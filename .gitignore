@@ -3,3 +3,20 @@ __pycache__/
 *.pyc
 .DS_Store
 *.egg-info/
+
+# Do not push binary datasets/models
+app/assets/images/**/*.png
+app/assets/images/**/*.jpg
+app/assets/images/**/*.jpeg
+app/assets/images/**/*.webp
+app/assets/images/**/*.bmp
+app/assets/images/**/*.gif
+app/assets/videos/**
+app/models/**/*.json
+app/models/**/*.txt
+app/models/**/*.bin
+app/models/**/*.pt
+app/models/**/*.pth
+!app/assets/images/.gitkeep
+!app/assets/videos/.gitkeep
+!app/models/.gitkeep
