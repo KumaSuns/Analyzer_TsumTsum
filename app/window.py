@@ -4,13 +4,12 @@ import colorsys
 import threading
 import queue
 import time
-import html
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, Qt, QUrl, QSettings, Signal, QTimer
-from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -337,6 +336,7 @@ class MainWindow(QMainWindow):
         left.setFixedWidth(300)
         self.left_layout = QVBoxLayout(left)
         self.left_layout.setContentsMargins(0, 0, 0, 0)
+        self._left_section_frame = left
 
         center = QFrame(main)
         center.setObjectName("centerSection")
@@ -352,6 +352,7 @@ class MainWindow(QMainWindow):
         right.setFixedWidth(520)
         self.right_layout = QVBoxLayout(right)
         self.right_layout.setContentsMargins(0, 0, 0, 0)
+        self._right_section_frame = right
 
         main_layout.addWidget(left, 0)
         main_layout.addWidget(center, 0)
@@ -386,10 +387,34 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.deleteLater()
 
+    def _release_counter_and_log_widgets(self) -> None:
+        for name in (
+            "log_view",
+            "counter_frame",
+            "counter_use_tsum_label",
+            "counter_use_item_label",
+            "counter_fever_count_label",
+            "counter_skill_count_label",
+            "counter_analysis_state_label",
+            "counter_progress_label",
+        ):
+            if hasattr(self, name):
+                delattr(self, name)
+
     def _render_feature_ui(self, feature_id: int) -> None:
         self._clear_layout(self.left_layout)
         self._clear_layout(self.center_layout)
         self._clear_layout(self.right_layout)
+        if feature_id == 2:
+            self._release_counter_and_log_widgets()
+
+        # 動画ツール(tab2)のみ: 左=クイックボタン列、右=トリミングのみ（列幅入替）。ログ・カウンターは置かない。
+        if feature_id == 2:
+            self._left_section_frame.setFixedWidth(520)
+            self._right_section_frame.setFixedWidth(300)
+        else:
+            self._left_section_frame.setFixedWidth(300)
+            self._right_section_frame.setFixedWidth(520)
 
         if feature_id == 1:
             self.left_layout.setContentsMargins(2, 2, 2, 2)
@@ -444,10 +469,10 @@ class MainWindow(QMainWindow):
             self.left_layout.addStretch(1)
         else:
             if feature_id == 2:
-                self.left_layout.setContentsMargins(2, 2, 2, 2)
-                self.left_layout.setSpacing(2)
-                self.left_layout.addWidget(QLabel("トリミング"))
-                self.left_layout.addWidget(QLabel("対象(複数選択)"))
+                self.right_layout.setContentsMargins(2, 2, 2, 2)
+                self.right_layout.setSpacing(2)
+                self.right_layout.addWidget(QLabel("トリミング"))
+                self.right_layout.addWidget(QLabel("対象(複数選択)"))
                 self.crop_target_buttons = {}
                 target_grid = QFrame()
                 target_grid_layout = QHBoxLayout(target_grid)
@@ -464,21 +489,21 @@ class MainWindow(QMainWindow):
                     btn.toggled.connect(self._on_crop_target_selection_changed)
                     self.crop_target_buttons[key] = btn
                     target_grid_layout.addWidget(btn)
-                self.left_layout.addWidget(target_grid)
+                self.right_layout.addWidget(target_grid)
                 # Default selection to avoid "saved but no target selected" confusion.
                 if "score" in self.crop_target_buttons:
                     self.crop_target_buttons["score"].setChecked(True)
 
                 self.crop_rect_label = QLabel("範囲: 未選択")
-                self.left_layout.addWidget(self.crop_rect_label)
+                self.right_layout.addWidget(self.crop_rect_label)
 
                 self.crop_start_button = QPushButton("トリミング開始")
                 self.crop_start_button.setCheckable(True)
                 self.crop_start_button.toggled.connect(self._on_toggle_crop_mode)
-                self.left_layout.addWidget(self.crop_start_button)
+                self.right_layout.addWidget(self.crop_start_button)
 
                 self.crop_status_label = QLabel("状態: 停止")
-                self.left_layout.addWidget(self.crop_status_label)
+                self.right_layout.addWidget(self.crop_status_label)
 
                 adjust_row1 = QFrame()
                 adjust_row1_layout = QHBoxLayout(adjust_row1)
@@ -500,7 +525,7 @@ class MainWindow(QMainWindow):
                 self.crop_y_spin.setFixedHeight(22)
                 self.crop_y_spin.valueChanged.connect(self._on_crop_spin_changed)
                 adjust_row1_layout.addWidget(self.crop_y_spin, 1)
-                self.left_layout.addWidget(adjust_row1)
+                self.right_layout.addWidget(adjust_row1)
 
                 adjust_row2 = QFrame()
                 adjust_row2_layout = QHBoxLayout(adjust_row2)
@@ -522,55 +547,80 @@ class MainWindow(QMainWindow):
                 self.crop_h_spin.setFixedHeight(22)
                 self.crop_h_spin.valueChanged.connect(self._on_crop_spin_changed)
                 adjust_row2_layout.addWidget(self.crop_h_spin, 1)
-                self.left_layout.addWidget(adjust_row2)
+                self.right_layout.addWidget(adjust_row2)
 
                 save_crop_button = QPushButton("位置を保存")
                 save_crop_button.clicked.connect(self._on_save_crop_clicked)
-                self.left_layout.addWidget(save_crop_button)
+                self.right_layout.addWidget(save_crop_button)
                 save_dataset_button = QPushButton("対象画像保存(自動train/val)")
                 save_dataset_button.clicked.connect(self._on_save_target_images_clicked)
-                self.left_layout.addWidget(save_dataset_button)
+                self.right_layout.addWidget(save_dataset_button)
                 check_crop_button = QPushButton("停止画で切り抜き確認")
                 check_crop_button.clicked.connect(self._on_check_crop_preview_clicked)
-                self.left_layout.addWidget(check_crop_button)
-                self.left_layout.addWidget(QLabel("動画上をドラッグで指定"))
+                self.right_layout.addWidget(check_crop_button)
+                self.right_layout.addWidget(QLabel("動画上をドラッグで指定"))
 
                 self.crop_preview_label = QLabel("プレビューなし")
                 self.crop_preview_label.setFixedSize(180, 100)
                 self.crop_preview_label.setStyleSheet("border:1px solid #888; background:#111; color:#DDD;")
                 self.crop_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.left_layout.addWidget(self.crop_preview_label)
+                self.right_layout.addWidget(self.crop_preview_label)
                 self.crop_check_label = QLabel("確認プレビューなし")
-                self.crop_check_label.setFixedSize(300, 200)
+                self.crop_check_label.setFixedSize(280, 180)
                 self.crop_check_label.setStyleSheet("border:1px solid #888; background:#111; color:#DDD;")
                 self.crop_check_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.left_layout.addWidget(self.crop_check_label)
-                self.left_layout.addStretch(1)
+                self.right_layout.addWidget(self.crop_check_label)
                 self._on_crop_target_selection_changed()
-            else:
+            elif feature_id not in (3,):
                 self.left_layout.addWidget(QLabel(f"left - button{feature_id}"))
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.counter_frame = QFrame()
-        self.counter_frame.setFixedHeight(72)
-        self.counter_frame.setStyleSheet("border: none; background: transparent;")
-        counter_layout = QVBoxLayout(self.counter_frame)
-        counter_layout.setContentsMargins(0, 0, 0, 0)
-        counter_layout.setSpacing(2)
-        self.counter_use_tsum_label = QLabel("使用ツム: --")
-        self.counter_use_item_label = QLabel("使用アイテム: --")
-        self.counter_fever_count_label = QLabel("fever回数: 0")
-        self.counter_skill_count_label = QLabel("スキル回数: 0")
-        self.counter_analysis_state_label = QLabel("解析状態: 停止")
-        self.counter_progress_label = QLabel("進行: --")
-        counter_layout.addWidget(self.counter_use_tsum_label)
-        counter_layout.addWidget(self.counter_use_item_label)
-        counter_layout.addWidget(self.counter_fever_count_label)
-        counter_layout.addWidget(self.counter_skill_count_label)
-        counter_layout.addWidget(self.counter_analysis_state_label)
-        counter_layout.addWidget(self.counter_progress_label)
-        self.right_layout.addWidget(self.counter_frame)
-        self.right_layout.addWidget(self.log_view)
+        if feature_id == 2:
+            video_tool_btn_style = (
+                "QPushButton {"
+                "  border: 1px solid #888;"
+                "  border-radius: 4px;"
+                "  background: #F5F5F5;"
+                "  padding: 2px 4px;"
+                "}"
+                "QPushButton:hover { background: #EAEAEA; }"
+                "QPushButton:pressed { background: #DCDCDC; }"
+            )
+            video_tool_btn_row = QFrame()
+            video_tool_btn_row.setStyleSheet("background: transparent;")
+            btn_row_layout = QHBoxLayout(video_tool_btn_row)
+            btn_row_layout.setContentsMargins(4, 4, 4, 2)
+            btn_row_layout.setSpacing(4)
+            for i in range(6):
+                btn = QPushButton(str(i + 1))
+                btn.setFixedHeight(28)
+                btn.setStyleSheet(video_tool_btn_style)
+                btn.setToolTip(f"動画ツール クイックボタン {i + 1}（未割当）")
+                btn_row_layout.addWidget(btn, 1)
+            self.left_layout.addWidget(video_tool_btn_row)
+            self.left_layout.addStretch(1)
+        else:
+            self.log_view = QTextEdit()
+            self.log_view.setReadOnly(True)
+            self.log_view.setAcceptRichText(True)
+            self.counter_frame = QFrame()
+            self.counter_frame.setFixedHeight(72)
+            self.counter_frame.setStyleSheet("border: none; background: transparent;")
+            counter_layout = QVBoxLayout(self.counter_frame)
+            counter_layout.setContentsMargins(0, 0, 0, 0)
+            counter_layout.setSpacing(2)
+            self.counter_use_tsum_label = QLabel("使用ツム: --")
+            self.counter_use_item_label = QLabel("使用アイテム: --")
+            self.counter_fever_count_label = QLabel("fever回数: 0")
+            self.counter_skill_count_label = QLabel("スキル回数: 0")
+            self.counter_analysis_state_label = QLabel("解析状態: 停止")
+            self.counter_progress_label = QLabel("進行: --")
+            counter_layout.addWidget(self.counter_use_tsum_label)
+            counter_layout.addWidget(self.counter_use_item_label)
+            counter_layout.addWidget(self.counter_fever_count_label)
+            counter_layout.addWidget(self.counter_skill_count_label)
+            counter_layout.addWidget(self.counter_analysis_state_label)
+            counter_layout.addWidget(self.counter_progress_label)
+            self.right_layout.addWidget(self.counter_frame)
+            self.right_layout.addWidget(self.log_view, 1)
         if feature_id in (1, 2):
             self.player = QMediaPlayer(self)
             self.audio_output = QAudioOutput(self)
@@ -746,10 +796,22 @@ class MainWindow(QMainWindow):
                 else:
                     section_layout.setContentsMargins(4, 0, 4, 0)
                     section_layout.setSpacing(4)
+                    analyze_row_button_style = (
+                        "QPushButton {"
+                        "  border: 1px solid #888;"
+                        "  border-radius: 4px;"
+                        "  background: #F5F5F5;"
+                        "  padding: 2px 8px;"
+                        "}"
+                        "QPushButton:hover { background: #EAEAEA; }"
+                        "QPushButton:pressed { background: #DCDCDC; }"
+                        "QPushButton:disabled { color: #9A9A9A; background: #F2F2F2; border-color: #CCC; }"
+                    )
                     labels = ["仮1", "解析", "仮3", "仮4"] if feature_id == 1 else ["仮1", "仮2", "仮3", "仮4"]
                     for label in labels:
                         button = QPushButton(label, section)
-                        button.setFixedSize(64, 24)
+                        button.setStyleSheet(analyze_row_button_style)
+                        button.setFixedSize(88 if label == "解析" else 64, 24)
                         if label == "解析":
                             self.analyze_button = button
                             self.analyze_button.setText("解析開始")
@@ -760,10 +822,13 @@ class MainWindow(QMainWindow):
             self.center_layout.addWidget(top_box, 1)
             self.center_layout.addWidget(bottom_box, 1)
         elif feature_id == 3:
+            self.left_layout.setContentsMargins(4, 4, 4, 4)
+            self.left_layout.setSpacing(4)
             self.left_layout.addWidget(QLabel("学習データ"))
             self.left_layout.addWidget(QLabel("train: app/assets/images/train"))
             self.left_layout.addWidget(QLabel("val: app/assets/images/val"))
             self.left_layout.addWidget(QLabel("保存先: app/models/main_model/version_1"))
+            self.left_layout.addStretch(1)
 
             train_page = QFrame()
             train_page_layout = QVBoxLayout(train_page)
@@ -1448,7 +1513,6 @@ class MainWindow(QMainWindow):
                 scene = "fever"
                 self.timeup_confirm_count = 0
             elif raw_scene == "timeup":
-                # Reduce false positives by requiring consecutive timeup detections.
                 self.timeup_confirm_count += 1
                 if self.timeup_confirm_count >= 2:
                     scene = "timeup"
@@ -1520,38 +1584,49 @@ class MainWindow(QMainWindow):
         # item_detect comes from detection flow in _on_player_position_changed.
         effective_item_detected = item_detected if result.scene_label == "item" else False
         item_detected_text = "YES" if effective_item_detected else "NO"
-        scene_text = self._format_scene_text(result.scene_label)
-        base_text = f"t={seconds:7.2f}s frame={result.frame_index:6d} scene={scene_text}"
+        scene_label = result.scene_label
+        prefix = f"t={seconds:7.2f}s frame={result.frame_index:6d} scene="
         if result.scene_label == "item":
-            short_text = f"{base_text} item_detect={item_detected_text} used_items={log_used_items}"
-            detail_text = (
-                f"{base_text} item_detect={item_detected_text} "
+            short_suffix = f" item_detect={item_detected_text} used_items={log_used_items}"
+            detail_suffix = (
+                f" item_detect={item_detected_text} "
                 f"item={result.item_skill_label} used_items={log_used_items} "
                 f"selected={selected_text} use_tsum={log_use_tsum}"
             )
         else:
-            short_text = base_text
-            detail_text = f"{base_text} item={result.item_skill_label}"
+            short_suffix = ""
+            detail_suffix = f" item={result.item_skill_label}"
         if hasattr(self, "detail_log_check") and not self.detail_log_check.isChecked():
-            self._append_log_line(short_text)
+            self._append_log_colored_scene(prefix, scene_label, short_suffix)
             if item_debug and result.scene_label == "item":
                 self.log_view.append(f"  item_debug: {item_debug}")
             return
-        self._append_log_line(detail_text)
+        self._append_log_colored_scene(prefix, scene_label, detail_suffix)
         if item_debug and result.scene_label == "item":
             self.log_view.append(f"  item_debug: {item_debug}")
 
-    def _format_scene_text(self, scene_label: str) -> str:
-        if scene_label in {"ready", "go"}:
-            return f"<span style='color:#B45309;'>{html.escape(scene_label)}</span>"
-        return html.escape(scene_label)
-
-    def _append_log_line(self, text_with_scene_html: str) -> None:
+    def _append_log_colored_scene(self, prefix: str, scene_label: str, suffix: str) -> None:
+        """Log one line; scene name ready/go in orange via QTextCharFormat (HTML is unreliable in QTextEdit)."""
         if not hasattr(self, "log_view"):
             return
-        # Force rich text rendering while preserving spacing.
-        rich = text_with_scene_html.replace(" ", "&nbsp;")
-        self.log_view.append(f"<span style='font-family:monospace;'>{rich}</span>")
+        cursor = self.log_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        mono = QTextCharFormat()
+        mono.setFontFamilies(["monospace"])
+        orange = QTextCharFormat()
+        orange.setFontFamilies(["monospace"])
+        orange.setForeground(QColor("#B45309"))
+        cursor.setCharFormat(mono)
+        cursor.insertText(prefix)
+        if scene_label in {"ready", "go"}:
+            cursor.setCharFormat(orange)
+            cursor.insertText(scene_label)
+            cursor.setCharFormat(mono)
+        else:
+            cursor.insertText(scene_label)
+        cursor.insertText(suffix + "\n")
+        self.log_view.setTextCursor(cursor)
+        self.log_view.ensureCursorVisible()
 
     def _format_item_debug(self, evaluations: dict[str, dict], selected_targets: list[str]) -> str:
         parts = []
