@@ -6,8 +6,26 @@ from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtGui import QImage
 
+try:
+    import cv2  # type: ignore
+    import numpy as np  # type: ignore
+except ImportError:
+    cv2 = None  # type: ignore
+    np = None  # type: ignore
+
 
 SCENE_CLASSES = ["none", "item", "ready", "go", "fever", "timeup", "bonus", "result"]
+
+
+def image_file_to_feature(path: Path, size: int = 24) -> Optional[List[float]]:
+    """学習・検証用。バックグラウンドスレッドでも使える（QImage は GUI スレッド専用のため使わない）。"""
+    if cv2 is None or np is None:
+        return None
+    arr = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if arr is None:
+        return None
+    arr = cv2.resize(arr, (size, size), interpolation=cv2.INTER_AREA)
+    return (arr.astype(np.float64) / 255.0).flatten().tolist()
 
 
 def image_to_feature(image: QImage, size: int = 24) -> List[float]:
@@ -44,10 +62,10 @@ class SceneCentroidModel:
                 for file in cls_dir.iterdir():
                     if not file.is_file():
                         continue
-                    img = QImage(str(file))
-                    if img.isNull():
+                    feat = image_file_to_feature(file)
+                    if feat is None:
                         continue
-                    vectors.append(image_to_feature(img))
+                    vectors.append(feat)
             counts[cls] = len(vectors)
             if not vectors:
                 continue
@@ -62,10 +80,9 @@ class SceneCentroidModel:
             self.centroids[cls] = centroid
         return counts
 
-    def predict(self, image: QImage) -> Tuple[str, float]:
-        if image.isNull() or not self.centroids:
-            return ("none", 1e9)
-        feat = image_to_feature(image)
+    def predict_from_feature(self, feat: List[float]) -> str:
+        if not self.centroids or not feat:
+            return "none"
         best_cls = "none"
         best_dist = 1e9
         for cls, centroid in self.centroids.items():
@@ -73,7 +90,22 @@ class SceneCentroidModel:
             if d < best_dist:
                 best_dist = d
                 best_cls = cls
-        return (best_cls, best_dist)
+        return best_cls
+
+    def ranked_distances(self, image: QImage) -> List[Tuple[str, float]]:
+        """全クラスの距離を昇順（分類のあいまいさ解消に使う）。"""
+        if image.isNull() or not self.centroids:
+            return [("none", 1e9)]
+        feat = image_to_feature(image)
+        pairs = [(cls, l1_distance(feat, centroid)) for cls, centroid in self.centroids.items()]
+        pairs.sort(key=lambda x: x[1])
+        return pairs
+
+    def predict(self, image: QImage) -> Tuple[str, float]:
+        if image.isNull() or not self.centroids:
+            return ("none", 1e9)
+        ranked = self.ranked_distances(image)
+        return ranked[0][0], ranked[0][1]
 
     def evaluate_val(self, images_root: Path) -> Tuple[int, int]:
         total = 0
@@ -85,10 +117,10 @@ class SceneCentroidModel:
             for file in cls_dir.iterdir():
                 if not file.is_file():
                     continue
-                img = QImage(str(file))
-                if img.isNull():
+                feat = image_file_to_feature(file)
+                if feat is None:
                     continue
-                pred, _ = self.predict(img)
+                pred = self.predict_from_feature(feat)
                 total += 1
                 if pred == cls:
                     correct += 1

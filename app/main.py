@@ -1,6 +1,32 @@
 import sys
 import platform
 import os
+from pathlib import Path
+
+
+def _configure_qt_environment() -> None:
+    """Fix Qt not finding PySide6 plugins (e.g. Microsoft Store python.exe → 'No QtMultimedia backends found')."""
+    try:
+        import PySide6  # noqa: F401  # ensures DLL dirs on Windows before Qt loads
+
+        plugin_dir = Path(PySide6.__file__).resolve().parent / "plugins"
+        if plugin_dir.is_dir():
+            p = os.fspath(plugin_dir)
+            prev = os.environ.get("QT_PLUGIN_PATH", "")
+            if not prev:
+                os.environ["QT_PLUGIN_PATH"] = p
+            elif p not in prev.split(os.pathsep):
+                os.environ["QT_PLUGIN_PATH"] = p + os.pathsep + prev
+    except Exception:
+        pass
+
+    if sys.platform == "win32":
+        # ffmpeg バックエンドの方が多くのコーデックに対応（WMF は「Unsupported media type」になりやすい）
+        # うまくいかない場合のみ: set QT_MEDIA_BACKEND=windows
+        os.environ.setdefault("QT_MEDIA_BACKEND", "ffmpeg")
+
+
+_configure_qt_environment()
 
 from PySide6.QtWidgets import QApplication
 

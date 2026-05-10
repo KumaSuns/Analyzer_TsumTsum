@@ -1,3 +1,4 @@
+import os
 import platform
 import json
 import colorsys
@@ -9,7 +10,7 @@ from typing import Optional
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, Qt, QUrl, QSettings, Signal, QTimer
-from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QRubberBand,
     QSlider,
@@ -39,6 +41,65 @@ from app.services.analyzer import VideoAnalyzer
 from app.services.trainer import SimpleTrainer
 from app.services.tsum_registry import TsumRegistry
 from app.services.use_tsum_classifier import UseTsumClassifier
+from app.services.file_video import FileVideoSource, is_file_video_available
+
+
+def _qt_multimedia_environment_report() -> str:
+    import sys
+
+    lines = [f"Python: {sys.executable}"]
+    try:
+        import PySide6
+
+        root = os.path.dirname(PySide6.__file__)
+        lines.append(f"PySide6: {PySide6.__version__}")
+        lines.append(f"PySide6 dir: {root}")
+        mm = os.path.join(root, "plugins", "multimedia")
+        lines.append(f"plugins/multimedia exists: {os.path.isdir(mm)}")
+    except Exception as exc:
+        lines.append(f"PySide6: (取得できません: {exc})")
+    lines.append(f"QT_PLUGIN_PATH: {os.environ.get('QT_PLUGIN_PATH', '(未設定)')}")
+    lines.append(f"QT_MEDIA_BACKEND: {os.environ.get('QT_MEDIA_BACKEND', '(未設定)')}")
+    return "\n".join(lines)
+
+
+def _media_error_extra_hints(error_string: str) -> str:
+    low = (error_string or "").lower()
+    if "unsupported media type" not in low:
+        return ""
+    backend = os.environ.get("QT_MEDIA_BACKEND", "(未設定)")
+    bl = backend.lower() if backend != "(未設定)" else ""
+    other = "windows" if bl == "ffmpeg" else "ffmpeg"
+    lines = [
+        "\n--- よくある対処 ---\n",
+        f"現在のバックエンド: {backend}\n",
+    ]
+    if bl == "windows":
+        lines.append(
+            "WMF(windows) は形式によっては未対応になります。**まず ffmpeg を試してください**（下の1行目）。\n"
+        )
+    lines.append(f'ffmpeg で試す: $env:QT_MEDIA_BACKEND = "{other}"; python -m app.main\n')
+    lines.append(
+        "既定（main.py の ffmpeg）に戻す: Remove-Item Env:QT_MEDIA_BACKEND -ErrorAction SilentlyContinue; python -m app.main\n"
+    )
+    lines.append(
+        "それでもダメなら、H.264 映像 + AAC 音声の MP4 に再エンコード（HandBrake、ffmpeg の libx264/aac）。\n"
+    )
+    return "".join(lines)
+
+
+def _show_copyable_warning(parent: Optional[QWidget], title: str, summary: str, details: str) -> None:
+    QApplication.clipboard().setText(details)
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle(title)
+    box.setText(summary)
+    box.setInformativeText(
+        "詳細はメッセージボックスの「詳細を表示」で開くか、クリップボードにコピー済みの内容をメモ帳に貼り付け（Ctrl+V）してください。"
+    )
+    box.setDetailedText(details)
+    box.setStandardButtons(QMessageBox.StandardButton.Ok)
+    box.exec()
 
 
 def _is_alive_qobject(obj) -> bool:
@@ -67,6 +128,11 @@ class AspectFitVideoContainer(QWidget):
         ]
         self.video_widget = QVideoWidget(self)
         self.video_widget.setStyleSheet("background: #000;")
+        self.frame_label = QLabel(self)
+        self.frame_label.setStyleSheet("background: #000;")
+        self.frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.frame_label.hide()
+        self._opencv_display = False
         self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
         self._rubber_band.setStyleSheet("border: 2px solid #00E5FF; background: rgba(0, 229, 255, 40);")
         self._drag_origin = QPoint()
@@ -83,6 +149,14 @@ class AspectFitVideoContainer(QWidget):
     def set_source_size(self, width: int, height: int) -> None:
         self._source_width = max(0, width)
         self._source_height = max(0, height)
+
+    def set_opencv_display(self, on: bool) -> None:
+        self._opencv_display = bool(on)
+        self.video_widget.setVisible(not self._opencv_display)
+        self.frame_label.setVisible(self._opencv_display)
+
+    def _video_surface_rect(self) -> QRect:
+        return self.frame_label.geometry() if self._opencv_display else self.video_widget.geometry()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -105,7 +179,9 @@ class AspectFitVideoContainer(QWidget):
 
         x = rect.x() + (rect.width() - best_w) // 2
         y = rect.y() + (rect.height() - best_h) // 2
-        self.video_widget.setGeometry(QRect(x, y, best_w, best_h))
+        r = QRect(x, y, best_w, best_h)
+        self.video_widget.setGeometry(r)
+        self.frame_label.setGeometry(r)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if self._crop_enabled and event.button() == Qt.MouseButton.LeftButton:
@@ -171,18 +247,18 @@ class AspectFitVideoContainer(QWidget):
     def selected_pixmap(self) -> QPixmap:
         if self._selected_rect.isNull():
             return QPixmap()
-        video_rect = self.video_widget.geometry()
+        surface = self.frame_label if self._opencv_display else self.video_widget
+        video_rect = surface.geometry()
         local_rect = QRect(
             self._selected_rect.x() - video_rect.x(),
             self._selected_rect.y() - video_rect.y(),
             self._selected_rect.width(),
             self._selected_rect.height(),
         )
-        snapshot = self.video_widget.grab(local_rect)
-        return snapshot
+        return surface.grab(local_rect)
 
     def _content_rect(self) -> QRect:
-        video_rect = self.video_widget.geometry()
+        video_rect = self._video_surface_rect()
         if video_rect.width() <= 0 or video_rect.height() <= 0:
             return video_rect
         if self._source_width <= 0 or self._source_height <= 0:
@@ -223,6 +299,7 @@ class MainWindow(QMainWindow):
         self.flow_phase = "WAIT_ITEM"
         self.flow_game_index = 1
         self.timeup_confirm_count = 0
+        self._last_raw_scene_in_game = ""
         self.locked_item_targets: list[str] = []
         self.locked_use_tsum = "-"
         self.locked_item_fixed = False
@@ -262,6 +339,13 @@ class MainWindow(QMainWindow):
         self.train_thread: Optional[threading.Thread] = None
         self.train_busy = False
         self.train_started_at = 0.0
+        self.use_opencv_for_video = False
+        self.cv_source: Optional[FileVideoSource] = FileVideoSource() if is_file_video_available() else None
+        self._cv_position_ms = 0
+        self._cv_playing = False
+        self._cv_playback_rate = 1.0
+        self.cv_play_timer = QTimer(self)
+        self.cv_play_timer.timeout.connect(self._cv_timer_tick)
         self._setup_menu()
         self._setup_status_bar()
         self._setup_central_widget()
@@ -402,6 +486,11 @@ class MainWindow(QMainWindow):
                 delattr(self, name)
 
     def _render_feature_ui(self, feature_id: int) -> None:
+        if hasattr(self, "cv_play_timer"):
+            self.cv_play_timer.stop()
+            self._cv_playing = False
+        if getattr(self, "cv_source", None) is not None:
+            self.cv_source.release()
         self._clear_layout(self.left_layout)
         self._clear_layout(self.center_layout)
         self._clear_layout(self.right_layout)
@@ -632,6 +721,7 @@ class MainWindow(QMainWindow):
             self.player.playbackStateChanged.connect(self._on_playback_state_changed)
             self.player.mediaStatusChanged.connect(self._on_media_status_changed)
             self.player.setLoops(1)
+            self.player.errorOccurred.connect(self._on_player_error)
 
             top_box = QFrame()
             top_box.setStyleSheet("border: none; background: #222222;")
@@ -672,10 +762,39 @@ class MainWindow(QMainWindow):
 
             video_container = AspectFitVideoContainer(top_box)
             self.current_video_container = video_container
-            self.player.setVideoOutput(video_container.video_widget)
-            sink = video_container.video_widget.videoSink()
-            if sink is not None:
-                sink.videoFrameChanged.connect(self._on_video_frame_changed)
+            self.use_opencv_for_video = False
+            if self.cv_source is not None and platform.system() == "Windows":
+                self.use_opencv_for_video = True
+            if not self.use_opencv_for_video:
+                self.player.setVideoOutput(video_container.video_widget)
+                sink = video_container.video_widget.videoSink()
+                if sink is not None:
+                    sink.videoFrameChanged.connect(self._on_video_frame_changed)
+                elif self.cv_source is not None:
+                    self.use_opencv_for_video = True
+            if self.use_opencv_for_video:
+                video_container.set_opencv_display(True)
+                self.mute_checkbox.setEnabled(False)
+                self.mute_checkbox.setToolTip("ファイル動画モードでは音声がありません")
+            else:
+                video_container.set_opencv_display(False)
+                self.mute_checkbox.setEnabled(True)
+                self.mute_checkbox.setToolTip("")
+                if video_container.video_widget.videoSink() is None and self.cv_source is None:
+                    diag = (
+                        "QVideoSink を作成できませんでした。\n"
+                        "ファイル動画モードを使うには pip install（opencv-python-headless, imageio, imageio-ffmpeg）を実行してください。\n\n"
+                        + _qt_multimedia_environment_report()
+                    )
+                    QTimer.singleShot(
+                        0,
+                        lambda w=self, d=diag: _show_copyable_warning(
+                            w,
+                            "動画機能が使えません",
+                            "Qt でもファイル動画デコーダでも初期化できませんでした。",
+                            d,
+                        ),
+                    )
             video_container.clicked.connect(self._on_play_pause_clicked)
             video_container.cropSelected.connect(self._on_crop_selected)
             video_container.set_crop_enabled(False)
@@ -914,17 +1033,220 @@ class MainWindow(QMainWindow):
         self._load_video(selected_files[0])
 
     def _load_video(self, path: str) -> None:
-        self.last_video_path = path
-        self.settings.setValue("last_video_dir", str(Path(path).parent))
-        self.video_file_label.setText(Path(path).name)
-        self.player.setSource(QUrl.fromLocalFile(path))
-        self.player.pause()
+        resolved = str(Path(path).expanduser().resolve(strict=False))
+        self.last_video_path = resolved
+        self.settings.setValue("last_video_dir", str(Path(resolved).parent))
+        self.video_file_label.setText(Path(resolved).name)
         self.analysis_running = False
         self.analysis_warmup_until_ms = 0
         self.analysis_frame_seq = 0
         self._reset_analysis_flow()
         self.video_analyzer.reset()
+        if getattr(self, "use_opencv_for_video", False) and self.cv_source is not None:
+            self.cv_play_timer.stop()
+            self._cv_playing = False
+            prog: Optional[QProgressDialog] = None
+            if "マイドライブ" in resolved or "My Drive" in resolved:
+                prog = QProgressDialog(
+                    "マイドライブから動画を取り込んでいます。初回・大容量では時間がかかることがあります…",
+                    None,
+                    0,
+                    0,
+                    self,
+                )
+                prog.setWindowTitle("読み込み中")
+                prog.setWindowModality(Qt.WindowModality.ApplicationModal)
+                prog.setMinimumDuration(0)
+                prog.show()
+                QApplication.processEvents()
+            try:
+                opened_ok = self.cv_source.open(resolved)
+            finally:
+                if prog is not None:
+                    prog.close()
+            if not opened_ok:
+                if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                    self.log_view.append(f"動画を開けませんでした: {resolved}")
+                drive_hint = ""
+                if "マイドライブ" in resolved or "My Drive" in resolved:
+                    drive_hint = (
+                        "\n\nマイドライブ上のファイルは、開くときにバックグラウンドで順次ダウンロードします。"
+                        "初回は容量・回線状況により数十秒〜かかることがあります。別アプリでファイルを開きっぱなしにしていると失敗することがあります。"
+                    )
+                detail = getattr(self.cv_source, "last_open_error", "") or ""
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Icon.Warning)
+                box.setWindowTitle("動画を開けません")
+                box.setText(
+                    "動画の取り込みまたはデコードに失敗しました（順次読み・ffmpeg コピー・OpenCV・FFmpeg・H.264 トランスコードを試行済み）。"
+                    "ネットワーク・ディスク容量・他アプリのロックを確認してください。"
+                    + drive_hint
+                )
+                if detail.strip():
+                    box.setDetailedText(detail.strip())
+                    QApplication.clipboard().setText(detail.strip())
+                    box.setInformativeText("詳細は「詳細を表示」、またはクリップボードにコピー済みです。")
+                box.exec()
+                return
+            self.estimated_fps = self.cv_source.fps()
+            self.media_duration_ms = self.cv_source.duration_ms()
+            if hasattr(self, "seek_slider"):
+                self.seek_slider.setMaximum(max(self.media_duration_ms, 1))
+            self._cv_position_ms = 0
+            self.cv_source.seek_ms(0)
+            img = self.cv_source.read_qimage()
+            if img is None or img.isNull():
+                QMessageBox.warning(self, "動画を開けません", "最初のフレームを読み取れませんでした。")
+                self.cv_source.release()
+                return
+            self._video_frame_counter = 0
+            self._cv_push_frame(img)
+            self._refresh_play_button_text()
+            self._update_step_buttons_enabled()
+            QTimer.singleShot(0, lambda: self._cv_seek_and_show(self._cv_position_ms))
+            return
+        self.player.setSource(QUrl.fromLocalFile(resolved))
+        self.player.pause()
         self._on_playback_state_changed(self.player.playbackState())
+
+    def _playback_position_ms(self) -> int:
+        if getattr(self, "use_opencv_for_video", False):
+            return self._cv_position_ms
+        return self.player.position()
+
+    def _is_player_playing(self) -> bool:
+        if getattr(self, "use_opencv_for_video", False):
+            return self._cv_playing
+        return self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+
+    def _is_player_paused(self) -> bool:
+        if getattr(self, "use_opencv_for_video", False):
+            return not self._cv_playing
+        return self.player.playbackState() == QMediaPlayer.PlaybackState.PausedState
+
+    def _refresh_play_button_text(self) -> None:
+        if not hasattr(self, "play_pause_button") or not _is_alive_qobject(self.play_pause_button):
+            return
+        self.play_pause_button.setText("一時停止" if self._is_player_playing() else "再生")
+
+    def _update_step_buttons_enabled(self) -> None:
+        pause_only = self._is_player_paused()
+        if hasattr(self, "step_small_left_button"):
+            self.step_huge_left_button.setEnabled(pause_only)
+            self.step_small_left_button.setEnabled(pause_only)
+            self.step_large_left_button.setEnabled(pause_only)
+            self.step_small_right_button.setEnabled(pause_only)
+            self.step_large_right_button.setEnabled(pause_only)
+            self.step_huge_right_button.setEnabled(pause_only)
+
+    def _sync_cv_timer_interval(self) -> None:
+        fps = max(float(self.estimated_fps), 1.0)
+        self.cv_play_timer.setInterval(max(int(1000.0 / fps), 1))
+
+    def _cv_push_frame(self, image: QImage) -> None:
+        if image is None or image.isNull():
+            return
+        self.current_video_frame_image = image
+        if self.current_video_container is not None:
+            self.current_video_container.set_source_size(image.width(), image.height())
+            lbl = self.current_video_container.frame_label
+            geo = lbl.geometry()
+            if geo.width() > 0 and geo.height() > 0:
+                lbl.setPixmap(
+                    QPixmap.fromImage(image).scaled(
+                        geo.size(),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+        self._on_player_position_changed(self._cv_position_ms)
+        self._video_frame_counter += 1
+        if self._video_frame_counter % 2 != 0:
+            return
+        self.analysis_frame_seq += 1
+        if self.analysis_running:
+            self._run_analysis_step(self._cv_position_ms, image)
+
+    def _cv_seek_and_show(self, ms: int) -> None:
+        if not getattr(self, "use_opencv_for_video", False) or self.cv_source is None or not self.cv_source.is_open:
+            return
+        cap = self.media_duration_ms
+        self._cv_position_ms = max(0, min(ms, cap) if cap > 0 else max(0, ms))
+        self.cv_source.seek_ms(self._cv_position_ms)
+        img = self.cv_source.read_qimage()
+        if img is not None and not img.isNull():
+            self._cv_push_frame(img)
+        self._update_playback_indicators(self._cv_position_ms)
+
+    def _cv_timer_tick(self) -> None:
+        if not getattr(self, "use_opencv_for_video", False) or not self._cv_playing:
+            return
+        if self.cv_source is None or not self.cv_source.is_open:
+            return
+        if self.crop_playback_lock:
+            return
+        interval = self.cv_play_timer.interval()
+        delta = max(1, int(interval * self._cv_playback_rate))
+        next_ms = self._cv_position_ms + delta
+        if self.media_duration_ms > 0 and next_ms >= self.media_duration_ms:
+            self._cv_reached_end()
+            return
+        self._cv_position_ms = next_ms
+        self.cv_source.seek_ms(self._cv_position_ms)
+        img = self.cv_source.read_qimage()
+        if img is None or img.isNull():
+            self._cv_reached_end()
+            return
+        self._cv_push_frame(img)
+
+    def _cv_play(self) -> None:
+        if not getattr(self, "use_opencv_for_video", False) or self.cv_source is None or not self.cv_source.is_open:
+            return
+        if self.crop_playback_lock:
+            return
+        self._cv_playing = True
+        self._sync_cv_timer_interval()
+        self.cv_play_timer.start()
+        self._refresh_play_button_text()
+
+    def _cv_pause(self) -> None:
+        self._cv_playing = False
+        self.cv_play_timer.stop()
+        self._refresh_play_button_text()
+
+    def _cv_stop(self) -> None:
+        self._cv_pause()
+        self._cv_seek_and_show(0)
+
+    def _cv_reached_end(self) -> None:
+        self._cv_pause()
+        if self.media_duration_ms > 0:
+            self._cv_position_ms = self.media_duration_ms
+        self._update_playback_indicators(self._cv_position_ms)
+        self._on_end_of_media_cleanup()
+
+    def _on_end_of_media_cleanup(self) -> None:
+        if self.analysis_running:
+            self.analysis_running = False
+            self.analysis_warmup_until_ms = 0
+            self.analysis_frame_seq = 0
+            if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(self.counter_analysis_state_label):
+                self.counter_analysis_state_label.setText("解析状態: 完了")
+            if hasattr(self, "analyze_button") and _is_alive_qobject(self.analyze_button):
+                self.analyze_button.setText("解析開始")
+            if hasattr(self, "log_view"):
+                self.log_view.append("解析完了: 動画終端に到達しました。")
+        self._update_step_buttons_enabled()
+
+    def _on_player_error(self, error, error_string: str) -> None:
+        if error == QMediaPlayer.Error.NoError:
+            return
+        msg = (error_string or "").strip() or "動画を読み込めませんでした（コーデックまたは形式の問題の可能性があります）。"
+        if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+            self.log_view.append(f"メディアエラー: {msg}")
+        hints = _media_error_extra_hints(msg)
+        details = f"{msg}{hints}\n{_qt_multimedia_environment_report()}"
+        _show_copyable_warning(self, "動画を開けません", msg, details)
 
     def _on_mute_toggled(self, checked: bool) -> None:
         self.audio_output.setMuted(checked)
@@ -934,7 +1256,7 @@ class MainWindow(QMainWindow):
         self.media_duration_ms = max(duration_ms, 0)
         if hasattr(self, "seek_slider"):
             self.seek_slider.setMaximum(self.media_duration_ms)
-        self._update_playback_indicators(self.player.position())
+        self._update_playback_indicators(self._playback_position_ms())
 
     def _on_player_position_changed(self, position_ms: int) -> None:
         self._update_playback_indicators(position_ms)
@@ -943,6 +1265,9 @@ class MainWindow(QMainWindow):
             self.counter_progress_label.setText(f"進行: {position_ms/1000.0:.2f}s / f{frame_index}")
 
     def _on_slider_moved(self, position_ms: int) -> None:
+        if getattr(self, "use_opencv_for_video", False):
+            self._cv_seek_and_show(position_ms)
+            return
         self.player.setPosition(position_ms)
 
     def _on_play_pause_clicked(self) -> None:
@@ -952,13 +1277,22 @@ class MainWindow(QMainWindow):
         if self.crop_playback_lock or crop_checked:
             # Never toggle playback while cropping.
             return
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
+        if self._is_player_playing():
+            if getattr(self, "use_opencv_for_video", False):
+                self._cv_pause()
+            else:
+                self.player.pause()
         else:
-            self.player.play()
+            if getattr(self, "use_opencv_for_video", False):
+                self._cv_play()
+            else:
+                self.player.play()
 
     def _on_stop_clicked(self) -> None:
-        self.player.stop()
+        if getattr(self, "use_opencv_for_video", False):
+            self._cv_stop()
+        else:
+            self.player.stop()
         self.analysis_running = False
         self.analysis_warmup_until_ms = 0
         self.analysis_frame_seq = 0
@@ -969,8 +1303,13 @@ class MainWindow(QMainWindow):
             self.analyze_button.setText("解析開始")
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
-        if self.crop_playback_lock and state == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
+        if self.crop_playback_lock:
+            if getattr(self, "use_opencv_for_video", False):
+                if self._cv_playing:
+                    self._cv_pause()
+            elif state == QMediaPlayer.PlaybackState.PlayingState:
+                self.player.pause()
+            self._refresh_play_button_text()
             return
         if not hasattr(self, "play_pause_button") or not _is_alive_qobject(self.play_pause_button):
             return
@@ -990,42 +1329,37 @@ class MainWindow(QMainWindow):
     def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
         if status != QMediaPlayer.MediaStatus.EndOfMedia:
             return
-        if self.analysis_running:
-            self.analysis_running = False
-            self.analysis_warmup_until_ms = 0
-            self.analysis_frame_seq = 0
-            if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(self.counter_analysis_state_label):
-                self.counter_analysis_state_label.setText("解析状態: 完了")
-            if hasattr(self, "analyze_button") and _is_alive_qobject(self.analyze_button):
-                self.analyze_button.setText("解析開始")
-            if hasattr(self, "log_view"):
-                self.log_view.append("解析完了: 動画終端に到達しました。")
-
-        pause_only_enabled = state == QMediaPlayer.PlaybackState.PausedState
-        if hasattr(self, "step_small_left_button"):
-            self.step_huge_left_button.setEnabled(pause_only_enabled)
-            self.step_small_left_button.setEnabled(pause_only_enabled)
-            self.step_large_left_button.setEnabled(pause_only_enabled)
-            self.step_small_right_button.setEnabled(pause_only_enabled)
-            self.step_large_right_button.setEnabled(pause_only_enabled)
-            self.step_huge_right_button.setEnabled(pause_only_enabled)
+        self._on_end_of_media_cleanup()
 
     def _step_forward(self, frames: int) -> None:
-        if self.player.playbackState() != QMediaPlayer.PlaybackState.PausedState:
+        if not self._is_player_paused():
             return
         step_ms = int((frames / self.estimated_fps) * 1000)
-        target = min(self.player.position() + step_ms, self.media_duration_ms)
-        self.player.setPosition(target)
+        pos = self._playback_position_ms() + step_ms
+        if self.media_duration_ms > 0:
+            pos = min(pos, self.media_duration_ms)
+        target = max(pos, 0)
+        if getattr(self, "use_opencv_for_video", False):
+            self._cv_seek_and_show(target)
+        else:
+            self.player.setPosition(target)
 
     def _step_backward(self, frames: int) -> None:
-        if self.player.playbackState() != QMediaPlayer.PlaybackState.PausedState:
+        if not self._is_player_paused():
             return
         step_ms = int((frames / self.estimated_fps) * 1000)
-        target = max(self.player.position() - step_ms, 0)
-        self.player.setPosition(target)
+        target = max(self._playback_position_ms() - step_ms, 0)
+        if getattr(self, "use_opencv_for_video", False):
+            self._cv_seek_and_show(target)
+        else:
+            self.player.setPosition(target)
 
     def _set_playback_rate(self, rate: float) -> None:
-        self.player.setPlaybackRate(rate)
+        self._cv_playback_rate = max(rate, 0.05)
+        if not getattr(self, "use_opencv_for_video", False):
+            self.player.setPlaybackRate(rate)
+        elif self._cv_playing:
+            self._sync_cv_timer_interval()
 
     def _on_analyze_clicked(self) -> None:
         if self.analysis_running:
@@ -1033,7 +1367,10 @@ class MainWindow(QMainWindow):
             self.analysis_warmup_until_ms = 0
             self.analysis_frame_seq = 0
             self._reset_analysis_flow()
-            self.player.pause()
+            if getattr(self, "use_opencv_for_video", False):
+                self._cv_pause()
+            else:
+                self.player.pause()
             if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(self.counter_analysis_state_label):
                 self.counter_analysis_state_label.setText("解析状態: 停止")
             if hasattr(self, "analyze_button") and _is_alive_qobject(self.analyze_button):
@@ -1057,10 +1394,16 @@ class MainWindow(QMainWindow):
         if hasattr(self, "analyze_button") and _is_alive_qobject(self.analyze_button):
             self.analyze_button.setText("解析停止")
         if hasattr(self, "start_from_zero_check") and self.start_from_zero_check.isChecked():
-            self.player.setPosition(0)
+            if getattr(self, "use_opencv_for_video", False):
+                self._cv_seek_and_show(0)
+            else:
+                self.player.setPosition(0)
         # Ignore unstable first frames right after start/seek.
-        self.analysis_warmup_until_ms = max(self.player.position(), 0) + 500
-        self.player.play()
+        self.analysis_warmup_until_ms = max(self._playback_position_ms(), 0) + 500
+        if getattr(self, "use_opencv_for_video", False):
+            self._cv_play()
+        else:
+            self.player.play()
         if hasattr(self, "log_view"):
             self.log_view.clear()
             if hasattr(self, "counter_use_item_label"):
@@ -1141,7 +1484,9 @@ class MainWindow(QMainWindow):
         width = image.width()
         height = image.height()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        frame_index = int((max(self.player.position(), 0) / 1000.0) * self.estimated_fps) if hasattr(self, "player") else 0
+        frame_index = (
+            int((max(self._playback_position_ms(), 0) / 1000.0) * self.estimated_fps) if hasattr(self, "player") else 0
+        )
         saved = 0
 
         for key in selected_keys:
@@ -1348,8 +1693,11 @@ class MainWindow(QMainWindow):
     def _on_toggle_crop_mode(self, enabled: bool) -> None:
         self.crop_playback_lock = enabled
         if enabled and hasattr(self, "player"):
-            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-                self.player.pause()
+            if self._is_player_playing():
+                if getattr(self, "use_opencv_for_video", False):
+                    self._cv_pause()
+                else:
+                    self.player.pause()
                 self._train_log("トリミング開始: 再生中のため一時停止しました。")
             elif self.current_video_frame_image is None or self.current_video_frame_image.isNull():
                 self._train_log("トリミング開始: フレーム取得待ちです。動画を少し動かすと選択できます。")
@@ -1422,7 +1770,7 @@ class MainWindow(QMainWindow):
         if self.current_video_container is not None:
             self.current_video_container.set_source_size(image.width(), image.height())
         if self.analysis_running:
-            self._run_analysis_step(self.player.position(), image)
+            self._run_analysis_step(self._playback_position_ms(), image)
 
     def _run_analysis_step(self, position_ms: int, frame_image) -> None:
         if position_ms < self.analysis_warmup_until_ms:
@@ -1470,7 +1818,10 @@ class MainWindow(QMainWindow):
                 self.analysis_running = False
                 self.analysis_warmup_until_ms = 0
                 self.analysis_frame_seq = 0
-                self.player.pause()
+                if getattr(self, "use_opencv_for_video", False):
+                    self._cv_pause()
+                else:
+                    self.player.pause()
                 if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(self.counter_analysis_state_label):
                     self.counter_analysis_state_label.setText("解析状態: 完了(timeup)")
                 if hasattr(self, "analyze_button") and _is_alive_qobject(self.analyze_button):
@@ -1483,6 +1834,7 @@ class MainWindow(QMainWindow):
         self.flow_phase = "WAIT_ITEM"
         self.flow_game_index = 1
         self.timeup_confirm_count = 0
+        self._last_raw_scene_in_game = ""
         self.locked_item_targets = []
         self.locked_use_tsum = "-"
         self.locked_item_fixed = False
@@ -1508,18 +1860,25 @@ class MainWindow(QMainWindow):
             if raw_scene == "go":
                 scene = "go"
                 self.flow_phase = "IN_GAME"
+                self._last_raw_scene_in_game = ""
         elif phase == "IN_GAME":
             if raw_scene == "fever":
                 scene = "fever"
                 self.timeup_confirm_count = 0
             elif raw_scene == "timeup":
-                self.timeup_confirm_count += 1
-                if self.timeup_confirm_count >= 2:
-                    scene = "timeup"
-                    self.flow_phase = "WAIT_BONUS"
+                # 直前サンプルが fever の直後に 1 回だけ timeup → 多くは誤認（その次からは raw で連続判定）
+                if self._last_raw_scene_in_game == "fever":
+                    scene = "fever"
                     self.timeup_confirm_count = 0
+                else:
+                    self.timeup_confirm_count += 1
+                    if self.timeup_confirm_count >= 3:
+                        scene = "timeup"
+                        self.flow_phase = "WAIT_BONUS"
+                        self.timeup_confirm_count = 0
             else:
                 self.timeup_confirm_count = 0
+            self._last_raw_scene_in_game = raw_scene
         elif phase == "WAIT_BONUS":
             if raw_scene == "bonus":
                 scene = "bonus"
@@ -1804,6 +2163,7 @@ class MainWindow(QMainWindow):
             return
         self._set_train_ui_state(status_text="状態: モデル保存中...")
         self.trainer.save(self._train_log, version="version_1")
+        self.video_analyzer.reload_model()
         self._train_use_tsum_models()
         self._set_train_ui_state(status_text="状態: モデル保存完了")
 

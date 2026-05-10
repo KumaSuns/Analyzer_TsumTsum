@@ -135,6 +135,9 @@ class SimpleTrainer:
             encoding="utf-8",
         )
         self.scene_model.save(out_scene_model)
+        active_marker = self.model_root / "ACTIVE_VERSION"
+        active_marker.write_text(version, encoding="utf-8")
+        log(f"アクティブ版を更新: {active_marker} -> {version}")
         log(f"モデル保存: {out_file}")
         log(f"モデル保存(JSON): {out_json}")
         log(f"シーンモデル保存: {out_scene_model}")
