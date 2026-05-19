@@ -53,6 +53,20 @@ def iter_skill_images(tsum_dir: Path):
                 yield path
 
 
+def compute_match_max_dist(prototypes: List[List[float]]) -> float:
+    """学習画像同士の距離から、誤検知を抑えたマッチ上限を推定する。"""
+    if len(prototypes) < 2:
+        return 0.065
+    worst = 0.0
+    for i, vec_a in enumerate(prototypes):
+        for j, vec_b in enumerate(prototypes):
+            if i == j:
+                continue
+            worst = max(worst, UseTsumClassifier._l1_distance(vec_a, vec_b))
+    # 同じツムの発動画像のばらつきより少し余裕だけ見る（全画面系の誤検知は別途シーンで抑制）
+    return min(0.065, max(0.05, worst * 1.1))
+
+
 def resolve_tsum_dir(
     label: str,
     registry: Dict[str, str],
@@ -75,10 +89,12 @@ class SkillClassifierPool:
     def __init__(self, models_root: Path) -> None:
         self.models_root = models_root
         self._prototypes: Dict[str, List[List[float]]] = {}
+        self._max_dist: Dict[str, float] = {}
         self.reload()
 
     def reload(self) -> None:
         self._prototypes = {}
+        self._max_dist = {}
         if not self.models_root.exists():
             return
         for tsum_dir in sorted(p for p in self.models_root.iterdir() if p.is_dir()):
@@ -97,6 +113,11 @@ class SkillClassifierPool:
                         feats.append([float(v) for v in vec])
             if feats:
                 self._prototypes[tsum_dir.name] = feats
+                stored = data.get("match_max_dist")
+                if isinstance(stored, (int, float)) and float(stored) > 0:
+                    self._max_dist[tsum_dir.name] = float(stored)
+                else:
+                    self._max_dist[tsum_dir.name] = compute_match_max_dist(feats)
 
     def known_dirs(self) -> List[str]:
         return sorted(self._prototypes.keys())
@@ -104,12 +125,16 @@ class SkillClassifierPool:
     def has_model(self, tsum_dir: str) -> bool:
         return bool(tsum_dir) and tsum_dir in self._prototypes
 
+    def match_threshold(self, tsum_dir: str) -> float:
+        return self._max_dist.get(tsum_dir, 0.065)
+
     def predict(
         self,
         tsum_dir: str,
         image: QImage,
         crop_rect: Tuple[float, float, float, float] | None = None,
-        max_dist: float = 0.14,
+        *,
+        max_dist: float | None = None,
     ) -> Tuple[bool, float]:
         protos = self._prototypes.get(tsum_dir)
         if not protos or image.isNull():
@@ -123,7 +148,8 @@ class SkillClassifierPool:
         if not feat:
             return (False, float("inf"))
         dist = min(UseTsumClassifier._l1_distance(feat, proto) for proto in protos)
-        return (dist <= max_dist, dist)
+        limit = self.match_threshold(tsum_dir) if max_dist is None else max_dist
+        return (dist <= limit, dist)
 
     @staticmethod
     def build_models(
@@ -152,11 +178,13 @@ class SkillClassifierPool:
             out_dir = models_root / tsum_dir.name
             out_dir.mkdir(parents=True, exist_ok=True)
             out_file = out_dir / "model.json"
+            match_max = compute_match_max_dist(feats) if feats else 0.065
             out_file.write_text(
                 json.dumps(
                     {
                         "tsum_id": tsum_dir.name,
                         "sample_count": len(feats),
+                        "match_max_dist": match_max,
                         "prototypes": feats,
                     },
                     ensure_ascii=False,

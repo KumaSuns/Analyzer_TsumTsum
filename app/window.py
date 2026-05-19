@@ -2387,6 +2387,7 @@ class MainWindow(QMainWindow):
             use_tsum_dir=use_tsum_dir,
         )
         for result in results:
+            raw_scene = result.scene_label
             evaluations: dict[str, dict] = {}
             item_debug = ""
             if self.flow_phase == "WAIT_ITEM":
@@ -3016,7 +3017,7 @@ class MainWindow(QMainWindow):
             if self._skill_off_streak >= 2:
                 self._skill_episode_active = False
             return None
-        if self._skill_raw_streak < 2:
+        if self._skill_raw_streak < 3:
             return None
         if self._skill_episode_active:
             return None
