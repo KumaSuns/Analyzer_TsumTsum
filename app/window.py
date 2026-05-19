@@ -931,6 +931,17 @@ class MainWindow(QMainWindow):
                 confirm_layout.addWidget(cb)
             self.left_layout.addWidget(confirm_wrap)
 
+            skill_confirm_hint = QLabel(
+                "スキル発動はシーン一覧に含まれません（別判定）。"
+                "IN_GAME 中に検知され、ログへ skill=ツム名 と出ます。"
+            )
+            skill_confirm_hint.setWordWrap(True)
+            skill_confirm_hint.setStyleSheet("color: #555; font-size: 11px;")
+            self.left_layout.addWidget(skill_confirm_hint)
+            self.analysis_skill_confirm_check = QCheckBox("スキル発動（検知時モーダル）")
+            self.analysis_skill_confirm_check.setChecked(False)
+            self.left_layout.addWidget(self.analysis_skill_confirm_check)
+
             self.left_layout.addStretch(1)
         else:
             if feature_id == 2:
@@ -1497,6 +1508,21 @@ class MainWindow(QMainWindow):
             create_use_tsum_button = QPushButton("使用ツム追加")
             create_use_tsum_button.clicked.connect(self._on_create_use_tsum_clicked)
             train_page_layout.addWidget(create_use_tsum_button)
+
+            train_page_layout.addWidget(QLabel("スキル発動モデル（ツム別）"))
+            skill_train_hint = QLabel(
+                "画像: app/assets/images/skills/<dir>/activation/\n"
+                "「モデル保存」で使用ツム・スキル・シーンをまとめて学習します。"
+                "スキルだけなら学習開始は不要です。"
+            )
+            skill_train_hint.setWordWrap(True)
+            skill_train_hint.setStyleSheet("color: #444;")
+            train_page_layout.addWidget(skill_train_hint)
+            skill_save_only_btn = QPushButton("スキル・使用ツムだけ再学習")
+            skill_save_only_btn.setToolTip("シーンを触らず use_tsum / skill モデルだけ更新")
+            skill_save_only_btn.clicked.connect(self._on_train_skill_only_clicked)
+            train_page_layout.addWidget(skill_save_only_btn)
+
             self.center_layout.addWidget(train_page, 1)
             self._set_train_ui_state()
 
@@ -2391,8 +2417,33 @@ class MainWindow(QMainWindow):
                 self._resolve_tsum_dir(self.locked_use_tsum) if self.locked_item_fixed else use_tsum_dir
             )
             skill_new = False
+            skill_log_dir = ""
             if self.locked_item_fixed and skill_tsum_dir and self.flow_phase == "IN_GAME":
-                skill_new = self._run_skill_detection(frame_image, skill_tsum_dir)
+                pending_dist = self._probe_skill_new_episode(frame_image, skill_tsum_dir)
+                if pending_dist is not None:
+                    use_skill_modal = False
+                    skill_cb = getattr(self, "analysis_skill_confirm_check", None)
+                    if skill_cb is not None and _is_alive_qobject(skill_cb) and skill_cb.isChecked():
+                        use_skill_modal = True
+                    if use_skill_modal:
+                        if self._maybe_modal_skill_confirm(
+                            skill_tsum_dir, frame_image, pending_dist
+                        ):
+                            self._commit_skill_episode(skill_tsum_dir, pending_dist)
+                            skill_new = True
+                            skill_log_dir = skill_tsum_dir
+                        else:
+                            self._reject_skill_episode()
+                            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                                self.log_view.append(
+                                    f"t={result.timestamp_ms / 1000.0:7.2f}s "
+                                    f"frame={result.frame_index:6d} "
+                                    f"skill誤検知: 取り消し ({skill_tsum_dir})"
+                                )
+                    else:
+                        self._commit_skill_episode(skill_tsum_dir, pending_dist)
+                        skill_new = True
+                        skill_log_dir = skill_tsum_dir
             self._maybe_modal_scene_confirm(scene_label, frame_image)
             self._append_analysis_log(
                 result,
@@ -2401,7 +2452,7 @@ class MainWindow(QMainWindow):
                 item_detected,
                 item_debug,
                 skill_detected=skill_new,
-                skill_tsum_dir=skill_tsum_dir if skill_new else "",
+                skill_tsum_dir=skill_log_dir,
             )
             if scene_label == "timeup":
                 self.analysis_running = False
@@ -2604,6 +2655,78 @@ class MainWindow(QMainWindow):
             return None, False
         self._try_skill_save_from_dialog(frame_image, skill_save_cb, skill_tsum_combo, skill_cat_combo)
         return combo.currentText(), True
+
+    def _maybe_modal_skill_confirm(self, tsum_dir: str, frame_image, dist: float) -> bool:
+        """スキル発動候補の確認。はい=True（確定）、いいえ/×=False（誤検知として破棄）。"""
+        if not self.analysis_running or not tsum_dir:
+            return False
+
+        display = self.use_tsum_classifier._display_map.get(tsum_dir, tsum_dir)
+        was_cv = getattr(self, "use_opencv_for_video", False)
+        was_playing = self._is_player_playing()
+        if was_playing:
+            if was_cv:
+                self._cv_pause()
+            elif hasattr(self, "player") and _is_alive_qobject(self.player):
+                self.player.pause()
+
+        try:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("スキル発動の確認")
+            dlg.setModal(True)
+            layout = QVBoxLayout(dlg)
+            img = QLabel()
+            img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            img.setPixmap(
+                _preview_pixmap_for_scene_modal(
+                    frame_image, _SCENE_CONFIRM_PREVIEW_MAX_W, _SCENE_CONFIRM_PREVIEW_MAX_H
+                )
+            )
+            layout.addWidget(img)
+            txt = QLabel(
+                f"スキル発動を検知しました（{display} / {tsum_dir}）。\n"
+                "この判定は合っていますか？\n"
+                "・はい … スキル1回としてカウント\n"
+                "・いいえ … 誤検知として取り消し（カウントしません）"
+            )
+            txt.setWordWrap(True)
+            layout.addWidget(txt)
+            skill_save_cb, skill_tsum_combo, skill_cat_combo = self._build_skill_save_group(
+                layout,
+                show_fever_hint=True,
+                default_tsum_dir=tsum_dir,
+            )
+            row = QHBoxLayout()
+            yes_btn = QPushButton("はい")
+            no_btn = QPushButton("いいえ")
+            row.addStretch(1)
+            row.addWidget(yes_btn)
+            row.addWidget(no_btn)
+            layout.addLayout(row)
+            yes_btn.setDefault(True)
+            yes_btn.clicked.connect(lambda: dlg.done(1))
+            no_btn.clicked.connect(lambda: dlg.done(2))
+            rc = dlg.exec()
+            confirmed = rc == 1
+            if confirmed:
+                self._try_skill_save_from_dialog(frame_image, skill_save_cb, skill_tsum_combo, skill_cat_combo)
+            return confirmed
+        finally:
+            if was_playing and self.analysis_running:
+                if was_cv:
+                    self._cv_play()
+                elif hasattr(self, "player") and _is_alive_qobject(self.player):
+                    self.player.play()
+
+    def _on_train_skill_only_clicked(self) -> None:
+        if self.train_busy:
+            self._train_log("学習中は実行できません。")
+            return
+        self._train_use_tsum_models()
+        self._train_skill_models()
+        self.skill_classifier_pool.reload()
+        self.video_analyzer.item_skill_classifier.reload()
+        self._train_log("スキル・使用ツムモデルの再学習が完了しました。")
 
     def _maybe_modal_scene_confirm(self, scene_label: str, frame_image) -> None:
         """チェックされたシーンへ遷移した最初のフレームで確認（プレビュー付き）。誤りならクラス選択して保存。"""
@@ -2872,10 +2995,10 @@ class MainWindow(QMainWindow):
             list(self.use_tsum_classifier._prototypes.keys()),
         )
 
-    def _run_skill_detection(self, frame_image, tsum_dir: str) -> bool:
-        """IN_GAME 中のスキル発動を検知。新規エピソード開始時だけ True。"""
+    def _probe_skill_new_episode(self, frame_image, tsum_dir: str) -> Optional[float]:
+        """IN_GAME 中のスキル候補。新規エピソードなら距離を返す（まだカウントしない）。"""
         if frame_image is None or frame_image.isNull() or not self.skill_classifier_pool.has_model(tsum_dir):
-            return False
+            return None
         skill_rect = None
         rect = self.crop_positions_for_analysis.get("skill")
         if isinstance(rect, list) and len(rect) == 4:
@@ -2892,18 +3015,25 @@ class MainWindow(QMainWindow):
             self._skill_off_streak += 1
             if self._skill_off_streak >= 2:
                 self._skill_episode_active = False
-            return False
+            return None
         if self._skill_raw_streak < 2:
-            return False
+            return None
         if self._skill_episode_active:
-            return False
+            return None
+        return dist
+
+    def _commit_skill_episode(self, tsum_dir: str, dist: float) -> None:
         self._skill_episode_active = True
         self._skill_count += 1
         if hasattr(self, "counter_skill_count_label") and _is_alive_qobject(self.counter_skill_count_label):
             self.counter_skill_count_label.setText(f"スキル回数: {self._skill_count}")
         if hasattr(self, "log_view") and hasattr(self, "detail_log_check") and self.detail_log_check.isChecked():
             self.log_view.append(f"  skill_debug: {tsum_dir} dist={dist:.3f}")
-        return True
+
+    def _reject_skill_episode(self) -> None:
+        """誤検知: カウントせず、同じ誤判定が連続しないよう streak を切る。"""
+        self._skill_episode_active = False
+        self._skill_raw_streak = 0
 
     def _detect_use_tsum(self, image) -> str:
         if image is None or image.isNull():
