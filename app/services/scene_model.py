@@ -16,16 +16,172 @@ except ImportError:
 
 SCENE_CLASSES = ["none", "item", "ready", "go", "fever", "timeup", "bonus", "result"]
 
+# 学習・評価で扱う画像（.gitkeep 等は除外）
+SCENE_DATASET_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"})
+
+
+def is_scene_dataset_image(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in SCENE_DATASET_IMAGE_SUFFIXES
+
+
+def iter_scene_dataset_images(cls_dir: Path):
+    """train/item 直下だけでなくサブフォルダ内の画像も列挙する。"""
+    if not cls_dir.is_dir():
+        return
+    for p in cls_dir.rglob("*"):
+        if is_scene_dataset_image(p):
+            yield p
+
+
+def _resize_gray_to_size(arr: np.ndarray, size: int) -> Optional[np.ndarray]:
+    """24x24 への縮小。OpenCV が無い環境では Pillow のみで行う。"""
+    if arr is None or arr.size == 0 or arr.ndim != 2:
+        return None
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if cv2 is not None:
+        try:
+            return cv2.resize(arr, (size, size), interpolation=cv2.INTER_AREA)
+        except Exception:
+            return None
+    try:
+        from PIL import Image
+
+        im = Image.fromarray(arr, mode="L")
+        try:
+            resample = Image.Resampling.LANCZOS
+        except AttributeError:
+            resample = Image.LANCZOS
+        im = im.resize((size, size), resample)
+        return np.array(im, dtype=np.uint8)
+    except Exception:
+        return None
+
 
 def image_file_to_feature(path: Path, size: int = 24) -> Optional[List[float]]:
     """学習・検証用。バックグラウンドスレッドでも使える（QImage は GUI スレッド専用のため使わない）。"""
-    if cv2 is None or np is None:
+    if np is None:
         return None
-    arr = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    path_r = path.expanduser().resolve(strict=False)
+    arr = None
+
+    if cv2 is not None:
+        arr = cv2.imread(str(path_r), cv2.IMREAD_GRAYSCALE)
+
+    if arr is None:
+        try:
+            import imageio.v3 as iio  # type: ignore
+
+            im = np.asarray(iio.imread(str(path_r)))
+            if im.size == 0:
+                im = np.array([])
+            if im.size > 0:
+                if im.ndim == 3:
+                    if im.shape[2] >= 3:
+                        arr = (
+                            0.299 * im[..., 0].astype(np.float64)
+                            + 0.587 * im[..., 1].astype(np.float64)
+                            + 0.114 * im[..., 2].astype(np.float64)
+                        ).clip(0, 255).astype(np.uint8)
+                    else:
+                        arr = im[..., 0].astype(np.uint8)
+                else:
+                    arr = im.astype(np.uint8)
+        except Exception:
+            try:
+                import imageio as iio_legacy  # type: ignore
+
+                im = np.asarray(iio_legacy.imread(str(path_r)))
+                if im.size > 0:
+                    if im.ndim == 3 and im.shape[2] >= 3:
+                        arr = (
+                            0.299 * im[..., 0].astype(np.float64)
+                            + 0.587 * im[..., 1].astype(np.float64)
+                            + 0.114 * im[..., 2].astype(np.float64)
+                        ).clip(0, 255).astype(np.uint8)
+                    elif im.ndim == 3:
+                        arr = im[..., 0].astype(np.uint8)
+                    else:
+                        arr = im.astype(np.uint8)
+            except Exception:
+                arr = None
+
+    if arr is None:
+        try:
+            from PIL import Image
+
+            pil = Image.open(path_r).convert("L")
+            if pil.size[0] < 1 or pil.size[1] < 1:
+                arr = None
+            else:
+                arr = np.array(pil, dtype=np.uint8)
+        except Exception:
+            arr = None
+
     if arr is None:
         return None
-    arr = cv2.resize(arr, (size, size), interpolation=cv2.INTER_AREA)
-    return (arr.astype(np.float64) / 255.0).flatten().tolist()
+    resized = _resize_gray_to_size(arr, size)
+    if resized is None:
+        return None
+    return (resized.astype(np.float64) / 255.0).flatten().tolist()
+
+
+def describe_training_image_load_failure(images_root: Path) -> str:
+    """特徴量0件時の切り分け用（最初に見つかった画像で各読み込みを試す）。"""
+    root = images_root.expanduser().resolve(strict=False)
+    sample: Optional[Path] = None
+    for cls in SCENE_CLASSES:
+        cls_dir = root / "train" / cls
+        if not cls_dir.is_dir():
+            continue
+        for p in iter_scene_dataset_images(cls_dir):
+            sample = p
+            break
+        if sample is not None:
+            break
+    if sample is None:
+        return f"images_root={root} の train/*/ 以下に画像拡張子のファイルがありません（サブフォルダは検索します）。"
+
+    parts = [f"サンプル: {sample}"]
+    pr = sample.expanduser().resolve(strict=False)
+    parts.append(f"exists={pr.is_file()} size_bytes={pr.stat().st_size if pr.is_file() else 0}")
+
+    if cv2 is not None:
+        a = cv2.imread(str(pr), cv2.IMREAD_GRAYSCALE)
+        parts.append(f"cv2.imread(grayscale)={'OK' if a is not None and a.size else 'NG'}")
+    else:
+        parts.append("cv2=未インストール")
+
+    try:
+        import imageio.v3 as iio  # type: ignore
+
+        im = np.asarray(iio.imread(str(pr)))
+        parts.append(f"imageio.v3={'OK shape=' + str(im.shape) if im.size else 'NG empty'}")
+    except Exception as exc:
+        parts.append(f"imageio.v3=NG ({exc})")
+        try:
+            import imageio as iio2  # type: ignore
+
+            im2 = np.asarray(iio2.imread(str(pr)))
+            parts.append(f"imageio legacy={'OK' if im2.size else 'NG empty'}")
+        except Exception as exc2:
+            parts.append(f"imageio legacy=NG ({exc2})")
+
+    try:
+        from PIL import Image
+
+        pil = Image.open(pr)
+        parts.append(f"PIL open={'OK ' + str(pil.size)}")
+    except Exception as exc:
+        parts.append(f"PIL=NG ({exc})")
+
+    feat = image_file_to_feature(sample)
+    parts.append(f"image_file_to_feature={'OK' if feat else 'NG'}")
+    if not feat:
+        parts.append(
+            "対処: プロジェクトで venv を有効にし `pip install -e .`（少なくとも Pillow または opencv-python-headless が必要です）"
+        )
+    return " | ".join(parts)
 
 
 def image_to_feature(image: QImage, size: int = 24) -> List[float]:
@@ -59,9 +215,7 @@ class SceneCentroidModel:
             cls_dir = images_root / "train" / cls
             vectors: List[List[float]] = []
             if cls_dir.exists():
-                for file in cls_dir.iterdir():
-                    if not file.is_file():
-                        continue
+                for file in iter_scene_dataset_images(cls_dir):
                     feat = image_file_to_feature(file)
                     if feat is None:
                         continue
@@ -114,9 +268,7 @@ class SceneCentroidModel:
             cls_dir = images_root / "val" / cls
             if not cls_dir.exists():
                 continue
-            for file in cls_dir.iterdir():
-                if not file.is_file():
-                    continue
+            for file in iter_scene_dataset_images(cls_dir):
                 feat = image_file_to_feature(file)
                 if feat is None:
                     continue
@@ -147,6 +299,24 @@ class SceneCentroidModel:
             pass
         self.centroids = {}
         return False
+
+    @staticmethod
+    def describe_load_failure(path: Path) -> str:
+        """load() が False のときの切り分け用メッセージ。"""
+        if not path.exists():
+            return "ファイルがありません"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return f"JSON が不正です ({exc})"
+        centroids = data.get("centroids", {})
+        if not isinstance(centroids, dict) or not centroids:
+            return (
+                "centroids が空です。"
+                "学習タブで「学習開始」→「モデル保存」をやり直してください"
+                "（保存時に numpy / opencv が使える venv で起動しているかも確認）"
+            )
+        return "centroids の形式が不正です"
 
     def class_count(self) -> int:
         return len(self.centroids)

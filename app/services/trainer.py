@@ -6,7 +6,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from app.services.scene_model import SceneCentroidModel
+from app.services.scene_model import (
+    SceneCentroidModel,
+    describe_training_image_load_failure,
+    iter_scene_dataset_images,
+)
 
 @dataclass
 class DatasetSummary:
@@ -41,8 +45,8 @@ class SimpleTrainer:
         for cls in self.CLASSES:
             train_dir = self.images_root / "train" / cls
             val_dir = self.images_root / "val" / cls
-            train_counts[cls] = self._count_files(train_dir)
-            val_counts[cls] = self._count_files(val_dir)
+            train_counts[cls] = self._count_class_images(train_dir)
+            val_counts[cls] = self._count_class_images(val_dir)
 
         summary = DatasetSummary(
             train_total=sum(train_counts.values()),
@@ -71,6 +75,12 @@ class SimpleTrainer:
         log(f"学習開始: train={summary.train_total}, val={summary.val_total}")
         log(f"学習完了: class_counts={per_class}")
         log(f"検証精度: {correct}/{total} ({self.val_accuracy:.3f})")
+        if sum(per_class.values()) == 0 and summary.train_total > 0:
+            log(
+                "エラー: 件数はあるのに特徴量が0件です。"
+                "画像が破損しているか、読み込みに失敗している可能性があります。"
+            )
+            log(describe_training_image_load_failure(self.images_root))
         self.is_running = False
         return True
 
@@ -96,6 +106,12 @@ class SimpleTrainer:
             self.val_accuracy = (correct / total) if total > 0 else 0.0
             log(f"保存前にモデル生成: class_counts={per_class}")
             log(f"保存前評価: {correct}/{total} ({self.val_accuracy:.3f})")
+
+        if not self.scene_model.centroids:
+            raise RuntimeError(
+                "シーン centroid が0件です（scene_model.json は書き出しません）。"
+                "train/*/ の画像が実際に読めるか確認し、学習をやり直してください。"
+            )
 
         self.model_root.mkdir(parents=True, exist_ok=True)
         out_dir = self.model_root / version
@@ -144,7 +160,7 @@ class SimpleTrainer:
         return out_file
 
     @staticmethod
-    def _count_files(path: Path) -> int:
+    def _count_class_images(path: Path) -> int:
         if not path.exists():
             return 0
-        return sum(1 for p in path.iterdir() if p.is_file())
+        return sum(1 for _ in iter_scene_dataset_images(path))

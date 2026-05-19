@@ -35,19 +35,15 @@ class SceneClassifier:
 
 
 class TsumItemSkillClassifier:
-    """Placeholder classifier for use_tsum branch."""
+    """scene=item 時にログへ載せる使用ツム表示名（dir→表示名）。"""
 
     def __init__(self, root: Path) -> None:
         self.root = root
         self.registry_path = root / "registry.json"
-        self.tsum_ids: list[str] = []
         self.registry: dict[str, str] = {}
         self.reload()
 
     def reload(self) -> None:
-        self.tsum_ids = sorted(
-            p.name for p in self.root.iterdir() if p.is_dir() and not p.name.startswith(".")
-        ) if self.root.exists() else []
         self.registry = {}
         if self.registry_path.exists():
             try:
@@ -57,13 +53,10 @@ class TsumItemSkillClassifier:
             except Exception:
                 self.registry = {}
 
-    def predict(self, frame_index: int, selected_tsum: str = "auto") -> str:
-        if selected_tsum != "auto":
-            return self.registry.get(selected_tsum, selected_tsum)
-        if not self.tsum_ids:
-            return "unknown_tsum"
-        tsum_id = self.tsum_ids[(frame_index // 15) % len(self.tsum_ids)]
-        return self.registry.get(tsum_id, tsum_id)
+    def display_name(self, tsum_dir: str) -> str:
+        if not tsum_dir:
+            return "-"
+        return self.registry.get(tsum_dir, tsum_dir)
 
 
 class VideoAnalyzer:
@@ -76,6 +69,7 @@ class VideoAnalyzer:
         self.active_model_version = "unknown"
         self.scene_model_loaded = False
         self.scene_class_count = 0
+        self.scene_model_path: Path = self.model_root / "scene_model.json"
         self.reload_model()
 
     def reset(self) -> None:
@@ -85,8 +79,8 @@ class VideoAnalyzer:
         active_file = self.model_root / "ACTIVE_VERSION"
         if active_file.exists():
             self.active_model_version = active_file.read_text(encoding="utf-8").strip() or "unknown"
-        model_json = self.model_root / self.active_model_version / "scene_model.json"
-        self.scene_model_loaded = self.scene_classifier.load_model(model_json)
+        self.scene_model_path = self.model_root / self.active_model_version / "scene_model.json"
+        self.scene_model_loaded = self.scene_classifier.load_model(self.scene_model_path)
         self.scene_class_count = self.scene_classifier.model.class_count()
         self.item_skill_classifier.reload()
 
@@ -96,6 +90,7 @@ class VideoAnalyzer:
         position_ms: int,
         selected_tsum: str = "auto",
         frame_image=None,
+        use_tsum_dir: str = "",
     ) -> List[AnalysisResult]:
         """Process using actual decoded frame sequence from video callback."""
         frame_index = max(0, int(frame_seq))
@@ -108,8 +103,8 @@ class VideoAnalyzer:
         self._last_sampled_frame = frame_index
         scene_label = self.scene_classifier.predict(frame_image)
         item_skill_label = "-"
-        if scene_label == "item":
-            item_skill_label = self.item_skill_classifier.predict(frame_index, selected_tsum)
+        if scene_label == "item" and use_tsum_dir:
+            item_skill_label = self.item_skill_classifier.display_name(use_tsum_dir)
 
         return [
             AnalysisResult(
@@ -120,7 +115,14 @@ class VideoAnalyzer:
             )
         ]
 
-    def process_position(self, position_ms: int, fps: float, selected_tsum: str = "auto", frame_image=None) -> List[AnalysisResult]:
+    def process_position(
+        self,
+        position_ms: int,
+        fps: float,
+        selected_tsum: str = "auto",
+        frame_image=None,
+        use_tsum_dir: str = "",
+    ) -> List[AnalysisResult]:
         if fps <= 0:
             fps = 30.0
 
@@ -134,8 +136,8 @@ class VideoAnalyzer:
         self._last_sampled_frame = frame_index
         scene_label = self.scene_classifier.predict(frame_image)
         item_skill_label = "-"
-        if scene_label == "item":
-            item_skill_label = self.item_skill_classifier.predict(frame_index, selected_tsum)
+        if scene_label == "item" and use_tsum_dir:
+            item_skill_label = self.item_skill_classifier.display_name(use_tsum_dir)
 
         return [
             AnalysisResult(

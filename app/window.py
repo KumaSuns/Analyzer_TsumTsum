@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRect, Qt, QUrl, QSettings, Signal, QTimer
+from PySide6.QtCore import QObject, QPoint, QRect, Qt, QRunnable, QThreadPool, QUrl, QSettings, Signal, QTimer
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -19,15 +19,19 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QLabel,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QProgressBar,
+    QStackedWidget,
     QPushButton,
     QRubberBand,
     QSlider,
@@ -38,10 +42,63 @@ from PySide6.QtWidgets import (
 )
 
 from app.services.analyzer import VideoAnalyzer
+from app.services.image_save import prepare_training_image, save_training_png
+from app.services.scene_model import SceneCentroidModel
 from app.services.trainer import SimpleTrainer
 from app.services.tsum_registry import TsumRegistry
+from app.services.skill_classifier import (
+    SKILL_IMAGE_CATEGORY_ACTIVATION,
+    SkillClassifierPool,
+    list_skill_categories,
+    list_skill_tsum_dirs,
+    resolve_tsum_dir,
+    skill_category_label,
+)
 from app.services.use_tsum_classifier import UseTsumClassifier
 from app.services.file_video import FileVideoSource, is_file_video_available
+
+# 解析テスト: item〜result を「シーンに入った瞬間」で確認モーダルする対象にできる（none 除く）
+_ANALYSIS_SCENE_CONFIRM_LABELS = tuple(c for c in SimpleTrainer.CLASSES if c != "none")
+
+_SCENE_CONFIRM_PREVIEW_MAX_W = 560
+_SCENE_CONFIRM_PREVIEW_MAX_H = 315
+
+
+class _AsyncPngSaveSignals(QObject):
+    finished = Signal(bool, str)
+
+
+class _AsyncPngSaveTask(QRunnable):
+    def __init__(self, image: QImage, path: Path) -> None:
+        super().__init__()
+        self._image = image
+        self._path = path
+        self.signals: Optional[_AsyncPngSaveSignals] = None
+
+    def run(self) -> None:
+        from app.services.image_save import PNG_SAVE_COMPRESSION_FAST
+
+        ok = self._image.save(str(self._path), "PNG", PNG_SAVE_COMPRESSION_FAST)
+        if self.signals is not None:
+            self.signals.finished.emit(ok, str(self._path))
+
+
+def _preview_pixmap_for_scene_modal(frame_image, max_w: int, max_h: int) -> QPixmap:
+    if frame_image is None or frame_image.isNull():
+        pm = QPixmap(min(320, max_w), min(180, max_h))
+        pm.fill(QColor(60, 60, 60))
+        return pm
+    pm = QPixmap.fromImage(frame_image)
+    if pm.isNull():
+        pm = QPixmap(min(320, max_w), min(180, max_h))
+        pm.fill(QColor(60, 60, 60))
+        return pm
+    return pm.scaled(
+        max_w,
+        max_h,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
 
 
 def _qt_multimedia_environment_report() -> str:
@@ -296,10 +353,19 @@ class MainWindow(QMainWindow):
         self.analysis_running = False
         self.analysis_warmup_until_ms = 0
         self.analysis_frame_seq = 0
+        self._analysis_log_scroll_counter = 0
+        self._analysis_confirm_edge_prev = ""
         self.flow_phase = "WAIT_ITEM"
         self.flow_game_index = 1
         self.timeup_confirm_count = 0
+        self._fever_raw_streak = 0
         self._last_raw_scene_in_game = ""
+        self._fever_count = 0
+        self._fever_episode_active = False
+        self._skill_count = 0
+        self._skill_episode_active = False
+        self._skill_off_streak = 0
+        self._skill_raw_streak = 0
         self.locked_item_targets: list[str] = []
         self.locked_use_tsum = "-"
         self.locked_item_fixed = False
@@ -328,6 +394,9 @@ class MainWindow(QMainWindow):
         self.use_tsum_classifier = UseTsumClassifier(
             models_root=self.project_root / "app/models/use_tsum",
             registry_path=self.project_root / "app/models/use_tsum/registry.json",
+        )
+        self.skill_classifier_pool = SkillClassifierPool(
+            models_root=self.project_root / "app/models/skill",
         )
         self.train_timer = QTimer(self)
         self.train_timer.setInterval(500)
@@ -464,6 +533,264 @@ class MainWindow(QMainWindow):
     def _on_feature_changed(self, feature_id: int) -> None:
         self._render_feature_ui(feature_id)
 
+    def _on_video_tool_quick_mode_clicked(self, mode_id: int) -> None:
+        """動画ツール: 1=右列・トリミング、2=右列・シーン保存、3〜6=右列を空に。"""
+        if self.button_group.checkedId() != 2:
+            return
+        stack = getattr(self, "_video_tool_right_stack", None)
+        if stack is None or not _is_alive_qobject(stack):
+            return
+        if mode_id == 1:
+            stack.setCurrentIndex(0)
+            stack.setVisible(True)
+        elif mode_id == 2:
+            stack.setCurrentIndex(1)
+            stack.setVisible(True)
+        else:
+            stack.setVisible(False)
+
+    def _on_video_tool_scene_save_clicked(self) -> None:
+        """右列・画像保存: 停止中フレームを PNG で書き出す（train/val は自動）。"""
+        status = getattr(self, "_video_tool_scene_status", None)
+        combo = getattr(self, "_video_tool_scene_class_combo", None)
+        if self.button_group.checkedId() != 2 or combo is None or not _is_alive_qobject(combo):
+            return
+        image = self.current_video_frame_image
+        if image is None or image.isNull():
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("フレームがありません。動画を一時停止または停止してから保存してください。")
+            return
+        choice = combo.currentText()
+        if not choice:
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("クラスを選択してください。")
+            return
+        ok, msg = self._save_frame_to_scene_class(image, choice)
+        if ok:
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #2E7D32;")
+                parts = msg.split("/", 2)
+                if len(parts) == 3:
+                    split, cls, fname = parts[0], parts[1], parts[2]
+                    status.setText(f"保存しました → {split} / {cls} / {fname}")
+                    self._train_log(f"画像保存: {split}/{cls} -> {fname}")
+                else:
+                    status.setText(f"保存しました → {msg}")
+                    self._train_log(f"画像保存: {msg}")
+        else:
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText(f"書き込み失敗: {msg}")
+
+    def _on_video_tool_skill_save_clicked(self) -> None:
+        """動画ツール2: スキル発動画像を skills/<dir>/<種類>/ へ保存（非同期）。"""
+        status = getattr(self, "_video_tool_scene_status", None)
+        save_btn = getattr(self, "_video_tool_skill_save_btn", None)
+        tsum_combo = getattr(self, "_video_tool_skill_tsum_combo", None)
+        cat_combo = getattr(self, "_video_tool_skill_cat_combo", None)
+        if self.button_group.checkedId() != 2 or tsum_combo is None or cat_combo is None:
+            return
+        if not _is_alive_qobject(tsum_combo) or not _is_alive_qobject(cat_combo):
+            return
+        image = self.current_video_frame_image
+        if image is None or image.isNull():
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("フレームがありません。動画を一時停止または停止してから保存してください。")
+            return
+        tsum_dir = tsum_combo.currentData()
+        category = cat_combo.currentData()
+        if not tsum_dir or not category:
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("ツムと種類を選択してください。")
+            return
+        out_dir = self._skills_images_root() / str(tsum_dir) / str(category)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        frame_index = int((max(self._playback_position_ms(), 0) / 1000.0) * float(self.estimated_fps or 30.0))
+        out_path = out_dir / f"skill_{category}_{timestamp}_f{frame_index}.png"
+        rel_msg = f"skills/{tsum_dir}/{category}/{out_path.name}"
+
+        prepared = prepare_training_image(image)
+        if prepared.isNull():
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("画像の準備に失敗しました。")
+            return
+
+        if save_btn is not None and _is_alive_qobject(save_btn):
+            save_btn.setEnabled(False)
+        if status is not None and _is_alive_qobject(status):
+            status.setStyleSheet("color: #555;")
+            status.setText("スキル保存中…")
+
+        signals = _AsyncPngSaveSignals()
+        task = _AsyncPngSaveTask(prepared, out_path)
+
+        def _on_skill_save_done(ok: bool, path_str: str) -> None:
+            if save_btn is not None and _is_alive_qobject(save_btn):
+                save_btn.setEnabled(True)
+            if status is None or not _is_alive_qobject(status):
+                return
+            if ok:
+                status.setStyleSheet("color: #2E7D32;")
+                status.setText(f"スキル保存 → {rel_msg}")
+            else:
+                status.setStyleSheet("color: #C62828;")
+                status.setText(f"スキル保存失敗: {path_str}")
+
+        signals.finished.connect(_on_skill_save_done)
+        task.signals = signals
+        QThreadPool.globalInstance().start(task)
+
+    def _choose_scene_train_val_split(self, cls: str) -> str:
+        base = self.project_root / "app/assets/images"
+        train_dir = base / "train" / cls
+        val_dir = base / "val" / cls
+        train_count = self._count_image_files(train_dir)
+        val_count = self._count_image_files(val_dir)
+        total = train_count + val_count
+        expected_val_after = int((total + 1) * 0.2)
+        if val_count < expected_val_after:
+            return "val"
+        return "train"
+
+    def _skills_images_root(self) -> Path:
+        return self.project_root / "app/assets/images/skills"
+
+    def _default_skill_tsum_dir(self) -> str:
+        if self.locked_item_fixed and self.locked_use_tsum not in {"-", ""}:
+            resolved = self._resolve_tsum_dir(self.locked_use_tsum)
+            if resolved:
+                return resolved
+        if hasattr(self, "item_tsum_combo"):
+            selected = self.item_tsum_combo.currentText()
+            if selected and selected != "auto":
+                return self._resolve_tsum_dir(selected)
+        return ""
+
+    def _save_frame_to_skill(self, image, tsum_dir: str, category: str) -> tuple[bool, str]:
+        if image is None or image.isNull():
+            return False, "画像がありません"
+        if not tsum_dir or not category:
+            return False, "ツムまたは種類が未選択です"
+        out_dir = self._skills_images_root() / tsum_dir / category
+        out_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        frame_index = int((max(self._playback_position_ms(), 0) / 1000.0) * float(self.estimated_fps or 30.0))
+        out_path = out_dir / f"skill_{category}_{timestamp}_f{frame_index}.png"
+        if save_training_png(image, out_path):
+            return True, f"skills/{tsum_dir}/{category}/{out_path.name}"
+        return False, str(out_path)
+
+    def _create_skill_tsum_category_combos(self, default_tsum_dir: str) -> tuple[QComboBox, QComboBox]:
+        tsum_combo = QComboBox()
+        tsum_ids = list_skill_tsum_dirs(self._skills_images_root())
+        if not tsum_ids:
+            tsum_ids = self.tsum_registry.list_tsum_ids()
+        for tid in tsum_ids:
+            display = self.use_tsum_classifier._display_map.get(tid, tid)
+            tsum_combo.addItem(f"{display} ({tid})", tid)
+        if default_tsum_dir:
+            idx = tsum_combo.findData(default_tsum_dir)
+            if idx >= 0:
+                tsum_combo.setCurrentIndex(idx)
+
+        cat_combo = QComboBox()
+
+        def refill_categories() -> None:
+            cat_combo.clear()
+            tid = tsum_combo.currentData()
+            if not tid:
+                return
+            for cat in list_skill_categories(self._skills_images_root(), str(tid)):
+                cat_combo.addItem(skill_category_label(cat), cat)
+            act_idx = cat_combo.findData(SKILL_IMAGE_CATEGORY_ACTIVATION)
+            if act_idx >= 0:
+                cat_combo.setCurrentIndex(act_idx)
+
+        tsum_combo.currentIndexChanged.connect(lambda _i: refill_categories())
+        refill_categories()
+        return tsum_combo, cat_combo
+
+    def _build_skill_save_group(
+        self,
+        parent_layout: QVBoxLayout,
+        *,
+        show_fever_hint: bool,
+        default_tsum_dir: str,
+    ) -> tuple[QCheckBox, QComboBox, QComboBox]:
+        """シーン確認ダイアログ用: スキル発動画面の任意保存 UI。"""
+        group = QGroupBox("スキル発動画面（任意）")
+        g_layout = QVBoxLayout(group)
+        hint = (
+            "フィーバー表示とスキル発動が重なることがあります。"
+            "このフレームをスキル学習用に保存する場合は種類を選んでください。"
+        )
+        if show_fever_hint:
+            hint = "※ フィーバーと重なっている場合、下で発動時などを選んで保存できます。\n" + hint
+        hint_lbl = QLabel(hint)
+        hint_lbl.setWordWrap(True)
+        g_layout.addWidget(hint_lbl)
+
+        save_cb = QCheckBox("スキル発動画像も保存する")
+        save_cb.setChecked(False)
+        g_layout.addWidget(save_cb)
+
+        tsum_combo, cat_combo = self._create_skill_tsum_category_combos(default_tsum_dir)
+        tsum_row = QHBoxLayout()
+        tsum_row.addWidget(QLabel("ツム (dir)"))
+        tsum_row.addWidget(tsum_combo, 1)
+        g_layout.addLayout(tsum_row)
+        cat_row = QHBoxLayout()
+        cat_row.addWidget(QLabel("種類"))
+        cat_row.addWidget(cat_combo, 1)
+        g_layout.addLayout(cat_row)
+
+        save_cb.toggled.connect(tsum_combo.setEnabled)
+        save_cb.toggled.connect(cat_combo.setEnabled)
+        tsum_combo.setEnabled(False)
+        cat_combo.setEnabled(False)
+
+        parent_layout.addWidget(group)
+        return save_cb, tsum_combo, cat_combo
+
+    def _try_skill_save_from_dialog(
+        self,
+        frame_image,
+        save_cb: QCheckBox,
+        tsum_combo: QComboBox,
+        cat_combo: QComboBox,
+    ) -> None:
+        if not save_cb.isChecked():
+            return
+        tsum_dir = tsum_combo.currentData()
+        category = cat_combo.currentData()
+        if not tsum_dir or not category:
+            return
+        ok, msg = self._save_frame_to_skill(frame_image, str(tsum_dir), str(category))
+        if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+            self.log_view.append(("スキル画像保存: " if ok else "スキル画像保存失敗: ") + msg)
+        if ok:
+            self._train_log(f"スキル画像保存: {msg}")
+
+    def _save_frame_to_scene_class(self, image, choice: str) -> tuple[bool, str]:
+        """現在位置のフレームを train/val 振り分けで PNG 保存（動画ツールの画像保存と同じ規則）。"""
+        if image is None or image.isNull():
+            return False, "画像がありません"
+        split = self._choose_scene_train_val_split(choice)
+        out_dir = self.project_root / "app/assets/images" / split / choice
+        out_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        frame_index = int((max(self._playback_position_ms(), 0) / 1000.0) * float(self.estimated_fps or 30.0))
+        out_path = out_dir / f"scene_{choice}_{timestamp}_f{frame_index}.png"
+        if save_training_png(image, out_path):
+            return True, f"{split}/{choice}/{out_path.name}"
+        return False, str(out_path)
+
     def _clear_layout(self, layout: QVBoxLayout) -> None:
         while layout.count():
             item = layout.takeAt(0)
@@ -485,25 +812,60 @@ class MainWindow(QMainWindow):
             if hasattr(self, name):
                 delattr(self, name)
 
+    def _dispose_media_player(self) -> None:
+        """タブ切替で古い QMediaPlayer / QAudioOutput が子として残らないようにする。"""
+        pl = getattr(self, "player", None)
+        if pl is not None and _is_alive_qobject(pl):
+            pl.blockSignals(True)
+            try:
+                pl.stop()
+            except RuntimeError:
+                pass
+            pl.deleteLater()
+            delattr(self, "player")
+        ao = getattr(self, "audio_output", None)
+        if ao is not None and _is_alive_qobject(ao):
+            ao.blockSignals(True)
+            ao.deleteLater()
+            delattr(self, "audio_output")
+
     def _render_feature_ui(self, feature_id: int) -> None:
         if hasattr(self, "cv_play_timer"):
             self.cv_play_timer.stop()
             self._cv_playing = False
         if getattr(self, "cv_source", None) is not None:
             self.cv_source.release()
+        g = getattr(self, "_video_tool_mode_group", None)
+        if g is not None:
+            for b in list(g.buttons()):
+                g.removeButton(b)
+            g.deleteLater()
+            delattr(self, "_video_tool_mode_group")
+        pl = getattr(self, "player", None)
+        if pl is not None and _is_alive_qobject(pl):
+            pl.blockSignals(True)
+            try:
+                pl.stop()
+            except RuntimeError:
+                pass
         self._clear_layout(self.left_layout)
         self._clear_layout(self.center_layout)
+        self.current_video_container = None
         self._clear_layout(self.right_layout)
+        self._dispose_media_player()
+        self.left_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_layout.setSpacing(0)
+        self.center_layout.setContentsMargins(0, 0, 0, 0)
+        self.center_layout.setSpacing(0)
+        self.right_layout.setContentsMargins(0, 0, 0, 0)
+        self.right_layout.setSpacing(0)
+        self._right_section_frame.setVisible(True)
         if feature_id == 2:
             self._release_counter_and_log_widgets()
 
-        # 動画ツール(tab2)のみ: 左=クイックボタン列、右=トリミングのみ（列幅入替）。ログ・カウンターは置かない。
-        if feature_id == 2:
-            self._left_section_frame.setFixedWidth(520)
-            self._right_section_frame.setFixedWidth(300)
-        else:
-            self._left_section_frame.setFixedWidth(300)
-            self._right_section_frame.setFixedWidth(520)
+        # 処理テスト(1)・動画ツール(2)・学習(3) 共通: left 300 + center 480 + right 520（列幅の例外なし）
+        self._left_section_frame.setFixedWidth(300)
+        self._right_section_frame.setFixedWidth(520)
 
         if feature_id == 1:
             self.left_layout.setContentsMargins(2, 2, 2, 2)
@@ -555,13 +917,32 @@ class MainWindow(QMainWindow):
             self.start_from_zero_check = QCheckBox("先頭から")
             self.start_from_zero_check.setChecked(True)
             self.left_layout.addWidget(self.start_from_zero_check)
+
+            self.left_layout.addWidget(QLabel("シーン判定の確認（入った瞬間・モーダル）"))
+            confirm_wrap = QWidget()
+            confirm_layout = QVBoxLayout(confirm_wrap)
+            confirm_layout.setContentsMargins(0, 0, 0, 0)
+            confirm_layout.setSpacing(1)
+            self.analysis_scene_confirm_checks = {}
+            for scene_key in _ANALYSIS_SCENE_CONFIRM_LABELS:
+                cb = QCheckBox(scene_key)
+                cb.setChecked(False)
+                self.analysis_scene_confirm_checks[scene_key] = cb
+                confirm_layout.addWidget(cb)
+            self.left_layout.addWidget(confirm_wrap)
+
             self.left_layout.addStretch(1)
         else:
             if feature_id == 2:
                 self.right_layout.setContentsMargins(2, 2, 2, 2)
                 self.right_layout.setSpacing(2)
-                self.right_layout.addWidget(QLabel("トリミング"))
-                self.right_layout.addWidget(QLabel("対象(複数選択)"))
+                trim_page = QWidget()
+                self._video_tool_right_inner = trim_page
+                inner_layout = QVBoxLayout(trim_page)
+                inner_layout.setContentsMargins(0, 0, 0, 0)
+                inner_layout.setSpacing(2)
+                inner_layout.addWidget(QLabel("トリミング"))
+                inner_layout.addWidget(QLabel("対象(複数選択)"))
                 self.crop_target_buttons = {}
                 target_grid = QFrame()
                 target_grid_layout = QHBoxLayout(target_grid)
@@ -578,21 +959,21 @@ class MainWindow(QMainWindow):
                     btn.toggled.connect(self._on_crop_target_selection_changed)
                     self.crop_target_buttons[key] = btn
                     target_grid_layout.addWidget(btn)
-                self.right_layout.addWidget(target_grid)
+                inner_layout.addWidget(target_grid)
                 # Default selection to avoid "saved but no target selected" confusion.
                 if "score" in self.crop_target_buttons:
                     self.crop_target_buttons["score"].setChecked(True)
 
                 self.crop_rect_label = QLabel("範囲: 未選択")
-                self.right_layout.addWidget(self.crop_rect_label)
+                inner_layout.addWidget(self.crop_rect_label)
 
                 self.crop_start_button = QPushButton("トリミング開始")
                 self.crop_start_button.setCheckable(True)
                 self.crop_start_button.toggled.connect(self._on_toggle_crop_mode)
-                self.right_layout.addWidget(self.crop_start_button)
+                inner_layout.addWidget(self.crop_start_button)
 
                 self.crop_status_label = QLabel("状態: 停止")
-                self.right_layout.addWidget(self.crop_status_label)
+                inner_layout.addWidget(self.crop_status_label)
 
                 adjust_row1 = QFrame()
                 adjust_row1_layout = QHBoxLayout(adjust_row1)
@@ -614,7 +995,7 @@ class MainWindow(QMainWindow):
                 self.crop_y_spin.setFixedHeight(22)
                 self.crop_y_spin.valueChanged.connect(self._on_crop_spin_changed)
                 adjust_row1_layout.addWidget(self.crop_y_spin, 1)
-                self.right_layout.addWidget(adjust_row1)
+                inner_layout.addWidget(adjust_row1)
 
                 adjust_row2 = QFrame()
                 adjust_row2_layout = QHBoxLayout(adjust_row2)
@@ -636,29 +1017,112 @@ class MainWindow(QMainWindow):
                 self.crop_h_spin.setFixedHeight(22)
                 self.crop_h_spin.valueChanged.connect(self._on_crop_spin_changed)
                 adjust_row2_layout.addWidget(self.crop_h_spin, 1)
-                self.right_layout.addWidget(adjust_row2)
+                inner_layout.addWidget(adjust_row2)
 
                 save_crop_button = QPushButton("位置を保存")
                 save_crop_button.clicked.connect(self._on_save_crop_clicked)
-                self.right_layout.addWidget(save_crop_button)
+                inner_layout.addWidget(save_crop_button)
                 save_dataset_button = QPushButton("対象画像保存(自動train/val)")
                 save_dataset_button.clicked.connect(self._on_save_target_images_clicked)
-                self.right_layout.addWidget(save_dataset_button)
+                inner_layout.addWidget(save_dataset_button)
                 check_crop_button = QPushButton("停止画で切り抜き確認")
                 check_crop_button.clicked.connect(self._on_check_crop_preview_clicked)
-                self.right_layout.addWidget(check_crop_button)
-                self.right_layout.addWidget(QLabel("動画上をドラッグで指定"))
+                inner_layout.addWidget(check_crop_button)
+                inner_layout.addWidget(QLabel("動画上をドラッグで指定"))
 
                 self.crop_preview_label = QLabel("プレビューなし")
                 self.crop_preview_label.setFixedSize(180, 100)
                 self.crop_preview_label.setStyleSheet("border:1px solid #888; background:#111; color:#DDD;")
                 self.crop_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.right_layout.addWidget(self.crop_preview_label)
+                inner_layout.addWidget(self.crop_preview_label)
                 self.crop_check_label = QLabel("確認プレビューなし")
                 self.crop_check_label.setFixedSize(280, 180)
                 self.crop_check_label.setStyleSheet("border:1px solid #888; background:#111; color:#DDD;")
                 self.crop_check_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.right_layout.addWidget(self.crop_check_label)
+                inner_layout.addWidget(self.crop_check_label)
+                inner_layout.addStretch(1)
+
+                scene_page = QWidget()
+                sv = QVBoxLayout(scene_page)
+                sv.setContentsMargins(0, 0, 0, 0)
+                sv.setSpacing(10)
+                scene_title = QLabel("画像の保存")
+                scene_title.setStyleSheet("font-weight: bold; font-size: 14px;")
+                sv.addWidget(scene_title)
+                scene_hint = QLabel(
+                    "一時停止または停止中の画面1枚を PNG で書き出します。\n"
+                    "保存先: app/assets/images の train または val / クラス名（振り分けは自動・目安 val 約20%）。"
+                )
+                scene_hint.setWordWrap(True)
+                scene_hint.setStyleSheet("color: #444;")
+                sv.addWidget(scene_hint)
+
+                class_row = QFrame()
+                class_row_layout = QHBoxLayout(class_row)
+                class_row_layout.setContentsMargins(0, 0, 0, 0)
+                class_row_layout.setSpacing(8)
+                class_row_layout.addWidget(QLabel("クラス"))
+                self._video_tool_scene_class_combo = QComboBox()
+                self._video_tool_scene_class_combo.addItems(list(SimpleTrainer.CLASSES))
+                self._video_tool_scene_class_combo.setMinimumWidth(220)
+                class_row_layout.addWidget(self._video_tool_scene_class_combo, 1)
+                sv.addWidget(class_row)
+
+                self._video_tool_scene_save_btn = QPushButton("画像を保存")
+                self._video_tool_scene_save_btn.setToolTip("選択クラスへ保存（train/val は自動）")
+                self._video_tool_scene_save_btn.setAutoDefault(True)
+                self._video_tool_scene_save_btn.clicked.connect(self._on_video_tool_scene_save_clicked)
+                sv.addWidget(self._video_tool_scene_save_btn)
+
+                skill_title = QLabel("スキル発動画像")
+                skill_title.setStyleSheet("font-weight: bold; font-size: 14px; margin-top: 8px;")
+                sv.addWidget(skill_title)
+                skill_hint = QLabel(
+                    "保存先: app/assets/images/skills/<dir名>/<種類>/（例: namine/activation）。\n"
+                    "フィーバーと重なっている画面も、こちらで発動時として保存できます。"
+                )
+                skill_hint.setWordWrap(True)
+                skill_hint.setStyleSheet("color: #444;")
+                sv.addWidget(skill_hint)
+                skill_tsum_row = QFrame()
+                skill_tsum_row_layout = QHBoxLayout(skill_tsum_row)
+                skill_tsum_row_layout.setContentsMargins(0, 0, 0, 0)
+                skill_tsum_row_layout.setSpacing(8)
+                skill_tsum_row_layout.addWidget(QLabel("ツム"))
+                self._video_tool_skill_tsum_combo, self._video_tool_skill_cat_combo = (
+                    self._create_skill_tsum_category_combos(self._default_skill_tsum_dir())
+                )
+                self._video_tool_skill_tsum_combo.setMinimumWidth(180)
+                skill_tsum_row_layout.addWidget(self._video_tool_skill_tsum_combo, 1)
+                sv.addWidget(skill_tsum_row)
+                skill_cat_row = QFrame()
+                skill_cat_row_layout = QHBoxLayout(skill_cat_row)
+                skill_cat_row_layout.setContentsMargins(0, 0, 0, 0)
+                skill_cat_row_layout.setSpacing(8)
+                skill_cat_row_layout.addWidget(QLabel("種類"))
+                self._video_tool_skill_cat_combo.setMinimumWidth(180)
+                skill_cat_row_layout.addWidget(self._video_tool_skill_cat_combo, 1)
+                sv.addWidget(skill_cat_row)
+                self._video_tool_skill_save_btn = QPushButton("スキル発動画像を保存")
+                self._video_tool_skill_save_btn.setToolTip(
+                    "skills/<dir>/activation/ などへ保存（学習タブのモデル保存で反映）"
+                )
+                self._video_tool_skill_save_btn.clicked.connect(self._on_video_tool_skill_save_clicked)
+                sv.addWidget(self._video_tool_skill_save_btn)
+
+                self._video_tool_scene_status = QLabel(
+                    "左の「2」で表示。シーンはクラスを選んで「画像を保存」。"
+                    "スキルはツム・種類を選んで「スキル発動画像を保存」。"
+                )
+                self._video_tool_scene_status.setWordWrap(True)
+                self._video_tool_scene_status.setStyleSheet("color: #555;")
+                sv.addWidget(self._video_tool_scene_status)
+                sv.addStretch(1)
+
+                self._video_tool_right_stack = QStackedWidget()
+                self._video_tool_right_stack.addWidget(trim_page)
+                self._video_tool_right_stack.addWidget(scene_page)
+                self.right_layout.addWidget(self._video_tool_right_stack)
                 self._on_crop_target_selection_changed()
             elif feature_id not in (3,):
                 self.left_layout.addWidget(QLabel(f"left - button{feature_id}"))
@@ -672,24 +1136,48 @@ class MainWindow(QMainWindow):
                 "}"
                 "QPushButton:hover { background: #EAEAEA; }"
                 "QPushButton:pressed { background: #DCDCDC; }"
+                "QPushButton:checked { background: #FFD54F; border: 1px solid #C9A227; }"
             )
             video_tool_btn_row = QFrame()
             video_tool_btn_row.setStyleSheet("background: transparent;")
-            btn_row_layout = QHBoxLayout(video_tool_btn_row)
-            btn_row_layout.setContentsMargins(4, 4, 4, 2)
+            # 縦ボタン列が左列いっぱいに伸びないよう幅を抑える。
+            video_tool_btn_row.setMaximumWidth(88)
+            btn_row_layout = QVBoxLayout(video_tool_btn_row)
+            btn_row_layout.setContentsMargins(4, 4, 4, 4)
             btn_row_layout.setSpacing(4)
+            self._video_tool_mode_group = QButtonGroup(self)
+            self._video_tool_mode_group.setExclusive(True)
             for i in range(6):
                 btn = QPushButton(str(i + 1))
+                btn.setCheckable(True)
                 btn.setFixedHeight(28)
                 btn.setStyleSheet(video_tool_btn_style)
-                btn.setToolTip(f"動画ツール クイックボタン {i + 1}（未割当）")
-                btn_row_layout.addWidget(btn, 1)
+                if i == 0:
+                    btn.setToolTip("右列: トリミング・位置保存など")
+                elif i == 1:
+                    btn.setToolTip("右列: シーン画像・スキル発動画像の保存")
+                else:
+                    btn.setToolTip("右列を空にする（未割当）")
+                btn_row_layout.addWidget(btn)
+                self._video_tool_mode_group.addButton(btn, i + 1)
+            self._video_tool_mode_group.idClicked.connect(self._on_video_tool_quick_mode_clicked)
+            first_mode = self._video_tool_mode_group.button(1)
+            if first_mode is not None:
+                first_mode.setChecked(True)
+            stack = getattr(self, "_video_tool_right_stack", None)
+            if stack is not None:
+                stack.setCurrentIndex(0)
+                stack.setVisible(True)
+            btn_row_layout.addStretch(1)
             self.left_layout.addWidget(video_tool_btn_row)
             self.left_layout.addStretch(1)
         else:
             self.log_view = QTextEdit()
             self.log_view.setReadOnly(True)
             self.log_view.setAcceptRichText(True)
+            doc = self.log_view.document()
+            if doc is not None and hasattr(doc, "setMaximumBlockCount"):
+                doc.setMaximumBlockCount(12000)
             self.counter_frame = QFrame()
             self.counter_frame.setFixedHeight(72)
             self.counter_frame.setStyleSheet("border: none; background: transparent;")
@@ -763,7 +1251,9 @@ class MainWindow(QMainWindow):
             video_container = AspectFitVideoContainer(top_box)
             self.current_video_container = video_container
             self.use_opencv_for_video = False
-            if self.cv_source is not None and platform.system() == "Windows":
+            # Windows に加え macOS でも Qt Multimedia がファイルを出さない環境があるため、
+            # FileVideoSource が使えるときはファイル動画モード（OpenCV / imageio）に寄せる。
+            if self.cv_source is not None and platform.system() in ("Windows", "Darwin"):
                 self.use_opencv_for_video = True
             if not self.use_opencv_for_video:
                 self.player.setVideoOutput(video_container.video_widget)
@@ -974,6 +1464,14 @@ class MainWindow(QMainWindow):
             train_page_layout.addWidget(train_save_button)
             self.train_status_label = QLabel("状態: 待機中")
             train_page_layout.addWidget(self.train_status_label)
+            self.train_progress_bar = QProgressBar()
+            self.train_progress_bar.setFixedHeight(14)
+            self.train_progress_bar.setRange(0, 100)
+            self.train_progress_bar.setValue(0)
+            self.train_progress_bar.setTextVisible(True)
+            self.train_progress_bar.setFormat("")
+            self.train_progress_bar.setVisible(False)
+            train_page_layout.addWidget(self.train_progress_bar)
 
             train_page_layout.addWidget(QLabel("使用ツム登録"))
             use_tsum_row_1 = QFrame()
@@ -1015,28 +1513,52 @@ class MainWindow(QMainWindow):
             if last_path.exists():
                 initial_path = str(last_path.parent)
 
-        dialog = QFileDialog(self, "動画ファイルを選択")
-        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dialog.setNameFilter("動画ファイル (*.mp4 *.mov *.m4v *.avi *.mkv *.webm)")
-        dialog.setDirectory(initial_path)
-        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-
-        if self.last_video_path and Path(self.last_video_path).exists():
-            dialog.selectFile(self.last_video_path)
-
-        if not dialog.exec():
+        # exec()+selectedFiles() は環境によって空になりやすいので getOpenFileName に統一する。
+        filter_str = "動画 (*.mp4 *.mov *.m4v *.avi *.mkv *.webm);;すべて (*.*)"
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "動画ファイルを選択",
+            initial_path,
+            filter_str,
+        )
+        if not path:
             return
+        self._load_video(path)
 
-        selected_files = dialog.selectedFiles()
-        if not selected_files:
-            return
-        self._load_video(selected_files[0])
+    def _switch_to_qt_video_and_load(self, resolved: str) -> bool:
+        """OpenCV / imageio 経路が失敗したとき、同一ファイルを Qt Multimedia で開き直す。"""
+        if self.cv_source is not None:
+            self.cv_source.release()
+        self.cv_play_timer.stop()
+        self._cv_playing = False
+        self.use_opencv_for_video = False
+        vc = self.current_video_container
+        if vc is None or not hasattr(self, "player") or not _is_alive_qobject(self.player):
+            return False
+        vc.set_opencv_display(False)
+        if hasattr(self, "mute_checkbox") and _is_alive_qobject(self.mute_checkbox):
+            self.mute_checkbox.setEnabled(True)
+            self.mute_checkbox.setToolTip("")
+        self.player.setVideoOutput(vc.video_widget)
+        sink = vc.video_widget.videoSink()
+        if sink is None:
+            return False
+        try:
+            sink.videoFrameChanged.disconnect(self._on_video_frame_changed)
+        except TypeError:
+            pass
+        sink.videoFrameChanged.connect(self._on_video_frame_changed)
+        self.player.setSource(QUrl.fromLocalFile(resolved))
+        self.player.pause()
+        self._on_playback_state_changed(self.player.playbackState())
+        return True
 
     def _load_video(self, path: str) -> None:
         resolved = str(Path(path).expanduser().resolve(strict=False))
         self.last_video_path = resolved
         self.settings.setValue("last_video_dir", str(Path(resolved).parent))
-        self.video_file_label.setText(Path(resolved).name)
+        if hasattr(self, "video_file_label") and _is_alive_qobject(self.video_file_label):
+            self.video_file_label.setText(Path(resolved).name)
         self.analysis_running = False
         self.analysis_warmup_until_ms = 0
         self.analysis_frame_seq = 0
@@ -1065,6 +1587,13 @@ class MainWindow(QMainWindow):
                 if prog is not None:
                     prog.close()
             if not opened_ok:
+                detail = getattr(self.cv_source, "last_open_error", "") or ""
+                if self._switch_to_qt_video_and_load(resolved):
+                    if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                        self.log_view.append(
+                            f"ファイル動画モードで開けなかったため、Qt で再試行しました: {resolved}"
+                        )
+                    return
                 if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
                     self.log_view.append(f"動画を開けませんでした: {resolved}")
                 drive_hint = ""
@@ -1073,12 +1602,12 @@ class MainWindow(QMainWindow):
                         "\n\nマイドライブ上のファイルは、開くときにバックグラウンドで順次ダウンロードします。"
                         "初回は容量・回線状況により数十秒〜かかることがあります。別アプリでファイルを開きっぱなしにしていると失敗することがあります。"
                     )
-                detail = getattr(self.cv_source, "last_open_error", "") or ""
                 box = QMessageBox(self)
                 box.setIcon(QMessageBox.Icon.Warning)
                 box.setWindowTitle("動画を開けません")
                 box.setText(
                     "動画の取り込みまたはデコードに失敗しました（順次読み・ffmpeg コピー・OpenCV・FFmpeg・H.264 トランスコードを試行済み）。"
+                    "Qt への切り替えもできないか、Qt でも読み込めませんでした。"
                     "ネットワーク・ディスク容量・他アプリのロックを確認してください。"
                     + drive_hint
                 )
@@ -1096,11 +1625,18 @@ class MainWindow(QMainWindow):
             self.cv_source.seek_ms(0)
             img = self.cv_source.read_qimage()
             if img is None or img.isNull():
-                QMessageBox.warning(self, "動画を開けません", "最初のフレームを読み取れませんでした。")
                 self.cv_source.release()
+                if self._switch_to_qt_video_and_load(resolved):
+                    if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                        self.log_view.append(
+                            f"最初のフレーム取得に失敗したため、Qt で再試行しました: {resolved}"
+                        )
+                    return
+                QMessageBox.warning(self, "動画を開けません", "最初のフレームを読み取れませんでした。")
                 return
             self._video_frame_counter = 0
             self._cv_push_frame(img)
+            QApplication.processEvents()
             self._refresh_play_button_text()
             self._update_step_buttons_enabled()
             QTimer.singleShot(0, lambda: self._cv_seek_and_show(self._cv_position_ms))
@@ -1151,14 +1687,23 @@ class MainWindow(QMainWindow):
             self.current_video_container.set_source_size(image.width(), image.height())
             lbl = self.current_video_container.frame_label
             geo = lbl.geometry()
-            if geo.width() > 0 and geo.height() > 0:
-                lbl.setPixmap(
-                    QPixmap.fromImage(image).scaled(
-                        geo.size(),
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
+            tw, th = geo.width(), geo.height()
+            # レイアウト直後は geometry が 0 のことがあり、この分岐だと一生 pixmap が付かず真っ黒になる。
+            if tw <= 0 or th <= 0:
+                cr = self.current_video_container.contentsRect()
+                tw = max(cr.width(), 1)
+                th = max(cr.height(), 1)
+            if tw <= 0 or th <= 0:
+                tw = max(min(image.width(), 1280), 1)
+                th = max(min(image.height(), 720), 1)
+            lbl.setPixmap(
+                QPixmap.fromImage(image).scaled(
+                    tw,
+                    th,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
                 )
+            )
         self._on_player_position_changed(self._cv_position_ms)
         self._video_frame_counter += 1
         if self._video_frame_counter % 2 != 0:
@@ -1260,7 +1805,7 @@ class MainWindow(QMainWindow):
 
     def _on_player_position_changed(self, position_ms: int) -> None:
         self._update_playback_indicators(position_ms)
-        if hasattr(self, "counter_progress_label"):
+        if hasattr(self, "counter_progress_label") and _is_alive_qobject(self.counter_progress_label):
             frame_index = int((max(position_ms, 0) / 1000.0) * self.estimated_fps)
             self.counter_progress_label.setText(f"進行: {position_ms/1000.0:.2f}s / f{frame_index}")
 
@@ -1297,9 +1842,9 @@ class MainWindow(QMainWindow):
         self.analysis_warmup_until_ms = 0
         self.analysis_frame_seq = 0
         self._reset_analysis_flow()
-        if hasattr(self, "counter_analysis_state_label"):
+        if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(self.counter_analysis_state_label):
             self.counter_analysis_state_label.setText("解析状態: 停止")
-        if hasattr(self, "analyze_button"):
+        if hasattr(self, "analyze_button") and _is_alive_qobject(self.analyze_button):
             self.analyze_button.setText("解析開始")
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
@@ -1384,10 +1929,13 @@ class MainWindow(QMainWindow):
             return
         self.crop_positions_for_analysis = self._load_crop_positions()
         self.use_tsum_classifier.reload()
+        self.skill_classifier_pool.reload()
         self.video_analyzer.reload_model()
         self.video_analyzer.reset()
         self.analysis_running = True
         self.analysis_frame_seq = 0
+        self._analysis_log_scroll_counter = 0
+        self._analysis_confirm_edge_prev = ""
         self._reset_analysis_flow()
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(self.counter_analysis_state_label):
             self.counter_analysis_state_label.setText("解析状態: 実行中")
@@ -1416,9 +1964,26 @@ class MainWindow(QMainWindow):
                 f"loaded={self.video_analyzer.scene_model_loaded} "
                 f"class_count={self.video_analyzer.scene_class_count}"
             )
+            if self.video_analyzer.scene_model_loaded:
+                labels = sorted(self.video_analyzer.scene_classifier.model.centroids.keys())
+                self.log_view.append(
+                    "シーン centroid のクラス（学習で train に画像があったもののみ）: " + ", ".join(labels)
+                )
+            else:
+                p = getattr(self.video_analyzer, "scene_model_path", None)
+                if p is not None:
+                    reason = SceneCentroidModel.describe_load_failure(p)
+                    self.log_view.append(f"scene_model 読込失敗: {p} （{reason}）")
             self.log_view.append(f"トリミング読込: {list(self.crop_positions_for_analysis.keys())}")
+            skill_dirs = self.skill_classifier_pool.known_dirs()
+            if skill_dirs:
+                self.log_view.append(f"スキルモデル読込: {', '.join(skill_dirs)}")
+            else:
+                self.log_view.append(
+                    "スキルモデル: 未読込（skills/<dir名>/activation/ に発動時画像→学習タブで保存）"
+                )
             if not self.video_analyzer.scene_model_loaded:
-                self.log_view.append("警告: scene_model.json が未読込です。button3で学習→モデル保存を先に実施してください。")
+                self.log_view.append("警告: scene_model.json が未読込です。学習タブで学習→モデル保存を先に実施してください。")
 
     def _on_sample_frame_changed(self, value: int) -> None:
         self.video_analyzer.sample_every_frames = max(1, value)
@@ -1431,7 +1996,9 @@ class MainWindow(QMainWindow):
     def _on_crop_target_selection_changed(self) -> None:
         if not hasattr(self, "crop_target_buttons") or not hasattr(self, "crop_rect_label"):
             return
-        selected = [k for k, b in self.crop_target_buttons.items() if b.isChecked()]
+        if not _is_alive_qobject(getattr(self, "crop_rect_label", None)):
+            return
+        selected = [k for k, b in self.crop_target_buttons.items() if _is_alive_qobject(b) and b.isChecked()]
         if not selected:
             self.crop_rect_label.setText("範囲: 未選択 (対象未選択)")
             return
@@ -1455,7 +2022,7 @@ class MainWindow(QMainWindow):
             return
         if not hasattr(self, "crop_target_buttons"):
             return
-        selected_keys = [k for k, b in self.crop_target_buttons.items() if b.isChecked()]
+        selected_keys = [k for k, b in self.crop_target_buttons.items() if _is_alive_qobject(b) and b.isChecked()]
         if not selected_keys:
             self._train_log("保存失敗: 対象を1つ以上選択してください。")
             return
@@ -1474,7 +2041,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "crop_target_buttons"):
             self._train_log("保存失敗: 対象ボタンが見つかりません。")
             return
-        selected_keys = [k for k, b in self.crop_target_buttons.items() if b.isChecked()]
+        selected_keys = [k for k, b in self.crop_target_buttons.items() if _is_alive_qobject(b) and b.isChecked()]
         if not selected_keys:
             self._train_log("保存失敗: 対象を1つ以上選択してください。")
             return
@@ -1542,15 +2109,15 @@ class MainWindow(QMainWindow):
             return 0
         count = 0
         for file in path.iterdir():
-            if file.is_file() and file.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+            if file.is_file() and file.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}:
                 count += 1
         return count
 
     def _on_crop_spin_changed(self, _value: float) -> None:
-        if not all(
-            hasattr(self, name)
-            for name in ["crop_x_spin", "crop_y_spin", "crop_w_spin", "crop_h_spin"]
-        ):
+        spin_names = ["crop_x_spin", "crop_y_spin", "crop_w_spin", "crop_h_spin"]
+        if not all(hasattr(self, name) for name in spin_names):
+            return
+        if not all(_is_alive_qobject(getattr(self, name, None)) for name in spin_names):
             return
         self.pending_crop_rect = [
             round(self.crop_x_spin.value(), 4),
@@ -1558,7 +2125,7 @@ class MainWindow(QMainWindow):
             round(self.crop_w_spin.value(), 4),
             round(self.crop_h_spin.value(), 4),
         ]
-        if hasattr(self, "crop_rect_label"):
+        if hasattr(self, "crop_rect_label") and _is_alive_qobject(self.crop_rect_label):
             self.crop_rect_label.setText(f"範囲: {self.pending_crop_rect}")
         self._apply_pending_rect_to_video()
         self._refresh_crop_preview()
@@ -1576,7 +2143,7 @@ class MainWindow(QMainWindow):
         data = self._load_crop_positions()
         selected_keys: list[str] = []
         if hasattr(self, "crop_target_buttons"):
-            selected_keys = [k for k, b in self.crop_target_buttons.items() if b.isChecked()]
+            selected_keys = [k for k, b in self.crop_target_buttons.items() if _is_alive_qobject(b) and b.isChecked()]
         keys = [k for k in selected_keys if k in data]
         if not keys:
             keys = [k for k in data.keys()]
@@ -1676,7 +2243,7 @@ class MainWindow(QMainWindow):
     def _update_crop_controls_from_pending(self) -> None:
         if self.pending_crop_rect is None:
             return
-        if hasattr(self, "crop_rect_label"):
+        if hasattr(self, "crop_rect_label") and _is_alive_qobject(self.crop_rect_label):
             self.crop_rect_label.setText(f"範囲: {self.pending_crop_rect}")
         for spin_name, value in [
             ("crop_x_spin", self.pending_crop_rect[0]),
@@ -1686,6 +2253,8 @@ class MainWindow(QMainWindow):
         ]:
             if hasattr(self, spin_name):
                 spin = getattr(self, spin_name)
+                if not _is_alive_qobject(spin):
+                    continue
                 spin.blockSignals(True)
                 spin.setValue(float(value))
                 spin.blockSignals(False)
@@ -1719,7 +2288,7 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_crop_preview(self) -> None:
-        if not hasattr(self, "crop_preview_label"):
+        if not hasattr(self, "crop_preview_label") or not _is_alive_qobject(self.crop_preview_label):
             return
         if self.current_video_container is None or self.pending_crop_rect is None:
             self.crop_preview_label.setText("プレビューなし")
@@ -1775,16 +2344,21 @@ class MainWindow(QMainWindow):
     def _run_analysis_step(self, position_ms: int, frame_image) -> None:
         if position_ms < self.analysis_warmup_until_ms:
             return
-        # Keep analysis consistent with latest saved crop settings.
-        self.crop_positions_for_analysis = self._load_crop_positions()
+        # crop_positions は解析開始時に読み込み済み（毎フレームの disk I/O を避ける）
         selected_tsum = "auto"
         if hasattr(self, "item_tsum_combo"):
             selected_tsum = self.item_tsum_combo.currentText()
+        use_tsum_dir = ""
+        if self.locked_item_fixed:
+            use_tsum_dir = self._resolve_tsum_dir(self.locked_use_tsum)
+        elif selected_tsum != "auto":
+            use_tsum_dir = self._resolve_tsum_dir(selected_tsum)
         results = self.video_analyzer.process_frame(
             self.analysis_frame_seq,
             position_ms,
             selected_tsum,
             frame_image,
+            use_tsum_dir=use_tsum_dir,
         )
         for result in results:
             evaluations: dict[str, dict] = {}
@@ -1813,7 +2387,22 @@ class MainWindow(QMainWindow):
                 scene_label = self._apply_scene_flow(result.scene_label, item_detected, use_tsum_detected)
                 item_debug = "item_lock:ON"
             result.scene_label = scene_label
-            self._append_analysis_log(result, selected_targets, use_tsum_detected, item_detected, item_debug)
+            skill_tsum_dir = (
+                self._resolve_tsum_dir(self.locked_use_tsum) if self.locked_item_fixed else use_tsum_dir
+            )
+            skill_new = False
+            if self.locked_item_fixed and skill_tsum_dir and self.flow_phase == "IN_GAME":
+                skill_new = self._run_skill_detection(frame_image, skill_tsum_dir)
+            self._maybe_modal_scene_confirm(scene_label, frame_image)
+            self._append_analysis_log(
+                result,
+                selected_targets,
+                use_tsum_detected,
+                item_detected,
+                item_debug,
+                skill_detected=skill_new,
+                skill_tsum_dir=skill_tsum_dir if skill_new else "",
+            )
             if scene_label == "timeup":
                 self.analysis_running = False
                 self.analysis_warmup_until_ms = 0
@@ -1834,10 +2423,32 @@ class MainWindow(QMainWindow):
         self.flow_phase = "WAIT_ITEM"
         self.flow_game_index = 1
         self.timeup_confirm_count = 0
+        self._fever_raw_streak = 0
         self._last_raw_scene_in_game = ""
+        self._fever_count = 0
+        self._fever_episode_active = False
+        self._skill_count = 0
+        self._skill_episode_active = False
+        self._skill_off_streak = 0
+        self._skill_raw_streak = 0
         self.locked_item_targets = []
         self.locked_use_tsum = "-"
         self.locked_item_fixed = False
+        if hasattr(self, "counter_fever_count_label") and _is_alive_qobject(self.counter_fever_count_label):
+            self.counter_fever_count_label.setText("fever回数: 0")
+        if hasattr(self, "counter_skill_count_label") and _is_alive_qobject(self.counter_skill_count_label):
+            self.counter_skill_count_label.setText("スキル回数: 0")
+
+    def _on_flow_scene_confirmed(self, scene: str) -> None:
+        """1プレイ内の fever エピソードごとにカウンタを1回だけ増やす。"""
+        if scene == "fever":
+            if not self._fever_episode_active:
+                self._fever_episode_active = True
+                self._fever_count += 1
+                if hasattr(self, "counter_fever_count_label") and _is_alive_qobject(self.counter_fever_count_label):
+                    self.counter_fever_count_label.setText(f"fever回数: {self._fever_count}")
+        elif scene in ("timeup", "bonus", "result"):
+            self._fever_episode_active = False
 
     def _apply_scene_flow(self, raw_scene: str, item_detected: bool, use_tsum_detected: str) -> str:
         """Apply game-order constraints:
@@ -1863,8 +2474,11 @@ class MainWindow(QMainWindow):
                 self._last_raw_scene_in_game = ""
         elif phase == "IN_GAME":
             if raw_scene == "fever":
-                scene = "fever"
-                self.timeup_confirm_count = 0
+                # 1フレームだけの誤分類で none→fever になるのを抑える（連続2回 raw fever で確定）
+                self._fever_raw_streak = min(self._fever_raw_streak + 1, 30)
+                if self._fever_raw_streak >= 2:
+                    scene = "fever"
+                    self.timeup_confirm_count = 0
             elif raw_scene == "timeup":
                 # 直前サンプルが fever の直後に 1 回だけ timeup → 多くは誤認（その次からは raw で連続判定）
                 if self._last_raw_scene_in_game == "fever":
@@ -1877,6 +2491,9 @@ class MainWindow(QMainWindow):
                         self.flow_phase = "WAIT_BONUS"
                         self.timeup_confirm_count = 0
             else:
+                # none など誤判定の挟み込みでは streak を維持（fever 表示が出にくい問題の対策）
+                if raw_scene != "none":
+                    self._fever_raw_streak = 0
                 self.timeup_confirm_count = 0
             self._last_raw_scene_in_game = raw_scene
         elif phase == "WAIT_BONUS":
@@ -1895,6 +2512,7 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "counter_analysis_state_label"):
             self.counter_analysis_state_label.setText(f"解析状態: G{self.flow_game_index} {self.flow_phase}")
+        self._on_flow_scene_confirmed(scene)
         return scene
 
     def _load_crop_positions(self) -> dict:
@@ -1909,6 +2527,131 @@ class MainWindow(QMainWindow):
             pass
         return {}
 
+    def _exec_scene_confirm_dialog(self, frame_image, scene_label: str) -> bool:
+        """プレビュー付き。はい・×閉じる＝判定で合っている。いいえ＝修正へ。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("シーン判定の確認")
+        dlg.setModal(True)
+        layout = QVBoxLayout(dlg)
+        img = QLabel()
+        img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        img.setPixmap(
+            _preview_pixmap_for_scene_modal(
+                frame_image, _SCENE_CONFIRM_PREVIEW_MAX_W, _SCENE_CONFIRM_PREVIEW_MAX_H
+            )
+        )
+        layout.addWidget(img)
+        txt = QLabel(f"シーンを「{scene_label}」と判定しました。\nこの判定は合っていますか？")
+        txt.setWordWrap(True)
+        layout.addWidget(txt)
+        skill_save_cb, skill_tsum_combo, skill_cat_combo = self._build_skill_save_group(
+            layout,
+            show_fever_hint=(scene_label == "fever"),
+            default_tsum_dir=self._default_skill_tsum_dir(),
+        )
+        row = QHBoxLayout()
+        row.addStretch(1)
+        yes_btn = QPushButton("はい")
+        no_btn = QPushButton("いいえ")
+        row.addWidget(yes_btn)
+        row.addWidget(no_btn)
+        layout.addLayout(row)
+        yes_btn.setDefault(True)
+
+        yes_btn.clicked.connect(lambda: dlg.done(1))
+        no_btn.clicked.connect(lambda: dlg.done(2))
+        rc = dlg.exec()
+        if rc != 2:
+            self._try_skill_save_from_dialog(frame_image, skill_save_cb, skill_tsum_combo, skill_cat_combo)
+        return rc != 2
+
+    def _exec_scene_correction_dialog(self, frame_image, scene_label: str) -> tuple[Optional[str], bool]:
+        """プレビュー付きクラス選択。（choice, accepted）。キャンセル時 choice は None。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("正しいクラス")
+        dlg.setModal(True)
+        layout = QVBoxLayout(dlg)
+        img = QLabel()
+        img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        img.setPixmap(
+            _preview_pixmap_for_scene_modal(
+                frame_image, _SCENE_CONFIRM_PREVIEW_MAX_W, _SCENE_CONFIRM_PREVIEW_MAX_H
+            )
+        )
+        layout.addWidget(img)
+        layout.addWidget(
+            QLabel("保存するクラス（none は保存しません／他は train・val 自動）")
+        )
+        combo = QComboBox()
+        combo.addItems(list(SimpleTrainer.CLASSES))
+        cur = 0
+        if scene_label in SimpleTrainer.CLASSES:
+            cur = SimpleTrainer.CLASSES.index(scene_label)
+        combo.setCurrentIndex(cur)
+        layout.addWidget(combo)
+        skill_save_cb, skill_tsum_combo, skill_cat_combo = self._build_skill_save_group(
+            layout,
+            show_fever_hint=True,
+            default_tsum_dir=self._default_skill_tsum_dir(),
+        )
+        bbox = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addWidget(bbox)
+        bbox.accepted.connect(dlg.accept)
+        bbox.rejected.connect(dlg.reject)
+        if dlg.exec() != 1:  # QDialog.Accepted
+            return None, False
+        self._try_skill_save_from_dialog(frame_image, skill_save_cb, skill_tsum_combo, skill_cat_combo)
+        return combo.currentText(), True
+
+    def _maybe_modal_scene_confirm(self, scene_label: str, frame_image) -> None:
+        """チェックされたシーンへ遷移した最初のフレームで確認（プレビュー付き）。誤りならクラス選択して保存。"""
+        checks = getattr(self, "analysis_scene_confirm_checks", None)
+        if checks is None or not self.analysis_running:
+            return
+        watched = [
+            c
+            for c in _ANALYSIS_SCENE_CONFIRM_LABELS
+            if c in checks and _is_alive_qobject(checks[c]) and checks[c].isChecked()
+        ]
+        prev = getattr(self, "_analysis_confirm_edge_prev", "")
+        if scene_label not in watched:
+            self._analysis_confirm_edge_prev = scene_label
+            return
+        if scene_label == prev:
+            return
+
+        was_cv = getattr(self, "use_opencv_for_video", False)
+        was_playing = self._is_player_playing()
+        if was_playing:
+            if was_cv:
+                self._cv_pause()
+            elif hasattr(self, "player") and _is_alive_qobject(self.player):
+                self.player.pause()
+
+        try:
+            if not self._exec_scene_confirm_dialog(frame_image, scene_label):
+                choice, ok = self._exec_scene_correction_dialog(frame_image, scene_label)
+                if ok and choice:
+                    if choice == "none":
+                        if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                            self.log_view.append("修正: none（画像は保存しません）")
+                    else:
+                        save_ok, msg = self._save_frame_to_scene_class(frame_image, choice)
+                        if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                            self.log_view.append(("修正保存: " if save_ok else "修正保存失敗: ") + msg)
+                        if save_ok:
+                            self._train_log(f"解析修正保存: {msg}")
+        finally:
+            self._analysis_confirm_edge_prev = scene_label
+            resume = was_playing and self.analysis_running and scene_label != "timeup"
+            if resume:
+                if was_cv:
+                    self._cv_play()
+                elif hasattr(self, "player") and _is_alive_qobject(self.player):
+                    self.player.play()
+
     def _append_analysis_log(
         self,
         result,
@@ -1916,6 +2659,8 @@ class MainWindow(QMainWindow):
         use_tsum_detected: str = "-",
         item_detected: bool = False,
         item_debug: str = "",
+        skill_detected: bool = False,
+        skill_tsum_dir: str = "",
     ) -> None:
         if not hasattr(self, "log_view"):
             return
@@ -1954,17 +2699,20 @@ class MainWindow(QMainWindow):
             )
         else:
             short_suffix = ""
-            detail_suffix = f" item={result.item_skill_label}"
+            detail_suffix = ""
+        skill_label = skill_tsum_dir if skill_detected else ""
         if hasattr(self, "detail_log_check") and not self.detail_log_check.isChecked():
-            self._append_log_colored_scene(prefix, scene_label, short_suffix)
+            self._append_log_colored_scene(prefix, scene_label, short_suffix, skill_label)
             if item_debug and result.scene_label == "item":
                 self.log_view.append(f"  item_debug: {item_debug}")
             return
-        self._append_log_colored_scene(prefix, scene_label, detail_suffix)
+        self._append_log_colored_scene(prefix, scene_label, detail_suffix, skill_label)
         if item_debug and result.scene_label == "item":
             self.log_view.append(f"  item_debug: {item_debug}")
 
-    def _append_log_colored_scene(self, prefix: str, scene_label: str, suffix: str) -> None:
+    def _append_log_colored_scene(
+        self, prefix: str, scene_label: str, suffix: str, skill_label: str = ""
+    ) -> None:
         """Log one line; scene name ready/go in orange via QTextCharFormat (HTML is unreliable in QTextEdit)."""
         if not hasattr(self, "log_view"):
             return
@@ -1981,11 +2729,31 @@ class MainWindow(QMainWindow):
             cursor.setCharFormat(orange)
             cursor.insertText(scene_label)
             cursor.setCharFormat(mono)
+        elif scene_label == "fever":
+            fever_fmt = QTextCharFormat()
+            fever_fmt.setFontFamilies(["monospace"])
+            fever_fmt.setForeground(QColor("#DC2626"))
+            cursor.setCharFormat(fever_fmt)
+            cursor.insertText(scene_label)
+            cursor.setCharFormat(mono)
         else:
             cursor.insertText(scene_label)
+        if skill_label:
+            skill_fmt = QTextCharFormat()
+            skill_fmt.setFontFamilies(["monospace"])
+            skill_fmt.setForeground(QColor("#7C3AED"))
+            cursor.setCharFormat(skill_fmt)
+            cursor.insertText(f" skill={skill_label}")
+            cursor.setCharFormat(mono)
         cursor.insertText(suffix + "\n")
         self.log_view.setTextCursor(cursor)
-        self.log_view.ensureCursorVisible()
+        # 解析中は毎行 ensureCursorVisible すると QTextEdit のスクロールが重い
+        if not getattr(self, "analysis_running", False):
+            self.log_view.ensureCursorVisible()
+        else:
+            self._analysis_log_scroll_counter += 1
+            if self._analysis_log_scroll_counter % 16 == 0:
+                self.log_view.ensureCursorVisible()
 
     def _format_item_debug(self, evaluations: dict[str, dict], selected_targets: list[str]) -> str:
         parts = []
@@ -2097,6 +2865,46 @@ class MainWindow(QMainWindow):
             return (0.0, 0.0)
         return (yellow / total, blue / total)
 
+    def _resolve_tsum_dir(self, label: str) -> str:
+        return resolve_tsum_dir(
+            label,
+            self.use_tsum_classifier._display_map,
+            list(self.use_tsum_classifier._prototypes.keys()),
+        )
+
+    def _run_skill_detection(self, frame_image, tsum_dir: str) -> bool:
+        """IN_GAME 中のスキル発動を検知。新規エピソード開始時だけ True。"""
+        if frame_image is None or frame_image.isNull() or not self.skill_classifier_pool.has_model(tsum_dir):
+            return False
+        skill_rect = None
+        rect = self.crop_positions_for_analysis.get("skill")
+        if isinstance(rect, list) and len(rect) == 4:
+            try:
+                skill_rect = (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
+            except Exception:
+                skill_rect = None
+        raw_hit, dist = self.skill_classifier_pool.predict(tsum_dir, frame_image, skill_rect)
+        if raw_hit:
+            self._skill_raw_streak = min(self._skill_raw_streak + 1, 30)
+            self._skill_off_streak = 0
+        else:
+            self._skill_raw_streak = 0
+            self._skill_off_streak += 1
+            if self._skill_off_streak >= 2:
+                self._skill_episode_active = False
+            return False
+        if self._skill_raw_streak < 2:
+            return False
+        if self._skill_episode_active:
+            return False
+        self._skill_episode_active = True
+        self._skill_count += 1
+        if hasattr(self, "counter_skill_count_label") and _is_alive_qobject(self.counter_skill_count_label):
+            self.counter_skill_count_label.setText(f"スキル回数: {self._skill_count}")
+        if hasattr(self, "log_view") and hasattr(self, "detail_log_check") and self.detail_log_check.isChecked():
+            self.log_view.append(f"  skill_debug: {tsum_dir} dist={dist:.3f}")
+        return True
+
     def _detect_use_tsum(self, image) -> str:
         if image is None or image.isNull():
             return "-"
@@ -2161,11 +2969,47 @@ class MainWindow(QMainWindow):
         if self.train_busy:
             self._train_log("学習中は保存できません。完了後に実行してください。")
             return
-        self._set_train_ui_state(status_text="状態: モデル保存中...")
-        self.trainer.save(self._train_log, version="version_1")
-        self.video_analyzer.reload_model()
-        self._train_use_tsum_models()
+        bar = getattr(self, "train_progress_bar", None)
+        if bar is not None and _is_alive_qobject(bar):
+            bar.setStyleSheet("")
+            bar.setRange(0, 0)
+            bar.setFormat("保存中…")
+            bar.setVisible(True)
+        try:
+            self._set_train_ui_state(status_text="状態: モデル保存中...")
+            self.trainer.save(self._train_log, version="version_1")
+            self.video_analyzer.reload_model()
+            self._train_use_tsum_models()
+            self._train_skill_models()
+            self.skill_classifier_pool.reload()
+        except Exception as exc:
+            self._train_log(f"モデル保存エラー: {exc}")
+            self._set_train_ui_state(status_text="状態: 保存失敗")
+            self._reset_train_progress_bar()
+            return
         self._set_train_ui_state(status_text="状態: モデル保存完了")
+        self._flash_train_save_complete()
+
+    def _flash_train_save_complete(self) -> None:
+        """保存成功をプログレスバーで明示してから消す。"""
+        bar = getattr(self, "train_progress_bar", None)
+        if bar is not None and _is_alive_qobject(bar):
+            bar.setRange(0, 100)
+            bar.setValue(100)
+            bar.setFormat("保存完了")
+            bar.setStyleSheet("QProgressBar::chunk { background-color: #66BB6A; }")
+            bar.setVisible(True)
+        QTimer.singleShot(3200, self._reset_train_progress_bar)
+
+    def _reset_train_progress_bar(self) -> None:
+        bar = getattr(self, "train_progress_bar", None)
+        if bar is None or not _is_alive_qobject(bar):
+            return
+        bar.setStyleSheet("")
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setFormat("")
+        bar.setVisible(False)
 
     def _train_use_tsum_models(self) -> None:
         images_root = self.project_root / "app/assets/images/use_tsums"
@@ -2190,6 +3034,32 @@ class MainWindow(QMainWindow):
             self._train_log(f"使用ツムモデル学習: use_tsum範囲で切抜き作成 {use_tsum_rect}")
         self._train_log(f"使用ツムモデル学習: {summary}")
 
+    def _train_skill_models(self) -> None:
+        images_root = self.project_root / "app/assets/images/skills"
+        models_root = self.project_root / "app/models/skill"
+        crop_positions = self._load_crop_positions()
+        skill_rect = None
+        rect = crop_positions.get("skill")
+        if isinstance(rect, list) and len(rect) == 4:
+            try:
+                skill_rect = (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
+            except Exception:
+                skill_rect = None
+        counts = SkillClassifierPool.build_models(images_root, models_root, skill_rect)
+        self.skill_classifier_pool.reload()
+        if not counts:
+            self._train_log(
+                "スキルモデル学習: 対象画像なし"
+                f"（app/assets/images/skills/<dir名>/{SKILL_IMAGE_CATEGORY_ACTIVATION}/ に発動時画像）"
+            )
+            return
+        summary = ", ".join(f"{k}:{v}枚" for k, v in sorted(counts.items()))
+        if skill_rect is None:
+            self._train_log("スキルモデル学習: skill範囲未設定のため画像全体から作成")
+        else:
+            self._train_log(f"スキルモデル学習: skill範囲で切抜き作成 {skill_rect}")
+        self._train_log(f"スキルモデル学習: {summary}")
+
     def _on_train_timer_tick(self) -> None:
         # Legacy timer: no-op (training now runs in background thread).
         self.train_timer.stop()
@@ -2203,6 +3073,7 @@ class MainWindow(QMainWindow):
                 elapsed = int(max(0.0, time.time() - self.train_started_at))
                 self._train_log(f"学習処理が完了しました。所要時間: {elapsed}s")
                 self._set_train_ui_state(status_text=f"状態: 学習完了 ({elapsed}s)")
+                self._reset_train_progress_bar()
                 continue
             self._train_log(msg)
 
@@ -2218,6 +3089,11 @@ class MainWindow(QMainWindow):
                 self.train_status_label.setText(status_text)
             else:
                 self.train_status_label.setText("状態: 学習中..." if self.train_busy else "状態: 待機中")
+        bar = getattr(self, "train_progress_bar", None)
+        if bar is not None and _is_alive_qobject(bar) and self.train_busy:
+            bar.setRange(0, 0)
+            bar.setFormat("学習処理中…")
+            bar.setVisible(True)
 
     def _on_create_use_tsum_clicked(self) -> None:
         name = self.use_tsum_name_input.text().strip() if hasattr(self, "use_tsum_name_input") else ""
@@ -2228,8 +3104,13 @@ class MainWindow(QMainWindow):
 
         model_dir = self.project_root / "app/models/use_tsum" / dir_name
         image_dir = self.project_root / "app/assets/images/use_tsums" / dir_name
+        skill_model_dir = self.project_root / "app/models/skill" / dir_name
+        skill_image_dir = self.project_root / "app/assets/images/skills" / dir_name
+        skill_activation_dir = skill_image_dir / SKILL_IMAGE_CATEGORY_ACTIVATION
         model_dir.mkdir(parents=True, exist_ok=True)
         image_dir.mkdir(parents=True, exist_ok=True)
+        skill_model_dir.mkdir(parents=True, exist_ok=True)
+        skill_activation_dir.mkdir(parents=True, exist_ok=True)
 
         registry_path = self.project_root / "app/models/use_tsum/registry.json"
         registry: dict[str, str] = {}
@@ -2246,7 +3127,11 @@ class MainWindow(QMainWindow):
         self._train_log(f"使用ツム追加: {name} ({dir_name})")
         self._train_log(f"作成: {model_dir}")
         self._train_log(f"作成: {image_dir}")
+        self._train_log(f"作成: {skill_model_dir}")
+        self._train_log(f"作成: {skill_activation_dir} （発動時画像用）")
         self._train_log(f"紐付け保存: {registry_path}")
+        self.use_tsum_classifier.reload()
+        self.skill_classifier_pool.reload()
 
     def _update_playback_indicators(self, position_ms: int) -> None:
         if not hasattr(self, "seek_slider"):
