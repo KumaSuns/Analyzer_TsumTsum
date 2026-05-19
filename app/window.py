@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPoint, QRect, Qt, QRunnable, QThreadPool, QUrl, QSettings, Signal, QTimer
+from PySide6.QtCore import QObject, QPoint, QRect, Qt, QUrl, QSettings, Signal, QTimer
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.services.analyzer import VideoAnalyzer
-from app.services.image_save import prepare_training_image, save_training_png
+from app.services.image_save import save_training_png
 from app.services.scene_model import SceneCentroidModel
 from app.services.trainer import SimpleTrainer
 from app.services.tsum_registry import TsumRegistry
@@ -59,28 +59,15 @@ from app.services.file_video import FileVideoSource, is_file_video_available
 
 # 解析テスト: item〜result を「シーンに入った瞬間」で確認モーダルする対象にできる（none 除く）
 _ANALYSIS_SCENE_CONFIRM_LABELS = tuple(c for c in SimpleTrainer.CLASSES if c != "none")
+# IN_GAME で raw fever が続いた回数で確定（間隔10なら3回≈30フレーム相当）
+_FEVER_RAW_STREAK_REQUIRED = 3
+# go 直後の誤検知を避けるウォームアップ（サンプル回数）
+_FEVER_IN_GAME_WARMUP_SAMPLES = 3
+# fever 確定途中に none が 1 回挟まってもストリーク維持
+_FEVER_NONE_GAP_ALLOW = 1
 
 _SCENE_CONFIRM_PREVIEW_MAX_W = 560
 _SCENE_CONFIRM_PREVIEW_MAX_H = 315
-
-
-class _AsyncPngSaveSignals(QObject):
-    finished = Signal(bool, str)
-
-
-class _AsyncPngSaveTask(QRunnable):
-    def __init__(self, image: QImage, path: Path) -> None:
-        super().__init__()
-        self._image = image
-        self._path = path
-        self.signals: Optional[_AsyncPngSaveSignals] = None
-
-    def run(self) -> None:
-        from app.services.image_save import PNG_SAVE_COMPRESSION_FAST
-
-        ok = self._image.save(str(self._path), "PNG", PNG_SAVE_COMPRESSION_FAST)
-        if self.signals is not None:
-            self.signals.finished.emit(ok, str(self._path))
 
 
 def _preview_pixmap_for_scene_modal(frame_image, max_w: int, max_h: int) -> QPixmap:
@@ -120,7 +107,12 @@ def _qt_multimedia_environment_report() -> str:
     return "\n".join(lines)
 
 
-def _media_error_extra_hints(error_string: str) -> str:
+def _is_streaming_drive_path(path: str) -> bool:
+    p = path or ""
+    return "マイドライブ" in p or "My Drive" in p
+
+
+def _media_error_extra_hints(error_string: str, video_path: str = "") -> str:
     low = (error_string or "").lower()
     if "unsupported media type" not in low:
         return ""
@@ -131,11 +123,25 @@ def _media_error_extra_hints(error_string: str) -> str:
         "\n--- よくある対処 ---\n",
         f"現在のバックエンド: {backend}\n",
     ]
+    if _is_streaming_drive_path(video_path):
+        lines.append(
+            "マイドライブ上の iPhone 動画は、Qt ではほぼ開けません。"
+            "エクスプローラで「オフラインで使用可能」にするか、C: などローカルにコピーしてから開いてください。\n"
+        )
     if bl == "windows":
         lines.append(
             "WMF(windows) は形式によっては未対応になります。**まず ffmpeg を試してください**（下の1行目）。\n"
         )
-    lines.append(f'ffmpeg で試す: $env:QT_MEDIA_BACKEND = "{other}"; python -m app.main\n')
+    if bl == "ffmpeg":
+        lines.append(
+            f'別バックエンド(windows)を試す: $env:QT_MEDIA_BACKEND = "{other}"; python -m app.main\n'
+        )
+    elif bl == "windows":
+        lines.append(
+            f'別バックエンド(ffmpeg)を試す: $env:QT_MEDIA_BACKEND = "{other}"; python -m app.main\n'
+        )
+    else:
+        lines.append(f'バックエンドを試す: $env:QT_MEDIA_BACKEND = "{other}"; python -m app.main\n')
     lines.append(
         "既定（main.py の ffmpeg）に戻す: Remove-Item Env:QT_MEDIA_BACKEND -ErrorAction SilentlyContinue; python -m app.main\n"
     )
@@ -359,6 +365,8 @@ class MainWindow(QMainWindow):
         self.flow_game_index = 1
         self.timeup_confirm_count = 0
         self._fever_raw_streak = 0
+        self._fever_none_gap_used = 0
+        self._in_game_fever_warmup = 0
         self._last_raw_scene_in_game = ""
         self._fever_count = 0
         self._fever_episode_active = False
@@ -409,6 +417,7 @@ class MainWindow(QMainWindow):
         self.train_busy = False
         self.train_started_at = 0.0
         self.use_opencv_for_video = False
+        self._last_file_video_open_error = ""
         self.cv_source: Optional[FileVideoSource] = FileVideoSource() if is_file_video_available() else None
         self._cv_position_ms = 0
         self._cv_playing = False
@@ -585,7 +594,7 @@ class MainWindow(QMainWindow):
                 status.setText(f"書き込み失敗: {msg}")
 
     def _on_video_tool_skill_save_clicked(self) -> None:
-        """動画ツール2: スキル発動画像を skills/<dir>/<種類>/ へ保存（非同期）。"""
+        """動画ツール2: スキル発動画像を skills/<dir>/<種類>/ へ保存。"""
         status = getattr(self, "_video_tool_scene_status", None)
         save_btn = getattr(self, "_video_tool_skill_save_btn", None)
         tsum_combo = getattr(self, "_video_tool_skill_tsum_combo", None)
@@ -607,44 +616,28 @@ class MainWindow(QMainWindow):
                 status.setStyleSheet("color: #C62828;")
                 status.setText("ツムと種類を選択してください。")
             return
-        out_dir = self._skills_images_root() / str(tsum_dir) / str(category)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        frame_index = int((max(self._playback_position_ms(), 0) / 1000.0) * float(self.estimated_fps or 30.0))
-        out_path = out_dir / f"skill_{category}_{timestamp}_f{frame_index}.png"
-        rel_msg = f"skills/{tsum_dir}/{category}/{out_path.name}"
-
-        prepared = prepare_training_image(image)
-        if prepared.isNull():
-            if status is not None and _is_alive_qobject(status):
-                status.setStyleSheet("color: #C62828;")
-                status.setText("画像の準備に失敗しました。")
-            return
 
         if save_btn is not None and _is_alive_qobject(save_btn):
             save_btn.setEnabled(False)
         if status is not None and _is_alive_qobject(status):
             status.setStyleSheet("color: #555;")
             status.setText("スキル保存中…")
+        QApplication.processEvents()
 
-        signals = _AsyncPngSaveSignals()
-        task = _AsyncPngSaveTask(prepared, out_path)
-
-        def _on_skill_save_done(ok: bool, path_str: str) -> None:
+        try:
+            ok, msg = self._save_frame_to_skill(image, str(tsum_dir), str(category))
+        finally:
             if save_btn is not None and _is_alive_qobject(save_btn):
                 save_btn.setEnabled(True)
-            if status is None or not _is_alive_qobject(status):
-                return
-            if ok:
-                status.setStyleSheet("color: #2E7D32;")
-                status.setText(f"スキル保存 → {rel_msg}")
-            else:
-                status.setStyleSheet("color: #C62828;")
-                status.setText(f"スキル保存失敗: {path_str}")
 
-        signals.finished.connect(_on_skill_save_done)
-        task.signals = signals
-        QThreadPool.globalInstance().start(task)
+        if status is None or not _is_alive_qobject(status):
+            return
+        if ok:
+            status.setStyleSheet("color: #2E7D32;")
+            status.setText(f"スキル保存 → {msg}")
+        else:
+            status.setStyleSheet("color: #C62828;")
+            status.setText(f"スキル保存失敗: {msg}")
 
     def _choose_scene_train_val_split(self, cls: str) -> str:
         base = self.project_root / "app/assets/images"
@@ -830,6 +823,8 @@ class MainWindow(QMainWindow):
             delattr(self, "audio_output")
 
     def _render_feature_ui(self, feature_id: int) -> None:
+        if hasattr(self, "detail_log_check") and _is_alive_qobject(getattr(self, "detail_log_check", None)):
+            self._save_analysis_settings_ui()
         if hasattr(self, "cv_play_timer"):
             self.cv_play_timer.stop()
             self._cv_playing = False
@@ -941,6 +936,8 @@ class MainWindow(QMainWindow):
             self.analysis_skill_confirm_check = QCheckBox("スキル発動（検知時モーダル）")
             self.analysis_skill_confirm_check.setChecked(False)
             self.left_layout.addWidget(self.analysis_skill_confirm_check)
+
+            self._bind_analysis_settings_persistence()
 
             self.left_layout.addStretch(1)
         else:
@@ -1551,8 +1548,37 @@ class MainWindow(QMainWindow):
             return
         self._load_video(path)
 
+    def _show_video_open_failed(self, resolved: str, detail: str) -> None:
+        if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+            self.log_view.append(f"動画を開けませんでした: {resolved}")
+            if detail.strip():
+                self.log_view.append(detail.strip())
+        drive_hint = ""
+        if _is_streaming_drive_path(resolved):
+            drive_hint = (
+                "\n\nマイドライブ上のファイルは、開くときにバックグラウンドで順次ダウンロードします。"
+                "初回は容量・回線状況により数十秒〜かかることがあります。"
+                "「オフラインで使用可能」にするか、C: などローカルへコピーしてから開いてください。"
+                "別アプリでファイルを開きっぱなしにしていると失敗することがあります。"
+            )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("動画を開けません")
+        box.setText(
+            "動画の取り込みまたはデコードに失敗しました（順次読み・ffmpeg コピー・OpenCV・FFmpeg・H.264 トランスコードを試行済み）。"
+            "ネットワーク・ディスク容量・他アプリのロックを確認してください。"
+            + drive_hint
+        )
+        if detail.strip():
+            box.setDetailedText(detail.strip())
+            QApplication.clipboard().setText(detail.strip())
+            box.setInformativeText("詳細は「詳細を表示」、またはクリップボードにコピー済みです。")
+        box.exec()
+
     def _switch_to_qt_video_and_load(self, resolved: str) -> bool:
         """OpenCV / imageio 経路が失敗したとき、同一ファイルを Qt Multimedia で開き直す。"""
+        if _is_streaming_drive_path(resolved):
+            return False
         if self.cv_source is not None:
             self.cv_source.release()
         self.cv_play_timer.stop()
@@ -1614,34 +1640,18 @@ class MainWindow(QMainWindow):
                     prog.close()
             if not opened_ok:
                 detail = getattr(self.cv_source, "last_open_error", "") or ""
+                self._last_file_video_open_error = detail
+                if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                    self.log_view.append(f"ファイル動画モードで開けませんでした: {resolved}")
+                    if detail.strip():
+                        self.log_view.append(detail.strip())
                 if self._switch_to_qt_video_and_load(resolved):
                     if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
                         self.log_view.append(
                             f"ファイル動画モードで開けなかったため、Qt で再試行しました: {resolved}"
                         )
                     return
-                if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                    self.log_view.append(f"動画を開けませんでした: {resolved}")
-                drive_hint = ""
-                if "マイドライブ" in resolved or "My Drive" in resolved:
-                    drive_hint = (
-                        "\n\nマイドライブ上のファイルは、開くときにバックグラウンドで順次ダウンロードします。"
-                        "初回は容量・回線状況により数十秒〜かかることがあります。別アプリでファイルを開きっぱなしにしていると失敗することがあります。"
-                    )
-                box = QMessageBox(self)
-                box.setIcon(QMessageBox.Icon.Warning)
-                box.setWindowTitle("動画を開けません")
-                box.setText(
-                    "動画の取り込みまたはデコードに失敗しました（順次読み・ffmpeg コピー・OpenCV・FFmpeg・H.264 トランスコードを試行済み）。"
-                    "Qt への切り替えもできないか、Qt でも読み込めませんでした。"
-                    "ネットワーク・ディスク容量・他アプリのロックを確認してください。"
-                    + drive_hint
-                )
-                if detail.strip():
-                    box.setDetailedText(detail.strip())
-                    QApplication.clipboard().setText(detail.strip())
-                    box.setInformativeText("詳細は「詳細を表示」、またはクリップボードにコピー済みです。")
-                box.exec()
+                self._show_video_open_failed(resolved, detail)
                 return
             self.estimated_fps = self.cv_source.fps()
             self.media_duration_ms = self.cv_source.duration_ms()
@@ -1652,13 +1662,17 @@ class MainWindow(QMainWindow):
             img = self.cv_source.read_qimage()
             if img is None or img.isNull():
                 self.cv_source.release()
+                detail = (
+                    getattr(self.cv_source, "last_open_error", "") or "最初のフレームを読み取れませんでした。"
+                )
+                self._last_file_video_open_error = detail
                 if self._switch_to_qt_video_and_load(resolved):
                     if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
                         self.log_view.append(
                             f"最初のフレーム取得に失敗したため、Qt で再試行しました: {resolved}"
                         )
                     return
-                QMessageBox.warning(self, "動画を開けません", "最初のフレームを読み取れませんでした。")
+                self._show_video_open_failed(resolved, detail)
                 return
             self._video_frame_counter = 0
             self._cv_push_frame(img)
@@ -1815,8 +1829,13 @@ class MainWindow(QMainWindow):
         msg = (error_string or "").strip() or "動画を読み込めませんでした（コーデックまたは形式の問題の可能性があります）。"
         if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
             self.log_view.append(f"メディアエラー: {msg}")
-        hints = _media_error_extra_hints(msg)
-        details = f"{msg}{hints}\n{_qt_multimedia_environment_report()}"
+        video_path = getattr(self, "last_video_path", "") or ""
+        hints = _media_error_extra_hints(msg, video_path)
+        file_detail = getattr(self, "_last_file_video_open_error", "") or ""
+        details = f"{msg}{hints}"
+        if file_detail.strip():
+            details += f"\n\n--- ファイル動画モード（先に試行）---\n{file_detail.strip()}"
+        details += f"\n{_qt_multimedia_environment_report()}"
         _show_copyable_warning(self, "動画を開けません", msg, details)
 
     def _on_mute_toggled(self, checked: bool) -> None:
@@ -2013,6 +2032,108 @@ class MainWindow(QMainWindow):
 
     def _on_sample_frame_changed(self, value: int) -> None:
         self.video_analyzer.sample_every_frames = max(1, value)
+
+    def _load_analysis_settings_ui(self) -> None:
+        """解析設定（左列）を QSettings から復元。"""
+        s = self.settings
+
+        def _set_spin(spin: QSpinBox, key: str, default: int) -> None:
+            spin.blockSignals(True)
+            spin.setValue(max(spin.minimum(), min(spin.maximum(), int(s.value(key, default, type=int)))))
+            spin.blockSignals(False)
+
+        def _set_check(cb: QCheckBox, key: str, default: bool) -> None:
+            cb.blockSignals(True)
+            cb.setChecked(bool(s.value(key, default, type=bool)))
+            cb.blockSignals(False)
+
+        if hasattr(self, "sample_frame_spin") and _is_alive_qobject(self.sample_frame_spin):
+            _set_spin(self.sample_frame_spin, "analysis/sample_every_frames", 10)
+            self.video_analyzer.sample_every_frames = self.sample_frame_spin.value()
+        if hasattr(self, "model_version_combo") and _is_alive_qobject(self.model_version_combo):
+            mv = str(s.value("analysis/model_version", "version_1", type=str))
+            self.model_version_combo.blockSignals(True)
+            idx = self.model_version_combo.findText(mv)
+            if idx >= 0:
+                self.model_version_combo.setCurrentIndex(idx)
+            self.model_version_combo.blockSignals(False)
+        if hasattr(self, "item_tsum_combo") and _is_alive_qobject(self.item_tsum_combo):
+            tsum = str(s.value("analysis/item_tsum", "auto", type=str))
+            self.item_tsum_combo.blockSignals(True)
+            idx = self.item_tsum_combo.findText(tsum)
+            if idx < 0:
+                idx = self.item_tsum_combo.findData(tsum)
+            if idx >= 0:
+                self.item_tsum_combo.setCurrentIndex(idx)
+            self.item_tsum_combo.blockSignals(False)
+        if hasattr(self, "detail_log_check") and _is_alive_qobject(self.detail_log_check):
+            _set_check(self.detail_log_check, "analysis/detail_log", False)
+        if hasattr(self, "start_from_zero_check") and _is_alive_qobject(self.start_from_zero_check):
+            _set_check(self.start_from_zero_check, "analysis/start_from_zero", True)
+        checks = getattr(self, "analysis_scene_confirm_checks", None)
+        if isinstance(checks, dict):
+            for scene_key, cb in checks.items():
+                if _is_alive_qobject(cb):
+                    _set_check(cb, f"analysis/scene_confirm/{scene_key}", False)
+        if hasattr(self, "analysis_skill_confirm_check") and _is_alive_qobject(
+            self.analysis_skill_confirm_check
+        ):
+            _set_check(self.analysis_skill_confirm_check, "analysis/skill_confirm", False)
+
+    def _save_analysis_settings_ui(self) -> None:
+        """解析設定を QSettings へ保存。"""
+        s = self.settings
+        if hasattr(self, "sample_frame_spin") and _is_alive_qobject(self.sample_frame_spin):
+            s.setValue("analysis/sample_every_frames", self.sample_frame_spin.value())
+        if hasattr(self, "model_version_combo") and _is_alive_qobject(self.model_version_combo):
+            s.setValue("analysis/model_version", self.model_version_combo.currentText())
+        if hasattr(self, "item_tsum_combo") and _is_alive_qobject(self.item_tsum_combo):
+            s.setValue("analysis/item_tsum", self.item_tsum_combo.currentText())
+        if hasattr(self, "detail_log_check") and _is_alive_qobject(self.detail_log_check):
+            s.setValue("analysis/detail_log", self.detail_log_check.isChecked())
+        if hasattr(self, "start_from_zero_check") and _is_alive_qobject(self.start_from_zero_check):
+            s.setValue("analysis/start_from_zero", self.start_from_zero_check.isChecked())
+        checks = getattr(self, "analysis_scene_confirm_checks", None)
+        if isinstance(checks, dict):
+            for scene_key, cb in checks.items():
+                if _is_alive_qobject(cb):
+                    s.setValue(f"analysis/scene_confirm/{scene_key}", cb.isChecked())
+        if hasattr(self, "analysis_skill_confirm_check") and _is_alive_qobject(
+            self.analysis_skill_confirm_check
+        ):
+            s.setValue("analysis/skill_confirm", self.analysis_skill_confirm_check.isChecked())
+        s.sync()
+
+    def _bind_analysis_settings_persistence(self) -> None:
+        self._load_analysis_settings_ui()
+
+        def _wire_save(signal, handler) -> None:
+            signal.connect(handler)
+
+        if hasattr(self, "sample_frame_spin") and _is_alive_qobject(self.sample_frame_spin):
+            _wire_save(self.sample_frame_spin.valueChanged, lambda _v: self._save_analysis_settings_ui())
+        if hasattr(self, "model_version_combo") and _is_alive_qobject(self.model_version_combo):
+            _wire_save(self.model_version_combo.currentIndexChanged, lambda _i: self._save_analysis_settings_ui())
+        if hasattr(self, "item_tsum_combo") and _is_alive_qobject(self.item_tsum_combo):
+            _wire_save(self.item_tsum_combo.currentIndexChanged, lambda _i: self._save_analysis_settings_ui())
+        if hasattr(self, "detail_log_check") and _is_alive_qobject(self.detail_log_check):
+            _wire_save(self.detail_log_check.toggled, lambda _c: self._save_analysis_settings_ui())
+        if hasattr(self, "start_from_zero_check") and _is_alive_qobject(self.start_from_zero_check):
+            _wire_save(self.start_from_zero_check.toggled, lambda _c: self._save_analysis_settings_ui())
+        checks = getattr(self, "analysis_scene_confirm_checks", None)
+        if isinstance(checks, dict):
+            for cb in checks.values():
+                if _is_alive_qobject(cb):
+                    _wire_save(cb.toggled, lambda _c: self._save_analysis_settings_ui())
+        if hasattr(self, "analysis_skill_confirm_check") and _is_alive_qobject(
+            self.analysis_skill_confirm_check
+        ):
+            _wire_save(self.analysis_skill_confirm_check.toggled, lambda _c: self._save_analysis_settings_ui())
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self.button_group.checkedId() == 1:
+            self._save_analysis_settings_ui()
+        super().closeEvent(event)
 
     def _on_crop_selected(self, x: float, y: float, w: float, h: float) -> None:
         self.pending_crop_rect = [round(x, 4), round(y, 4), round(w, 4), round(h, 4)]
@@ -2476,6 +2597,8 @@ class MainWindow(QMainWindow):
         self.flow_game_index = 1
         self.timeup_confirm_count = 0
         self._fever_raw_streak = 0
+        self._fever_none_gap_used = 0
+        self._in_game_fever_warmup = 0
         self._last_raw_scene_in_game = ""
         self._fever_count = 0
         self._fever_episode_active = False
@@ -2524,16 +2647,29 @@ class MainWindow(QMainWindow):
                 scene = "go"
                 self.flow_phase = "IN_GAME"
                 self._last_raw_scene_in_game = ""
+                self._fever_raw_streak = 0
+                self._fever_none_gap_used = 0
+                self._in_game_fever_warmup = _FEVER_IN_GAME_WARMUP_SAMPLES
         elif phase == "IN_GAME":
-            if raw_scene == "fever":
-                # 1フレームだけの誤分類で none→fever になるのを抑える（連続2回 raw fever で確定）
+            if self._in_game_fever_warmup > 0:
+                self._in_game_fever_warmup -= 1
+            fever_candidate = raw_scene == "fever" and self._in_game_fever_warmup <= 0
+            if fever_candidate:
                 self._fever_raw_streak = min(self._fever_raw_streak + 1, 30)
-                if self._fever_raw_streak >= 2:
+                self._fever_none_gap_used = 0
+                if self._fever_raw_streak >= _FEVER_RAW_STREAK_REQUIRED:
                     scene = "fever"
                     self.timeup_confirm_count = 0
             elif raw_scene == "timeup":
-                # 直前サンプルが fever の直後に 1 回だけ timeup → 多くは誤認（その次からは raw で連続判定）
-                if self._last_raw_scene_in_game == "fever":
+                if self._fever_episode_active and self._last_raw_scene_in_game == "fever":
+                    scene = "fever"
+                    self.timeup_confirm_count = 0
+                elif (
+                    self._fever_raw_streak >= _FEVER_RAW_STREAK_REQUIRED - 1
+                    and self._last_raw_scene_in_game == "fever"
+                ):
+                    # 確定直前: fever→timeup 1 回は fever 継続扱い
+                    self._fever_raw_streak = _FEVER_RAW_STREAK_REQUIRED
                     scene = "fever"
                     self.timeup_confirm_count = 0
                 else:
@@ -2542,10 +2678,21 @@ class MainWindow(QMainWindow):
                         scene = "timeup"
                         self.flow_phase = "WAIT_BONUS"
                         self.timeup_confirm_count = 0
-            else:
-                # none など誤判定の挟み込みでは streak を維持（fever 表示が出にくい問題の対策）
-                if raw_scene != "none":
                     self._fever_raw_streak = 0
+                    self._fever_none_gap_used = 0
+            elif raw_scene == "none" and self._fever_raw_streak > 0:
+                if self._fever_none_gap_used < _FEVER_NONE_GAP_ALLOW:
+                    self._fever_none_gap_used += 1
+                    if self._fever_raw_streak >= _FEVER_RAW_STREAK_REQUIRED:
+                        scene = "fever"
+                else:
+                    self._fever_raw_streak = 0
+                    self._fever_none_gap_used = 0
+                self.timeup_confirm_count = 0
+            else:
+                if raw_scene in ("go", "item", "ready", "bonus", "result"):
+                    self._fever_raw_streak = 0
+                    self._fever_none_gap_used = 0
                 self.timeup_confirm_count = 0
             self._last_raw_scene_in_game = raw_scene
         elif phase == "WAIT_BONUS":

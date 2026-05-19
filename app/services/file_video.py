@@ -19,6 +19,24 @@ from app.services.opencv_video import (
 )
 
 _STREAM_CHUNK = 4 * 1024 * 1024
+# Google ドライブの「クラウドのみ」は ftyp だけの数百バイトになることがある
+_MIN_PLAUSIBLE_VIDEO_BYTES = 4096
+
+
+def _placeholder_video_error(size: int, path: str) -> str:
+    drive = "マイドライブ" in path or "My Drive" in path
+    base = (
+        f"ファイルサイズが {size} バイトと異常に小さいです。"
+        "実体の動画がまだ PC にダウンロードされていない可能性が高いです。"
+    )
+    if drive:
+        return (
+            base
+            + "エクスプローラで右クリック→「オフラインで使用可能」をオンにし、"
+            "プロパティのサイズが数 MB 以上になるまで待ってから開いてください。"
+            "（現状は Google ドライブのプレースホルダのみの状態です。）"
+        )
+    return base + "別の場所へコピーするか、ファイルが壊れていないか確認してください。"
 
 
 def is_file_video_available() -> bool:
@@ -224,6 +242,14 @@ def _materialize_video_to_temp(path: str, owned: list[str], errors: list[str]) -
         errors.append("パスが存在しません（同期・オフライン・パス誤りを確認）")
         return None
 
+    try:
+        size = src.stat().st_size
+        if 0 <= size < _MIN_PLAUSIBLE_VIDEO_BYTES:
+            errors.append(_placeholder_video_error(size, str(src)))
+            return None
+    except OSError as exc:
+        errors.append(f"stat 失敗: {exc}")
+
     suffix = src.suffix or ".mp4"
     fd, tmp = tempfile.mkstemp(suffix=suffix, prefix="analyzer_vid_")
     os.close(fd)
@@ -346,6 +372,21 @@ class FileVideoSource:
         self.last_open_error = ""
         errors: list[str] = []
         primary = path
+
+        src_check = Path(path).expanduser()
+        try:
+            src_check = src_check.resolve(strict=False)
+        except Exception:
+            pass
+        if src_check.exists() and not src_check.is_dir():
+            try:
+                sz = src_check.stat().st_size
+                if 0 <= sz < _MIN_PLAUSIBLE_VIDEO_BYTES:
+                    errors.append(_placeholder_video_error(sz, path))
+                    self.last_open_error = "\n".join(errors)
+                    return False
+            except OSError as exc:
+                errors.append(f"stat 失敗: {exc}")
 
         if _needs_local_temp_copy(path):
             local = _materialize_video_to_temp(path, self._owned_temp_paths, errors)

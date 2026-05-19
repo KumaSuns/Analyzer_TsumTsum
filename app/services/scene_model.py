@@ -15,7 +15,6 @@ except ImportError:
 
 
 SCENE_CLASSES = ["none", "item", "ready", "go", "fever", "timeup", "bonus", "result"]
-
 # 学習・評価で扱う画像（.gitkeep 等は除外）
 SCENE_DATASET_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"})
 
@@ -184,14 +183,34 @@ def describe_training_image_load_failure(images_root: Path) -> str:
     return " | ".join(parts)
 
 
-def image_to_feature(image: QImage, size: int = 24) -> List[float]:
+def qimage_to_gray_array(image: QImage) -> Optional[np.ndarray]:
+    """QImage → グレースケール配列（学習時の image_file_to_feature と同系統）。"""
+    if image.isNull() or np is None:
+        return None
     gray = image.convertToFormat(QImage.Format.Format_Grayscale8)
-    small = gray.scaled(size, size)
-    feat: List[float] = []
-    for y in range(small.height()):
-        for x in range(small.width()):
-            feat.append(small.pixelColor(x, y).red() / 255.0)
-    return feat
+    w, h = gray.width(), gray.height()
+    if w < 1 or h < 1:
+        return None
+    bpl = int(gray.bytesPerLine())
+    buf = gray.constBits()
+    if buf is None:
+        return None
+    nbytes = bpl * h
+    arr = np.frombuffer(buf, dtype=np.uint8, count=nbytes).reshape(h, bpl)[:, :w].copy()
+    return arr
+
+
+def image_to_feature(image: QImage, size: int = 24) -> List[float]:
+    """推論用。image_file_to_feature と同じ縮小・正規化に揃える（学習との不一致を防ぐ）。"""
+    if image.isNull() or np is None:
+        return []
+    arr = qimage_to_gray_array(image)
+    if arr is None:
+        return []
+    resized = _resize_gray_to_size(arr, size)
+    if resized is None:
+        return []
+    return (resized.astype(np.float64) / 255.0).flatten().tolist()
 
 
 def l1_distance(a: List[float], b: List[float]) -> float:
@@ -202,6 +221,34 @@ def l1_distance(a: List[float], b: List[float]) -> float:
     for i in range(n):
         total += abs(a[i] - b[i])
     return total / n
+
+
+def _distance_map(ranked: List[Tuple[str, float]]) -> Dict[str, float]:
+    return {cls: dist for cls, dist in ranked}
+
+
+def fever_passes_confidence_gate(ranked: List[Tuple[str, float]]) -> bool:
+    """fever 1 位時: go に負けていないかだけ見る（none との僅差は本物 fever で多い）。"""
+    if not ranked or ranked[0][0] != "fever":
+        return False
+    dist = _distance_map(ranked)
+    df = dist.get("fever", 1e9)
+    dg = dist.get("go", 1e9)
+    if df >= dg - 0.004:
+        return False
+    if len(ranked) >= 2 and ranked[1][0] == "go" and (ranked[1][1] - df) < 0.008:
+        return False
+    return True
+
+
+def resolve_scene_label_from_ranked(ranked: List[Tuple[str, float]]) -> str:
+    """最近傍。fever は go との信頼度のみ確認（時間方向は window 側）。"""
+    if not ranked:
+        return "none"
+    best_cls = ranked[0][0]
+    if best_cls == "fever":
+        return "fever" if fever_passes_confidence_gate(ranked) else "none"
+    return best_cls
 
 
 class SceneCentroidModel:
@@ -237,14 +284,9 @@ class SceneCentroidModel:
     def predict_from_feature(self, feat: List[float]) -> str:
         if not self.centroids or not feat:
             return "none"
-        best_cls = "none"
-        best_dist = 1e9
-        for cls, centroid in self.centroids.items():
-            d = l1_distance(feat, centroid)
-            if d < best_dist:
-                best_dist = d
-                best_cls = cls
-        return best_cls
+        pairs = [(cls, l1_distance(feat, centroid)) for cls, centroid in self.centroids.items()]
+        pairs.sort(key=lambda x: x[1])
+        return resolve_scene_label_from_ranked(pairs)
 
     def ranked_distances(self, image: QImage) -> List[Tuple[str, float]]:
         """全クラスの距離を昇順（分類のあいまいさ解消に使う）。"""
@@ -259,7 +301,13 @@ class SceneCentroidModel:
         if image.isNull() or not self.centroids:
             return ("none", 1e9)
         ranked = self.ranked_distances(image)
-        return ranked[0][0], ranked[0][1]
+        label = resolve_scene_label_from_ranked(ranked)
+        dist = ranked[0][1]
+        for cls, d in ranked:
+            if cls == label:
+                dist = d
+                break
+        return label, dist
 
     def evaluate_val(self, images_root: Path) -> Tuple[int, int]:
         total = 0
