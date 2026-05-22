@@ -87,6 +87,22 @@ class ImageIoVideoSource:
             idx = max(0, min(idx, self._nframes - 1))
         else:
             idx = max(0, idx)
+        return self._read_frame_index(idx)
+
+    def read_next_qimage(self) -> Optional[QImage]:
+        if not self.is_open:
+            return None
+        idx = max(0, int((self._seek_ms_cursor / 1000.0) * self._fps))
+        img = self._read_frame_index(idx)
+        if img is not None and not img.isNull():
+            step_ms = max(1, int(1000.0 / self._fps))
+            self._seek_ms_cursor += step_ms
+        return img
+
+    def current_position_ms(self) -> int:
+        return max(0, int(self._seek_ms_cursor))
+
+    def _read_frame_index(self, idx: int) -> Optional[QImage]:
         try:
             arr = self._reader.get_data(idx)
         except Exception:

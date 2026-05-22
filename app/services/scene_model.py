@@ -6,6 +6,9 @@ from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtGui import QImage
 
+# 推論時は先に縮小（1080p 全体をグレー化すると重い）
+_INFERENCE_MAX_EDGE = 160
+
 try:
     import cv2  # type: ignore
     import numpy as np  # type: ignore
@@ -30,6 +33,39 @@ def iter_scene_dataset_images(cls_dir: Path):
     for p in cls_dir.rglob("*"):
         if is_scene_dataset_image(p):
             yield p
+
+
+def _downscale_gray_max_edge(arr: np.ndarray, max_edge: int = _INFERENCE_MAX_EDGE) -> np.ndarray:
+    """学習・推論で同じ前処理（大きい画像は長辺 max_edge に揃える）。"""
+    if arr is None or arr.size == 0 or arr.ndim != 2:
+        return arr
+    h, w = arr.shape
+    m = max(h, w)
+    if m <= max_edge:
+        return arr
+    if w >= h:
+        nw = max_edge
+        nh = max(1, int(h * max_edge / w))
+    else:
+        nh = max_edge
+        nw = max(1, int(w * max_edge / h))
+    if cv2 is not None:
+        try:
+            return cv2.resize(arr, (nw, nh), interpolation=cv2.INTER_AREA)
+        except Exception:
+            pass
+    try:
+        from PIL import Image
+
+        im = Image.fromarray(arr, mode="L")
+        try:
+            resample = Image.Resampling.BILINEAR
+        except AttributeError:
+            resample = Image.BILINEAR
+        im = im.resize((nw, nh), resample)
+        return np.array(im, dtype=np.uint8)
+    except Exception:
+        return arr
 
 
 def _resize_gray_to_size(arr: np.ndarray, size: int) -> Optional[np.ndarray]:
@@ -119,6 +155,7 @@ def image_file_to_feature(path: Path, size: int = 24) -> Optional[List[float]]:
 
     if arr is None:
         return None
+    arr = _downscale_gray_max_edge(arr)
     resized = _resize_gray_to_size(arr, size)
     if resized is None:
         return None
@@ -201,12 +238,13 @@ def qimage_to_gray_array(image: QImage) -> Optional[np.ndarray]:
 
 
 def image_to_feature(image: QImage, size: int = 24) -> List[float]:
-    """推論用。image_file_to_feature と同じ縮小・正規化に揃える（学習との不一致を防ぐ）。"""
+    """推論用。image_file_to_feature と同じ縮小・正規化に揃える。"""
     if image.isNull() or np is None:
         return []
     arr = qimage_to_gray_array(image)
     if arr is None:
         return []
+    arr = _downscale_gray_max_edge(arr)
     resized = _resize_gray_to_size(arr, size)
     if resized is None:
         return []
@@ -227,17 +265,28 @@ def _distance_map(ranked: List[Tuple[str, float]]) -> Dict[str, float]:
     return {cls: dist for cls, dist in ranked}
 
 
+# fever 誤検知抑制: none/go に僅差のときは raw を fever にしない
+_FEVER_MIN_LEAD_OVER_NONE = 0.008
+_FEVER_MIN_LEAD_OVER_SECOND = 0.010
+_FEVER_GO_CLEARLY_CLOSER = 0.003
+
+
 def fever_passes_confidence_gate(ranked: List[Tuple[str, float]]) -> bool:
-    """fever 1 位時: go に負けていないかだけ見る（none との僅差は本物 fever で多い）。"""
+    """fever 1 位でも、none/go に近すぎる場合は none 扱い（通常プレイの誤検知を抑える）。"""
     if not ranked or ranked[0][0] != "fever":
         return False
     dist = _distance_map(ranked)
     df = dist.get("fever", 1e9)
     dg = dist.get("go", 1e9)
-    if df >= dg - 0.004:
+    dn = dist.get("none", 1e9)
+    if dg < df - _FEVER_GO_CLEARLY_CLOSER:
         return False
-    if len(ranked) >= 2 and ranked[1][0] == "go" and (ranked[1][1] - df) < 0.008:
+    if dn <= df + _FEVER_MIN_LEAD_OVER_NONE:
         return False
+    if len(ranked) >= 2:
+        second_cls, second_dist = ranked[1]
+        if second_cls in ("none", "go") and (second_dist - df) < _FEVER_MIN_LEAD_OVER_SECOND:
+            return False
     return True
 
 

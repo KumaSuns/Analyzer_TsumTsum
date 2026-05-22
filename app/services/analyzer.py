@@ -33,6 +33,11 @@ class SceneClassifier:
         label, _dist = self.model.predict(frame_image)
         return label
 
+    def predict_feature(self, feat: List[float]) -> str:
+        if not feat:
+            return "none"
+        return self.model.predict_from_feature(feat)
+
 
 class TsumItemSkillClassifier:
     """scene=item 時にログへ載せる使用ツム表示名（dir→表示名）。"""
@@ -91,6 +96,7 @@ class VideoAnalyzer:
         selected_tsum: str = "auto",
         frame_image=None,
         use_tsum_dir: str = "",
+        scene_feature: Optional[List[float]] = None,
     ) -> List[AnalysisResult]:
         """Process using actual decoded frame sequence from video callback."""
         frame_index = max(0, int(frame_seq))
@@ -101,7 +107,10 @@ class VideoAnalyzer:
             return []
 
         self._last_sampled_frame = frame_index
-        scene_label = self.scene_classifier.predict(frame_image)
+        if scene_feature is not None:
+            scene_label = self.scene_classifier.predict_feature(scene_feature)
+        else:
+            scene_label = self.scene_classifier.predict(frame_image)
         item_skill_label = "-"
         if scene_label == "item" and use_tsum_dir:
             item_skill_label = self.item_skill_classifier.display_name(use_tsum_dir)
@@ -122,6 +131,7 @@ class VideoAnalyzer:
         selected_tsum: str = "auto",
         frame_image=None,
         use_tsum_dir: str = "",
+        scene_feature: Optional[List[float]] = None,
     ) -> List[AnalysisResult]:
         if fps <= 0:
             fps = 30.0
@@ -134,7 +144,10 @@ class VideoAnalyzer:
             return []
 
         self._last_sampled_frame = frame_index
-        scene_label = self.scene_classifier.predict(frame_image)
+        if scene_feature is not None:
+            scene_label = self.scene_classifier.predict_feature(scene_feature)
+        else:
+            scene_label = self.scene_classifier.predict(frame_image)
         item_skill_label = "-"
         if scene_label == "item" and use_tsum_dir:
             item_skill_label = self.item_skill_classifier.display_name(use_tsum_dir)

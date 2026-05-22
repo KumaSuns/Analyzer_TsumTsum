@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
 
 from app.services.analyzer import VideoAnalyzer
 from app.services.image_save import save_training_png
-from app.services.scene_model import SceneCentroidModel
+from app.services.scene_model import SceneCentroidModel, image_to_feature
 from app.services.trainer import SimpleTrainer
 from app.services.tsum_registry import TsumRegistry
 from app.services.skill_classifier import (
@@ -59,12 +59,16 @@ from app.services.file_video import FileVideoSource, is_file_video_available
 
 # 解析テスト: item〜result を「シーンに入った瞬間」で確認モーダルする対象にできる（none 除く）
 _ANALYSIS_SCENE_CONFIRM_LABELS = tuple(c for c in SimpleTrainer.CLASSES if c != "none")
-# IN_GAME で raw fever が続いた回数で確定（間隔10なら3回≈30フレーム相当）
+# IN_GAME で raw fever が続いた回数で確定（間隔15なら3回≈45フレーム相当）
 _FEVER_RAW_STREAK_REQUIRED = 3
 # go 直後の誤検知を避けるウォームアップ（サンプル回数）
-_FEVER_IN_GAME_WARMUP_SAMPLES = 3
-# fever 確定途中に none が 1 回挟まってもストリーク維持
-_FEVER_NONE_GAP_ALLOW = 1
+_FEVER_IN_GAME_WARMUP_SAMPLES = 2
+# fever 確定途中の none 挟み込みはストリークを切る（誤検知維持を防ぐ）
+_FEVER_NONE_GAP_ALLOW = 0
+# モーダルで fever 誤りとしたあと、しばらく fever 確定しない
+_FEVER_REJECT_COOLDOWN_SAMPLES = 12
+# IN_GAME で raw timeup が続いた回数で確定（誤検知抑制）
+_TIMEUP_RAW_STREAK_REQUIRED = 5
 
 _SCENE_CONFIRM_PREVIEW_MAX_W = 560
 _SCENE_CONFIRM_PREVIEW_MAX_H = 315
@@ -355,17 +359,23 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("Analyzer_TsumTsum", "Analyzer_TsumTsum")
         self.estimated_fps = 30.0
         self.media_duration_ms = 0
-        self.video_analyzer = VideoAnalyzer(sample_every_frames=10)
+        self.video_analyzer = VideoAnalyzer(sample_every_frames=15)
         self.analysis_running = False
         self.analysis_warmup_until_ms = 0
         self.analysis_frame_seq = 0
         self._analysis_log_scroll_counter = 0
         self._analysis_confirm_edge_prev = ""
+        self._analysis_last_logged_scene = ""
+        self._analysis_progress_ui_last_ms = 0
+        self._playback_ui_last_ms = 0
+        self._cv_display_tick = 0
+        self._video_frame_size: Optional[tuple[int, int]] = None
         self.flow_phase = "WAIT_ITEM"
         self.flow_game_index = 1
         self.timeup_confirm_count = 0
         self._fever_raw_streak = 0
         self._fever_none_gap_used = 0
+        self._fever_reject_cooldown = 0
         self._in_game_fever_warmup = 0
         self._last_raw_scene_in_game = ""
         self._fever_count = 0
@@ -874,12 +884,20 @@ class MainWindow(QMainWindow):
             sample_row_layout.setSpacing(2)
             self.sample_frame_spin = QSpinBox()
             self.sample_frame_spin.setRange(1, 60)
-            self.sample_frame_spin.setValue(10)
+            self.sample_frame_spin.setValue(15)
             self.sample_frame_spin.setFixedHeight(compact_h)
             self.sample_frame_spin.valueChanged.connect(self._on_sample_frame_changed)
             sample_row_layout.addWidget(QLabel("間隔"))
             sample_row_layout.addWidget(self.sample_frame_spin, 1)
             self.left_layout.addWidget(sample_row)
+            interval_hint = QLabel("間隔＝判定の間引きのみ（再生速度は変わりません）。重いときは20〜30。")
+            interval_hint.setWordWrap(True)
+            interval_hint.setStyleSheet("color: #555; font-size: 11px;")
+            self.left_layout.addWidget(interval_hint)
+
+            self.analysis_light_check = QCheckBox("軽量解析（スキル検知オフ・UI更新抑制）")
+            self.analysis_light_check.setChecked(False)
+            self.left_layout.addWidget(self.analysis_light_check)
 
             model_row = QFrame()
             model_row_layout = QHBoxLayout(model_row)
@@ -912,6 +930,13 @@ class MainWindow(QMainWindow):
             self.start_from_zero_check = QCheckBox("先頭から")
             self.start_from_zero_check.setChecked(True)
             self.left_layout.addWidget(self.start_from_zero_check)
+
+            self.analysis_stop_on_timeup_check = QCheckBox("timeupで解析を自動停止")
+            self.analysis_stop_on_timeup_check.setChecked(True)
+            self.analysis_stop_on_timeup_check.setToolTip(
+                "オフにすると誤検知の timeup でも最後まで再生します（fever 確認向け）。"
+            )
+            self.left_layout.addWidget(self.analysis_stop_on_timeup_check)
 
             self.left_layout.addWidget(QLabel("シーン判定の確認（入った瞬間・モーダル）"))
             confirm_wrap = QWidget()
@@ -1716,15 +1741,28 @@ class MainWindow(QMainWindow):
             self.step_huge_right_button.setEnabled(pause_only)
 
     def _sync_cv_timer_interval(self) -> None:
+        """再生速度は常に動画FPS基準。解析の「間隔」とは切り離す。"""
         fps = max(float(self.estimated_fps), 1.0)
-        self.cv_play_timer.setInterval(max(int(1000.0 / fps), 1))
+        rate = max(float(getattr(self, "_cv_playback_rate", 1.0)), 0.05)
+        self.cv_play_timer.setInterval(max(int(1000.0 / (fps * rate)), 1))
 
-    def _cv_push_frame(self, image: QImage) -> None:
+    def _analysis_sample_step(self) -> int:
+        step = max(1, self.video_analyzer.sample_every_frames)
+        if self._analysis_light_mode():
+            step *= 2
+        return step
+
+    def _cv_push_frame(self, image: QImage, *, refresh_display: bool = True) -> None:
         if image is None or image.isNull():
             return
         self.current_video_frame_image = image
+        if not refresh_display:
+            return
         if self.current_video_container is not None:
-            self.current_video_container.set_source_size(image.width(), image.height())
+            w, h = image.width(), image.height()
+            if self._video_frame_size != (w, h):
+                self._video_frame_size = (w, h)
+                self.current_video_container.set_source_size(w, h)
             lbl = self.current_video_container.frame_label
             geo = lbl.geometry()
             tw, th = geo.width(), geo.height()
@@ -1736,21 +1774,19 @@ class MainWindow(QMainWindow):
             if tw <= 0 or th <= 0:
                 tw = max(min(image.width(), 1280), 1)
                 th = max(min(image.height(), 720), 1)
+            scale_mode = (
+                Qt.TransformationMode.FastTransformation
+                if self.analysis_running
+                else Qt.TransformationMode.SmoothTransformation
+            )
             lbl.setPixmap(
                 QPixmap.fromImage(image).scaled(
                     tw,
                     th,
                     Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
+                    scale_mode,
                 )
             )
-        self._on_player_position_changed(self._cv_position_ms)
-        self._video_frame_counter += 1
-        if self._video_frame_counter % 2 != 0:
-            return
-        self.analysis_frame_seq += 1
-        if self.analysis_running:
-            self._run_analysis_step(self._cv_position_ms, image)
 
     def _cv_seek_and_show(self, ms: int) -> None:
         if not getattr(self, "use_opencv_for_video", False) or self.cv_source is None or not self.cv_source.is_open:
@@ -1770,19 +1806,31 @@ class MainWindow(QMainWindow):
             return
         if self.crop_playback_lock:
             return
-        interval = self.cv_play_timer.interval()
-        delta = max(1, int(interval * self._cv_playback_rate))
-        next_ms = self._cv_position_ms + delta
-        if self.media_duration_ms > 0 and next_ms >= self.media_duration_ms:
-            self._cv_reached_end()
-            return
-        self._cv_position_ms = next_ms
-        self.cv_source.seek_ms(self._cv_position_ms)
-        img = self.cv_source.read_qimage()
+        analyze_now = False
+        if self.analysis_running:
+            self.analysis_frame_seq += 1
+            step = self._analysis_sample_step()
+            analyze_now = self.analysis_frame_seq % step == 0
+            img = self.cv_source.read_next_qimage()
+            if img is not None and not img.isNull():
+                self._cv_position_ms = self.cv_source.current_position_ms()
+        else:
+            interval = self.cv_play_timer.interval()
+            delta = max(1, int(interval * self._cv_playback_rate))
+            next_ms = self._cv_position_ms + delta
+            if self.media_duration_ms > 0 and next_ms >= self.media_duration_ms:
+                self._cv_reached_end()
+                return
+            self._cv_position_ms = next_ms
+            self.cv_source.seek_ms(self._cv_position_ms)
+            img = self.cv_source.read_qimage()
         if img is None or img.isNull():
             self._cv_reached_end()
             return
-        self._cv_push_frame(img)
+        self._cv_push_frame(img, refresh_display=True)
+        self._on_player_position_changed(self._cv_position_ms)
+        if analyze_now:
+            self._run_analysis_step(self._cv_position_ms, img)
 
     def _cv_play(self) -> None:
         if not getattr(self, "use_opencv_for_video", False) or self.cv_source is None or not self.cv_source.is_open:
@@ -1851,6 +1899,10 @@ class MainWindow(QMainWindow):
     def _on_player_position_changed(self, position_ms: int) -> None:
         self._update_playback_indicators(position_ms)
         if hasattr(self, "counter_progress_label") and _is_alive_qobject(self.counter_progress_label):
+            if self.analysis_running:
+                if position_ms - self._analysis_progress_ui_last_ms < 500:
+                    return
+                self._analysis_progress_ui_last_ms = position_ms
             frame_index = int((max(position_ms, 0) / 1000.0) * self.estimated_fps)
             self.counter_progress_label.setText(f"進行: {position_ms/1000.0:.2f}s / f{frame_index}")
 
@@ -1981,6 +2033,8 @@ class MainWindow(QMainWindow):
         self.analysis_frame_seq = 0
         self._analysis_log_scroll_counter = 0
         self._analysis_confirm_edge_prev = ""
+        self._analysis_last_logged_scene = ""
+        self._analysis_progress_ui_last_ms = 0
         self._reset_analysis_flow()
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(self.counter_analysis_state_label):
             self.counter_analysis_state_label.setText("解析状態: 実行中")
@@ -1993,7 +2047,9 @@ class MainWindow(QMainWindow):
                 self.player.setPosition(0)
         # Ignore unstable first frames right after start/seek.
         self.analysis_warmup_until_ms = max(self._playback_position_ms(), 0) + 500
+        self._cv_display_tick = 0
         if getattr(self, "use_opencv_for_video", False):
+            self._sync_cv_timer_interval()
             self._cv_play()
         else:
             self.player.play()
@@ -2001,8 +2057,13 @@ class MainWindow(QMainWindow):
             self.log_view.clear()
             if hasattr(self, "counter_use_item_label"):
                 self.counter_use_item_label.setText("使用アイテム: --")
+            light = self._analysis_light_mode()
             self.log_view.append(
-                f"解析開始: {self.video_analyzer.sample_every_frames}フレームごとに判定します。 model={self.video_analyzer.active_model_version}"
+                f"解析開始: {self.video_analyzer.sample_every_frames}フレームごとに判定します。"
+                f" 軽量={'ON' if light else 'OFF'} model={self.video_analyzer.active_model_version}"
+            )
+            self.log_view.append(
+                "※ シーン判定ロジックを更新した場合は、学習タブで「学習開始」→「モデル保存」を実行してください。"
             )
             self.log_view.append(
                 "モデル状態: "
@@ -2033,6 +2094,14 @@ class MainWindow(QMainWindow):
     def _on_sample_frame_changed(self, value: int) -> None:
         self.video_analyzer.sample_every_frames = max(1, value)
 
+    def _analysis_light_mode(self) -> bool:
+        cb = getattr(self, "analysis_light_check", None)
+        return cb is not None and _is_alive_qobject(cb) and cb.isChecked()
+
+    def _analysis_stop_on_timeup_enabled(self) -> bool:
+        cb = getattr(self, "analysis_stop_on_timeup_check", None)
+        return cb is None or (not _is_alive_qobject(cb)) or cb.isChecked()
+
     def _load_analysis_settings_ui(self) -> None:
         """解析設定（左列）を QSettings から復元。"""
         s = self.settings
@@ -2048,7 +2117,7 @@ class MainWindow(QMainWindow):
             cb.blockSignals(False)
 
         if hasattr(self, "sample_frame_spin") and _is_alive_qobject(self.sample_frame_spin):
-            _set_spin(self.sample_frame_spin, "analysis/sample_every_frames", 10)
+            _set_spin(self.sample_frame_spin, "analysis/sample_every_frames", 15)
             self.video_analyzer.sample_every_frames = self.sample_frame_spin.value()
         if hasattr(self, "model_version_combo") and _is_alive_qobject(self.model_version_combo):
             mv = str(s.value("analysis/model_version", "version_1", type=str))
@@ -2068,8 +2137,14 @@ class MainWindow(QMainWindow):
             self.item_tsum_combo.blockSignals(False)
         if hasattr(self, "detail_log_check") and _is_alive_qobject(self.detail_log_check):
             _set_check(self.detail_log_check, "analysis/detail_log", False)
+        if hasattr(self, "analysis_light_check") and _is_alive_qobject(self.analysis_light_check):
+            _set_check(self.analysis_light_check, "analysis/light_mode", False)
         if hasattr(self, "start_from_zero_check") and _is_alive_qobject(self.start_from_zero_check):
             _set_check(self.start_from_zero_check, "analysis/start_from_zero", True)
+        if hasattr(self, "analysis_stop_on_timeup_check") and _is_alive_qobject(
+            self.analysis_stop_on_timeup_check
+        ):
+            _set_check(self.analysis_stop_on_timeup_check, "analysis/stop_on_timeup", True)
         checks = getattr(self, "analysis_scene_confirm_checks", None)
         if isinstance(checks, dict):
             for scene_key, cb in checks.items():
@@ -2091,8 +2166,14 @@ class MainWindow(QMainWindow):
             s.setValue("analysis/item_tsum", self.item_tsum_combo.currentText())
         if hasattr(self, "detail_log_check") and _is_alive_qobject(self.detail_log_check):
             s.setValue("analysis/detail_log", self.detail_log_check.isChecked())
+        if hasattr(self, "analysis_light_check") and _is_alive_qobject(self.analysis_light_check):
+            s.setValue("analysis/light_mode", self.analysis_light_check.isChecked())
         if hasattr(self, "start_from_zero_check") and _is_alive_qobject(self.start_from_zero_check):
             s.setValue("analysis/start_from_zero", self.start_from_zero_check.isChecked())
+        if hasattr(self, "analysis_stop_on_timeup_check") and _is_alive_qobject(
+            self.analysis_stop_on_timeup_check
+        ):
+            s.setValue("analysis/stop_on_timeup", self.analysis_stop_on_timeup_check.isChecked())
         checks = getattr(self, "analysis_scene_confirm_checks", None)
         if isinstance(checks, dict):
             for scene_key, cb in checks.items():
@@ -2118,8 +2199,17 @@ class MainWindow(QMainWindow):
             _wire_save(self.item_tsum_combo.currentIndexChanged, lambda _i: self._save_analysis_settings_ui())
         if hasattr(self, "detail_log_check") and _is_alive_qobject(self.detail_log_check):
             _wire_save(self.detail_log_check.toggled, lambda _c: self._save_analysis_settings_ui())
+        if hasattr(self, "analysis_light_check") and _is_alive_qobject(self.analysis_light_check):
+            _wire_save(self.analysis_light_check.toggled, lambda _c: self._save_analysis_settings_ui())
         if hasattr(self, "start_from_zero_check") and _is_alive_qobject(self.start_from_zero_check):
             _wire_save(self.start_from_zero_check.toggled, lambda _c: self._save_analysis_settings_ui())
+        if hasattr(self, "analysis_stop_on_timeup_check") and _is_alive_qobject(
+            self.analysis_stop_on_timeup_check
+        ):
+            _wire_save(
+                self.analysis_stop_on_timeup_check.toggled,
+                lambda _c: self._save_analysis_settings_ui(),
+            )
         checks = getattr(self, "analysis_scene_confirm_checks", None)
         if isinstance(checks, dict):
             for cb in checks.values():
@@ -2482,11 +2572,16 @@ class MainWindow(QMainWindow):
         if image is None or image.isNull():
             return
         self.current_video_frame_image = image
-        self.analysis_frame_seq += 1
         if self.current_video_container is not None:
-            self.current_video_container.set_source_size(image.width(), image.height())
+            w, h = image.width(), image.height()
+            if self._video_frame_size != (w, h):
+                self._video_frame_size = (w, h)
+                self.current_video_container.set_source_size(w, h)
         if self.analysis_running:
-            self._run_analysis_step(self._playback_position_ms(), image)
+            self.analysis_frame_seq += 1
+            if self.analysis_frame_seq % self._analysis_sample_step() == 0:
+                self._run_analysis_step(self._playback_position_ms(), image)
+            return
 
     def _run_analysis_step(self, position_ms: int, frame_image) -> None:
         if position_ms < self.analysis_warmup_until_ms:
@@ -2500,12 +2595,16 @@ class MainWindow(QMainWindow):
             use_tsum_dir = self._resolve_tsum_dir(self.locked_use_tsum)
         elif selected_tsum != "auto":
             use_tsum_dir = self._resolve_tsum_dir(selected_tsum)
+        scene_feature = None
+        if frame_image is not None and not frame_image.isNull():
+            scene_feature = image_to_feature(frame_image)
         results = self.video_analyzer.process_frame(
             self.analysis_frame_seq,
             position_ms,
             selected_tsum,
             frame_image,
             use_tsum_dir=use_tsum_dir,
+            scene_feature=scene_feature,
         )
         for result in results:
             raw_scene = result.scene_label
@@ -2534,13 +2633,22 @@ class MainWindow(QMainWindow):
                 use_tsum_detected = self.locked_use_tsum if self.locked_item_fixed else "-"
                 scene_label = self._apply_scene_flow(result.scene_label, item_detected, use_tsum_detected)
                 item_debug = "item_lock:ON"
+            if scene_label == "timeup" and not self._analysis_stop_on_timeup_enabled():
+                self.flow_phase = "IN_GAME"
+                self.timeup_confirm_count = 0
+                scene_label = "none"
             result.scene_label = scene_label
             skill_tsum_dir = (
                 self._resolve_tsum_dir(self.locked_use_tsum) if self.locked_item_fixed else use_tsum_dir
             )
             skill_new = False
             skill_log_dir = ""
-            if self.locked_item_fixed and skill_tsum_dir and self.flow_phase == "IN_GAME":
+            if (
+                not self._analysis_light_mode()
+                and self.locked_item_fixed
+                and skill_tsum_dir
+                and self.flow_phase == "IN_GAME"
+            ):
                 pending_dist = self._probe_skill_new_episode(frame_image, skill_tsum_dir)
                 if pending_dist is not None:
                     use_skill_modal = False
@@ -2567,16 +2675,19 @@ class MainWindow(QMainWindow):
                         skill_new = True
                         skill_log_dir = skill_tsum_dir
             self._maybe_modal_scene_confirm(scene_label, frame_image)
-            self._append_analysis_log(
-                result,
-                selected_targets,
-                use_tsum_detected,
-                item_detected,
-                item_debug,
-                skill_detected=skill_new,
-                skill_tsum_dir=skill_log_dir,
-            )
-            if scene_label == "timeup":
+            # 同じ scene が続く間は毎サンプル出さない（fever 継続中のログ連発を防ぐ）
+            if skill_new or scene_label != self._analysis_last_logged_scene:
+                self._append_analysis_log(
+                    result,
+                    selected_targets,
+                    use_tsum_detected,
+                    item_detected,
+                    item_debug,
+                    skill_detected=skill_new,
+                    skill_tsum_dir=skill_log_dir,
+                )
+                self._analysis_last_logged_scene = scene_label
+            if scene_label == "timeup" and self._analysis_stop_on_timeup_enabled():
                 self.analysis_running = False
                 self.analysis_warmup_until_ms = 0
                 self.analysis_frame_seq = 0
@@ -2598,10 +2709,12 @@ class MainWindow(QMainWindow):
         self.timeup_confirm_count = 0
         self._fever_raw_streak = 0
         self._fever_none_gap_used = 0
+        self._fever_reject_cooldown = 0
         self._in_game_fever_warmup = 0
         self._last_raw_scene_in_game = ""
         self._fever_count = 0
         self._fever_episode_active = False
+        self._analysis_last_logged_scene = ""
         self._skill_count = 0
         self._skill_episode_active = False
         self._skill_off_streak = 0
@@ -2651,9 +2764,15 @@ class MainWindow(QMainWindow):
                 self._fever_none_gap_used = 0
                 self._in_game_fever_warmup = _FEVER_IN_GAME_WARMUP_SAMPLES
         elif phase == "IN_GAME":
+            if self._fever_reject_cooldown > 0:
+                self._fever_reject_cooldown -= 1
             if self._in_game_fever_warmup > 0:
                 self._in_game_fever_warmup -= 1
-            fever_candidate = raw_scene == "fever" and self._in_game_fever_warmup <= 0
+            fever_candidate = (
+                raw_scene == "fever"
+                and self._in_game_fever_warmup <= 0
+                and self._fever_reject_cooldown <= 0
+            )
             if fever_candidate:
                 self._fever_raw_streak = min(self._fever_raw_streak + 1, 30)
                 self._fever_none_gap_used = 0
@@ -2674,7 +2793,7 @@ class MainWindow(QMainWindow):
                     self.timeup_confirm_count = 0
                 else:
                     self.timeup_confirm_count += 1
-                    if self.timeup_confirm_count >= 3:
+                    if self.timeup_confirm_count >= _TIMEUP_RAW_STREAK_REQUIRED:
                         scene = "timeup"
                         self.flow_phase = "WAIT_BONUS"
                         self.timeup_confirm_count = 0
@@ -2779,7 +2898,10 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(img)
         layout.addWidget(
-            QLabel("保存するクラス（none は保存しません／他は train・val 自動）")
+            QLabel(
+                "正しいクラスを選ぶと train/val に保存されます。"
+                "誤検知の fever などは none を選ぶと train/none へ入ります。"
+            )
         )
         combo = QComboBox()
         combo.addItems(list(SimpleTrainer.CLASSES))
@@ -2903,17 +3025,24 @@ class MainWindow(QMainWindow):
 
         try:
             if not self._exec_scene_confirm_dialog(frame_image, scene_label):
+                if scene_label == "fever":
+                    self._fever_raw_streak = 0
+                    self._fever_episode_active = False
+                    self._fever_none_gap_used = 0
+                    self._fever_reject_cooldown = _FEVER_REJECT_COOLDOWN_SAMPLES
                 choice, ok = self._exec_scene_correction_dialog(frame_image, scene_label)
                 if ok and choice:
-                    if choice == "none":
-                        if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                            self.log_view.append("修正: none（画像は保存しません）")
-                    else:
-                        save_ok, msg = self._save_frame_to_scene_class(frame_image, choice)
-                        if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                            self.log_view.append(("修正保存: " if save_ok else "修正保存失敗: ") + msg)
-                        if save_ok:
-                            self._train_log(f"解析修正保存: {msg}")
+                    if choice == "none" and scene_label == "fever":
+                        self._fever_reject_cooldown = _FEVER_REJECT_COOLDOWN_SAMPLES
+                    save_ok, msg = self._save_frame_to_scene_class(frame_image, choice)
+                    if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                        self.log_view.append(("修正保存: " if save_ok else "修正保存失敗: ") + msg)
+                    if save_ok:
+                        self._train_log(f"解析修正保存: {msg}")
+                        if choice == "none":
+                            self.log_view.append(
+                                "（none 保存後は学習タブで「学習開始」→「モデル保存」で反映）"
+                            )
         finally:
             self._analysis_confirm_edge_prev = scene_label
             resume = was_playing and self.analysis_running and scene_label != "timeup"
@@ -2987,6 +3116,9 @@ class MainWindow(QMainWindow):
         """Log one line; scene name ready/go in orange via QTextCharFormat (HTML is unreliable in QTextEdit)."""
         if not hasattr(self, "log_view"):
             return
+        batch_log = getattr(self, "analysis_running", False)
+        if batch_log:
+            self.log_view.setUpdatesEnabled(False)
         cursor = self.log_view.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         mono = QTextCharFormat()
@@ -3018,6 +3150,8 @@ class MainWindow(QMainWindow):
             cursor.setCharFormat(mono)
         cursor.insertText(suffix + "\n")
         self.log_view.setTextCursor(cursor)
+        if batch_log:
+            self.log_view.setUpdatesEnabled(True)
         # 解析中は毎行 ensureCursorVisible すると QTextEdit のスクロールが重い
         if not getattr(self, "analysis_running", False):
             self.log_view.ensureCursorVisible()
@@ -3414,6 +3548,10 @@ class MainWindow(QMainWindow):
     def _update_playback_indicators(self, position_ms: int) -> None:
         if not hasattr(self, "seek_slider"):
             return
+        if self.analysis_running:
+            if position_ms - self._playback_ui_last_ms < 300:
+                return
+            self._playback_ui_last_ms = position_ms
         self.seek_slider.blockSignals(True)
         self.seek_slider.setValue(max(position_ms, 0))
         self.seek_slider.blockSignals(False)

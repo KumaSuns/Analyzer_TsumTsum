@@ -191,6 +191,22 @@ class OpenCvVideoSource:
         ok, frame = self._cap.read()
         if not ok or frame is None:
             return None
+        return self._bgr_frame_to_qimage(frame)
+
+    def read_next_qimage(self) -> Optional[QImage]:
+        """seek せず次フレームを読む（解析再生で毎 tick の seek を避ける）。"""
+        return self.read_qimage()
+
+    def current_position_ms(self) -> int:
+        if not self.is_open:
+            return 0
+        try:
+            return int(float(self._cap.get(cv2.CAP_PROP_POS_MSEC)))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _bgr_frame_to_qimage(frame) -> Optional[QImage]:
         rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         h, w, ch = rgb.shape
         bytes_per_line = ch * w

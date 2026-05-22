@@ -458,3 +458,19 @@ class FileVideoSource:
         if self._impl is None:
             return None
         return self._impl.read_qimage()
+
+    def read_next_qimage(self):
+        if self._impl is None:
+            return None
+        fn = getattr(self._impl, "read_next_qimage", None)
+        if callable(fn):
+            return fn()
+        return self._impl.read_qimage()
+
+    def current_position_ms(self) -> int:
+        if self._impl is None:
+            return 0
+        fn = getattr(self._impl, "current_position_ms", None)
+        if callable(fn):
+            return int(fn())
+        return 0
