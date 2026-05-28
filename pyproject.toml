@@ -11,6 +11,16 @@ dependencies = [
   "Pillow>=10.0.0",
   "imageio>=2.34",
   "imageio-ffmpeg>=0.4.9",
+  "torch>=2.0.0",
+  "torchvision>=0.15.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+  # RTX 等: pip install -e ".[gpu]" ではなく下記 index で直接入れる（CPU 版と混在しないよう）
+  # pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+  "torch>=2.6.0",
+  "torchvision>=0.21.0",
 ]
 
 [project.scripts]

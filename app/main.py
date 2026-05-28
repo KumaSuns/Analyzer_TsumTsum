@@ -35,16 +35,19 @@ from app.window import MainWindow
 
 def _detect_compute_device() -> str:
     try:
-        import torch  # type: ignore
+        from app.services.scene_cnn import describe_torch_device, pick_torch_device, torch_available
 
-        if torch.cuda.is_available():
-            return "GPU:使用(CUDA)"
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        if not torch_available():
+            return "CPU:使用 / PyTorch 未導入"
+        dev = pick_torch_device()
+        if dev.type == "cuda":
+            return f"GPU:使用(CUDA) {describe_torch_device(dev)}"
+        if dev.type == "mps":
             return "GPU:使用(MPS)"
     except Exception:
         pass
 
-    return "CPU:使用 / GPU:未使用"
+    return "CPU:使用 / GPU:未使用（CUDA版 torch を入れると GPU 学習可）"
 
 
 def main() -> int:
@@ -52,6 +55,15 @@ def main() -> int:
     os_info = platform.platform()
     compute_status = _detect_compute_device()
     os.environ["ANALYZER_COMPUTE_DEVICE"] = compute_status
+
+    try:
+        from app.services.scene_cnn import verify_torch_install
+
+        torch_err = verify_torch_install()
+        if torch_err:
+            print(f"警告: {torch_err}")
+    except Exception:
+        pass
 
     screen = app.primaryScreen()
     geometry = screen.availableGeometry() if screen is not None else None

@@ -300,9 +300,302 @@ def resolve_scene_label_from_ranked(ranked: List[Tuple[str, float]]) -> str:
     return best_cls
 
 
+_IN_GAME_FEVER_NEAR_TOP = 0.030
+_IN_GAME_FEVER_NEAR_ENDGAME = 0.028
+# train/none の実画像（新しい順）に近いフレームは fever 候補から外す（centroid 平均だけでは効かない誤検知向け）
+_NONE_VETO_EXEMPLAR_MAX = 60
+_NONE_VETO_MARGIN = 0.005
+
+DEFAULT_FEVER_CALIB: Dict[str, float] = {
+    "top1_lead": 0.003,
+    "none_go_gap": 0.015,
+    "none_go_lead": 0.008,
+    "endgame_gap": 0.030,
+    "endgame_lead": 0.003,
+    "weak_none_go_gap": 0.022,
+    "weak_none_go_lead": 0.002,
+    "weak_endgame_gap": 0.032,
+    "weak_endgame_lead": 0.0,
+}
+
+
+def _fever_calib(calib: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+    merged = dict(DEFAULT_FEVER_CALIB)
+    if calib:
+        for key, val in calib.items():
+            if key in merged:
+                merged[key] = float(val)
+    return merged
+
+
+def _fever_go_blocks(dist: Dict[str, float]) -> bool:
+    dg = dist.get("go", 1e9)
+    df = dist.get("fever", 1e9)
+    return dg < df - _FEVER_GO_CLEARLY_CLOSER
+
+
+def fever_strong_from_ranked(
+    ranked: List[Tuple[str, float]],
+    calib: Optional[Dict[str, float]] = None,
+) -> bool:
+    """はっきりした fever（1 サンプルで確定向け）。学習時に val から閾値を更新する。"""
+    if not ranked:
+        return False
+    params = _fever_calib(calib)
+    dist = _distance_map(ranked)
+    if _fever_go_blocks(dist):
+        return False
+    top1, d1 = ranked[0]
+    df = dist.get("fever", 1e9)
+    dn = dist.get("none", 1e9)
+    if top1 == "fever":
+        return (dn - df) >= params["top1_lead"]
+    if top1 in ("none", "go"):
+        return df <= d1 + params["none_go_gap"] and (dn - df) >= params["none_go_lead"]
+    if top1 in ("timeup", "bonus", "result"):
+        return df <= d1 + params["endgame_gap"] and (dn - df) >= params["endgame_lead"]
+    return False
+
+
+def fever_weak_from_ranked(
+    ranked: List[Tuple[str, float]],
+    calib: Optional[Dict[str, float]] = None,
+) -> bool:
+    """弱い fever 候補（連続 2 サンプルで確定）。取りこぼし補完用。"""
+    if not ranked or fever_strong_from_ranked(ranked, calib):
+        return False
+    params = _fever_calib(calib)
+    dist = _distance_map(ranked)
+    if _fever_go_blocks(dist):
+        return False
+    top1, d1 = ranked[0]
+    df = dist.get("fever", 1e9)
+    dn = dist.get("none", 1e9)
+    if top1 == "fever":
+        return (dn - df) >= params["weak_none_go_lead"]
+    if top1 in ("none", "go"):
+        return df <= d1 + params["weak_none_go_gap"] and (dn - df) >= params["weak_none_go_lead"]
+    if top1 in ("timeup", "bonus", "result"):
+        return df <= d1 + params["weak_endgame_gap"] and (dn - df) >= params["weak_endgame_lead"]
+    return False
+
+
+def none_go_blocks_loose_fever(ranked: List[Tuple[str, float]]) -> bool:
+    """1 位が none/go で fever よりかなり近い → 緩い recall だけ止める（本物 fever は通す）。"""
+    if not ranked:
+        return False
+    top1, _d1 = ranked[0]
+    if top1 == "fever":
+        return False
+    dist = _distance_map(ranked)
+    df = dist.get("fever", 1e9)
+    if top1 == "none":
+        return (dist.get("none", 1e9) - df) >= 0.012
+    if top1 == "go":
+        return (dist.get("go", 1e9) - df) >= 0.012
+    return False
+
+
+def in_game_fever_candidate_from_ranked(
+    ranked: List[Tuple[str, float]],
+    calib: Optional[Dict[str, float]] = None,
+) -> bool:
+    """IN_GAME: 学習時に調整した fever ゲート（strong / weak / recall）。"""
+    if not ranked:
+        return False
+    if fever_strong_from_ranked(ranked, calib) or fever_weak_from_ranked(ranked, calib):
+        return True
+    if none_go_blocks_loose_fever(ranked):
+        return False
+    return fever_recall_from_ranked(ranked, calib)
+
+
+def fever_recall_from_ranked(
+    ranked: List[Tuple[str, float]],
+    calib: Optional[Dict[str, float]] = None,
+) -> bool:
+    """取りこぼし防止の緩い fever 候補（強/弱の次に適用）。"""
+    if not ranked:
+        return False
+    if fever_strong_from_ranked(ranked, calib) or fever_weak_from_ranked(ranked, calib):
+        return True
+    dist = _distance_map(ranked)
+    if _fever_go_blocks(dist):
+        return False
+    top1, d1 = ranked[0]
+    df = dist.get("fever", 1e9)
+    if top1 == "fever":
+        return True
+    if top1 in ("none", "go") and df <= d1 + _IN_GAME_FEVER_NEAR_TOP:
+        return True
+    if top1 in ("timeup", "bonus", "result") and df <= d1 + _IN_GAME_FEVER_NEAR_ENDGAME + 0.006:
+        return True
+    near = (
+        _IN_GAME_FEVER_NEAR_ENDGAME + 0.006
+        if top1 in ("timeup", "bonus", "result")
+        else _IN_GAME_FEVER_NEAR_TOP
+    )
+    for cls, _d in ranked[:3]:
+        if cls == "fever" and df <= d1 + near:
+            return True
+    return False
+
+
+def in_game_fever_live_from_ranked(
+    ranked: List[Tuple[str, float]],
+    calib: Optional[Dict[str, float]] = None,
+) -> bool:
+    """実動画向け（IN_GAME）。スキル UI 混在でも fever 画面を取りこぼしにくくする。"""
+    if not ranked:
+        return False
+    dist = _distance_map(ranked)
+    if "fever" not in dist:
+        return False
+    df = dist.get("fever", 1e9)
+    dg = dist.get("go", 1e9)
+    if dg < df - _FEVER_GO_CLEARLY_CLOSER:
+        return False
+    top1, d1 = ranked[0]
+    if top1 == "fever":
+        return True
+    # fever が 2 位以内かつ 1 位との差が小さい → 実プレイの fever 取りこぼし防止
+    margin = 0.045
+    if top1 in ("timeup", "bonus", "result"):
+        margin = 0.050
+    if df <= d1 + margin:
+        return True
+    for cls, d_cls in ranked[:4]:
+        if cls == "fever" and df <= d_cls + 0.010:
+            return True
+    return False
+
+
+def in_game_fever_raw_from_ranked(
+    ranked: List[Tuple[str, float]],
+    calib: Optional[Dict[str, float]] = None,
+) -> str:
+    """フロー遷移用（go 取りこぼし時の IN_GAME 入り）。"""
+    if fever_recall_from_ranked(ranked, calib):
+        return "fever"
+    return "none"
+
+
+def calibrate_fever_gate(
+    centroids: Dict[str, List[float]],
+    images_root: Path,
+) -> Dict[str, float]:
+    """val 画像で fever 閾値を grid search し、centroid 更新のたびに合わせる。"""
+    if not centroids or "fever" not in centroids:
+        return dict(DEFAULT_FEVER_CALIB)
+
+    cache: Dict[str, List[List[Tuple[str, float]]]] = {"fever": [], "none": [], "go": []}
+    val_root = images_root / "val"
+    for cls in cache:
+        cls_dir = val_root / cls
+        if not cls_dir.is_dir():
+            continue
+        for file in iter_scene_dataset_images(cls_dir):
+            feat = image_file_to_feature(file)
+            if feat is None:
+                continue
+            pairs = [(c, l1_distance(feat, centroids[c])) for c in centroids]
+            pairs.sort(key=lambda x: x[1])
+            cache[cls].append(pairs)
+
+    if not cache["fever"]:
+        return dict(DEFAULT_FEVER_CALIB)
+
+    best: Optional[tuple[int, Dict[str, float], int, int, int]] = None
+    for top1_lead in (0.0, 0.003, 0.005, 0.008):
+        for ng_gap in (0.012, 0.015, 0.018, 0.022):
+            for ng_lead in (0.005, 0.008, 0.010, 0.012):
+                for end_gap in (0.028, 0.030, 0.032, 0.035):
+                    calib = {
+                        "top1_lead": top1_lead,
+                        "none_go_gap": ng_gap,
+                        "none_go_lead": ng_lead,
+                        "endgame_gap": end_gap,
+                        "endgame_lead": 0.003,
+                        "weak_none_go_gap": min(ng_gap + 0.012, 0.035),
+                        "weak_none_go_lead": 0.0,
+                        "weak_endgame_gap": end_gap + 0.006,
+                        "weak_endgame_lead": 0.0,
+                    }
+                    tp = sum(
+                        1
+                        for ranked in cache["fever"]
+                        if fever_recall_from_ranked(ranked, calib)
+                    )
+                    strong_fp = sum(
+                        1 for ranked in cache["none"] + cache["go"]
+                        if fever_strong_from_ranked(ranked, calib)
+                    )
+                    weak_fp = sum(
+                        1 for ranked in cache["none"] + cache["go"]
+                        if fever_weak_from_ranked(ranked, calib)
+                    )
+                    # 弱候補は解析側で 2 連続が必要。none/go の strong 誤検知を強く罰する
+                    score = tp * 100 - strong_fp * 20 - weak_fp * 4
+                    if best is None or score > best[0]:
+                        best = (score, calib, tp, strong_fp, weak_fp)
+
+    return best[1] if best else dict(DEFAULT_FEVER_CALIB)
+
+
+def evaluate_fever_gate(
+    centroids: Dict[str, List[float]],
+    images_root: Path,
+    calib: Optional[Dict[str, float]] = None,
+) -> Dict[str, int]:
+    """fever ゲートの val 指標（学習ログ用）。"""
+    params = _fever_calib(calib)
+    out = {
+        "fever_val_total": 0,
+        "fever_val_strong": 0,
+        "fever_val_weak_only": 0,
+        "fever_val_any": 0,
+        "false_none_go_strong": 0,
+        "false_none_go_weak": 0,
+    }
+    val_root = images_root / "val"
+    for cls, keys in (
+        ("fever", ("fever_val_total", "fever_val_strong", "fever_val_weak_only", "fever_val_any")),
+        ("none", ("false_none_go_strong", "false_none_go_weak")),
+        ("go", ("false_none_go_strong", "false_none_go_weak")),
+    ):
+        cls_dir = val_root / cls
+        if not cls_dir.is_dir():
+            continue
+        for file in iter_scene_dataset_images(cls_dir):
+            feat = image_file_to_feature(file)
+            if feat is None:
+                continue
+            pairs = [(c, l1_distance(feat, centroids[c])) for c in centroids]
+            pairs.sort(key=lambda x: x[1])
+            strong = fever_strong_from_ranked(pairs, params)
+            weak = fever_weak_from_ranked(pairs, params)
+            if cls == "fever":
+                out["fever_val_total"] += 1
+                recall = fever_recall_from_ranked(pairs, params)
+                if strong:
+                    out["fever_val_strong"] += 1
+                if weak:
+                    out["fever_val_weak_only"] += 1
+                if recall:
+                    out["fever_val_any"] += 1
+            else:
+                if strong:
+                    out["false_none_go_strong"] += 1
+                if weak:
+                    out["false_none_go_weak"] += 1
+    return out
+
+
 class SceneCentroidModel:
     def __init__(self) -> None:
         self.centroids: Dict[str, List[float]] = {}
+        self.fever_calib: Dict[str, float] = dict(DEFAULT_FEVER_CALIB)
+        self.none_veto_exemplars: List[List[float]] = []
 
     def fit_from_dataset(self, images_root: Path) -> Dict[str, int]:
         counts: Dict[str, int] = {}
@@ -328,14 +621,74 @@ class SceneCentroidModel:
             for i in range(dim):
                 centroid[i] *= inv
             self.centroids[cls] = centroid
+        self.fever_calib = calibrate_fever_gate(self.centroids, images_root)
+        self.rebuild_none_veto_exemplars(images_root)
         return counts
+
+    def rebuild_none_veto_exemplars(
+        self,
+        images_root: Path,
+        max_n: int = _NONE_VETO_EXEMPLAR_MAX,
+    ) -> int:
+        """train/none の新しい画像をそのまま参照し、似たフレームは fever にしない。"""
+        self.none_veto_exemplars = []
+        cls_dir = images_root / "train" / "none"
+        if not cls_dir.is_dir():
+            return 0
+        files = sorted(
+            iter_scene_dataset_images(cls_dir),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for path in files[:max_n]:
+            feat = image_file_to_feature(path)
+            if feat is not None:
+                self.none_veto_exemplars.append(feat)
+        return len(self.none_veto_exemplars)
+
+    def exemplar_blocks_fever(self, feat: List[float]) -> bool:
+        """保存した none 実画像にほぼ同一のフレームだけ fever を止める（誤判定を広げない）。"""
+        if not feat or not self.none_veto_exemplars or "fever" not in self.centroids:
+            return False
+        df = l1_distance(feat, self.centroids["fever"])
+        best_none = min(l1_distance(feat, ex) for ex in self.none_veto_exemplars)
+        return best_none + 0.002 < df
+
+    def in_game_fever_raw(self, ranked: List[Tuple[str, float]]) -> str:
+        return in_game_fever_raw_from_ranked(ranked, self.fever_calib)
+
+    def in_game_fever_live(self, ranked: List[Tuple[str, float]]) -> bool:
+        return in_game_fever_live_from_ranked(ranked, self.fever_calib)
+
+    def in_game_fever_candidate(self, ranked: List[Tuple[str, float]]) -> bool:
+        return in_game_fever_candidate_from_ranked(ranked, self.fever_calib)
+
+    def none_go_blocks_loose_fever(self, ranked: List[Tuple[str, float]]) -> bool:
+        return none_go_blocks_loose_fever(ranked)
+
+    def exemplar_blocks_fever_feature(self, feat: List[float]) -> bool:
+        return self.exemplar_blocks_fever(feat)
+
+    def fever_strong(self, ranked: List[Tuple[str, float]]) -> bool:
+        return fever_strong_from_ranked(ranked, self.fever_calib)
+
+    def fever_weak(self, ranked: List[Tuple[str, float]]) -> bool:
+        return fever_weak_from_ranked(ranked, self.fever_calib)
+
+    def fever_gate_metrics(self, images_root: Path) -> Dict[str, int]:
+        return evaluate_fever_gate(self.centroids, images_root, self.fever_calib)
 
     def predict_from_feature(self, feat: List[float]) -> str:
         if not self.centroids or not feat:
             return "none"
+        return resolve_scene_label_from_ranked(self.ranked_from_feature(feat))
+
+    def ranked_from_feature(self, feat: List[float]) -> List[Tuple[str, float]]:
+        if not self.centroids or not feat:
+            return [("none", 1e9)]
         pairs = [(cls, l1_distance(feat, centroid)) for cls, centroid in self.centroids.items()]
         pairs.sort(key=lambda x: x[1])
-        return resolve_scene_label_from_ranked(pairs)
+        return pairs
 
     def ranked_distances(self, image: QImage) -> List[Tuple[str, float]]:
         """全クラスの距離を昇順（分類のあいまいさ解消に使う）。"""
@@ -378,23 +731,33 @@ class SceneCentroidModel:
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"centroids": self.centroids}, ensure_ascii=False),
+            json.dumps(
+                {"centroids": self.centroids, "fever_calib": self.fever_calib},
+                ensure_ascii=False,
+            ),
             encoding="utf-8",
         )
 
     def load(self, path: Path) -> bool:
         if not path.exists():
             self.centroids = {}
+            self.fever_calib = dict(DEFAULT_FEVER_CALIB)
             return False
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             centroids = data.get("centroids", {})
             if isinstance(centroids, dict):
                 self.centroids = {str(k): [float(v) for v in vals] for k, vals in centroids.items()}
+                raw_calib = data.get("fever_calib", {})
+                if isinstance(raw_calib, dict) and raw_calib:
+                    self.fever_calib = _fever_calib(raw_calib)
+                else:
+                    self.fever_calib = dict(DEFAULT_FEVER_CALIB)
                 return bool(self.centroids)
         except Exception:
             pass
         self.centroids = {}
+        self.fever_calib = dict(DEFAULT_FEVER_CALIB)
         return False
 
     @staticmethod

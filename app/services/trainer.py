@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from app.services.scene_cnn import SceneCnnClassifier, torch_available
 from app.services.scene_model import (
     SceneCentroidModel,
     describe_training_image_load_failure,
@@ -21,11 +22,7 @@ class DatasetSummary:
 
 
 class SimpleTrainer:
-    """Lightweight trainer scaffold for UI wiring.
-
-    This intentionally does not depend on torch yet. It validates dataset
-    layout and produces a model metadata file on save.
-    """
+    """シーン分類の学習（CNN 優先。torch 未導入時のみ centroid）。"""
 
     CLASSES = ["none", "item", "ready", "go", "fever", "timeup", "bonus", "result"]
 
@@ -34,10 +31,13 @@ class SimpleTrainer:
         self.model_root = model_root
         self.is_running = False
         self.current_epoch = 0
-        self.max_epochs = 5
+        self.max_epochs = 25
         self.summary: DatasetSummary | None = None
+        self.scene_cnn = SceneCnnClassifier()
         self.scene_model = SceneCentroidModel()
         self.val_accuracy = 0.0
+        self.last_fever_metrics: dict[str, int] = {}
+        self.scene_backend = "none"
 
     def summarize_dataset(self) -> DatasetSummary:
         train_counts: dict[str, int] = {}
@@ -69,18 +69,49 @@ class SimpleTrainer:
 
         self.is_running = True
         self.current_epoch = 1
-        per_class = self.scene_model.fit_from_dataset(self.images_root)
-        correct, total = self.scene_model.evaluate_val(self.images_root)
-        self.val_accuracy = (correct / total) if total > 0 else 0.0
-        log(f"学習開始: train={summary.train_total}, val={summary.val_total}")
-        log(f"学習完了: class_counts={per_class}")
-        log(f"検証精度: {correct}/{total} ({self.val_accuracy:.3f})")
-        if sum(per_class.values()) == 0 and summary.train_total > 0:
+
+        if torch_available():
+            log("シーン分類: CNN（深層学習）で学習します…")
+            log(f"train={summary.train_total}, val={summary.val_total}")
+            try:
+                stats = self.scene_cnn.train_from_dataset(
+                    self.images_root,
+                    epochs=self.max_epochs,
+                    log=log,
+                )
+                self.val_accuracy = float(stats.get("val_accuracy", 0.0))
+                self.scene_backend = "cnn"
+                per_val = stats.get("per_class_val", {})
+                fever = per_val.get("fever", (0, 0))
+                self.last_fever_metrics = {
+                    "fever_val_total": fever[1],
+                    "fever_val_strong": fever[0],
+                    "fever_val_any": fever[0],
+                    "false_none_go_strong": 0,
+                    "false_none_go_weak": 0,
+                }
+                log(f"CNN 検証精度: {self.val_accuracy:.3f}")
+                if fever[1]:
+                    log(f"fever(val): {fever[0]}/{fever[1]}")
+            except Exception as exc:
+                log(f"CNN 学習失敗: {exc}")
+                self.is_running = False
+                return False
+        else:
             log(
-                "エラー: 件数はあるのに特徴量が0件です。"
-                "画像が破損しているか、読み込みに失敗している可能性があります。"
+                "警告: PyTorch がありません。pip install torch torchvision のあと再学習してください。"
             )
-            log(describe_training_image_load_failure(self.images_root))
+            log("暫定: 従来の centroid で学習します（精度は限定的です）。")
+            per_class = self.scene_model.fit_from_dataset(self.images_root)
+            correct, total = self.scene_model.evaluate_val(self.images_root)
+            self.val_accuracy = (correct / total) if total > 0 else 0.0
+            self.last_fever_metrics = self.scene_model.fever_gate_metrics(self.images_root)
+            self.scene_backend = "centroid"
+            log(f"centroid 学習完了: class_counts={per_class}")
+            log(f"検証精度: {correct}/{total} ({self.val_accuracy:.3f})")
+            if sum(per_class.values()) == 0 and summary.train_total > 0:
+                log(describe_training_image_load_failure(self.images_root))
+
         self.is_running = False
         return True
 
@@ -97,21 +128,45 @@ class SimpleTrainer:
         log("学習を停止しました。")
 
     def save(self, log: Callable[[str], None], version: str = "version_1") -> Path:
-        # Safety net: if training has not been run in this session,
-        # build a scene model from current dataset before saving.
-        if not self.scene_model.centroids:
-            self.summarize_dataset()
+        self.summarize_dataset()
+        summary = self.summary or self.summarize_dataset()
+
+        if self.scene_cnn.is_loaded():
+            self.scene_backend = "cnn"
+            log(
+                f"シーン CNN を保存します（学習時 val精度={self.val_accuracy:.3f}）。"
+                " 再評価はスキップします。"
+            )
+            fever_total = int(summary.per_class_val.get("fever", 0))
+            fever_ok = int(self.last_fever_metrics.get("fever_val_strong", 0))
+            if fever_total and not fever_ok:
+                per_val = self.scene_cnn.evaluate_val(self.images_root)
+                fever = per_val.get("fever", (0, 0))
+                fever_ok, fever_total = fever[0], fever[1]
+                total_ok = sum(v[0] for v in per_val.values())
+                total_n = sum(v[1] for v in per_val.values())
+                if total_n:
+                    self.val_accuracy = total_ok / total_n
+            self.last_fever_metrics = {
+                "fever_val_total": fever_total,
+                "fever_val_strong": fever_ok,
+                "fever_val_any": fever_ok,
+                "false_none_go_strong": 0,
+                "false_none_go_weak": 0,
+            }
+        elif torch_available():
+            raise RuntimeError(
+                "シーン CNN が未学習です。先に「学習開始」を押し、完了してから「モデル保存」を実行してください。"
+            )
+        else:
             per_class = self.scene_model.fit_from_dataset(self.images_root)
             correct, total = self.scene_model.evaluate_val(self.images_root)
             self.val_accuracy = (correct / total) if total > 0 else 0.0
-            log(f"保存前にモデル生成: class_counts={per_class}")
-            log(f"保存前評価: {correct}/{total} ({self.val_accuracy:.3f})")
-
-        if not self.scene_model.centroids:
-            raise RuntimeError(
-                "シーン centroid が0件です（scene_model.json は書き出しません）。"
-                "train/*/ の画像が実際に読めるか確認し、学習をやり直してください。"
-            )
+            self.last_fever_metrics = self.scene_model.fever_gate_metrics(self.images_root)
+            self.scene_backend = "centroid"
+            log(f"centroid 保存用: {correct}/{total} ({self.val_accuracy:.3f})")
+            if not self.scene_model.centroids:
+                raise RuntimeError("シーン centroid が0件です。")
 
         self.model_root.mkdir(parents=True, exist_ok=True)
         out_dir = self.model_root / version
@@ -119,44 +174,67 @@ class SimpleTrainer:
         out_file = out_dir / "model_meta.txt"
         out_json = out_dir / "model_meta.json"
         out_scene_model = out_dir / "scene_model.json"
-        summary = self.summary or self.summarize_dataset()
+        out_cnn = out_dir / "scene_cnn.pt"
+
+        meta_payload = {
+            "saved_at": datetime.now().isoformat(),
+            "classes": self.CLASSES,
+            "train_total": summary.train_total,
+            "val_total": summary.val_total,
+            "per_class_train": summary.per_class_train,
+            "per_class_val": summary.per_class_val,
+            "last_epoch": self.current_epoch,
+            "val_accuracy": self.val_accuracy,
+            "scene_backend": self.scene_backend,
+        }
+        if self.scene_backend == "centroid":
+            meta_payload["fever_calib"] = self.scene_model.fever_calib
+            meta_payload.update(
+                {
+                    "fever_val_strong": self.last_fever_metrics.get("fever_val_strong", 0),
+                    "fever_val_any": self.last_fever_metrics.get("fever_val_any", 0),
+                    "fever_val_total": self.last_fever_metrics.get("fever_val_total", 0),
+                    "fever_false_none_go_strong": self.last_fever_metrics.get(
+                        "false_none_go_strong", 0
+                    ),
+                    "fever_false_none_go_weak": self.last_fever_metrics.get(
+                        "false_none_go_weak", 0
+                    ),
+                }
+            )
+        else:
+            meta_payload["fever_val_strong"] = self.last_fever_metrics.get("fever_val_strong", 0)
+            meta_payload["fever_val_any"] = self.last_fever_metrics.get("fever_val_any", 0)
+            meta_payload["fever_val_total"] = self.last_fever_metrics.get("fever_val_total", 0)
+
         out_file.write_text(
             "\n".join(
                 [
                     "Analyzer_TsumTsum model metadata",
                     f"saved_at={datetime.now().isoformat()}",
+                    f"scene_backend={self.scene_backend}",
                     f"train_total={summary.train_total}",
                     f"val_total={summary.val_total}",
                     f"classes={','.join(self.CLASSES)}",
-                    f"last_epoch={self.current_epoch}",
+                    f"val_accuracy={self.val_accuracy:.4f}",
                 ]
             ),
             encoding="utf-8",
         )
-        out_json.write_text(
-            json.dumps(
-                {
-                    "saved_at": datetime.now().isoformat(),
-                    "classes": self.CLASSES,
-                    "train_total": summary.train_total,
-                    "val_total": summary.val_total,
-                    "per_class_train": summary.per_class_train,
-                    "per_class_val": summary.per_class_val,
-                    "last_epoch": self.current_epoch,
-                    "val_accuracy": self.val_accuracy,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        self.scene_model.save(out_scene_model)
+        out_json.write_text(json.dumps(meta_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        if self.scene_cnn.is_loaded():
+            log("scene_cnn.pt を書き込み中…")
+            self.scene_cnn.save(out_cnn)
+            log(f"CNN モデル保存: {out_cnn}")
+        if self.scene_backend == "centroid":
+            self.scene_model.save(out_scene_model)
+            log(f"centroid 保存: {out_scene_model}")
+
         active_marker = self.model_root / "ACTIVE_VERSION"
         active_marker.write_text(version, encoding="utf-8")
         log(f"アクティブ版を更新: {active_marker} -> {version}")
-        log(f"モデル保存: {out_file}")
-        log(f"モデル保存(JSON): {out_json}")
-        log(f"シーンモデル保存: {out_scene_model}")
+        log(f"モデル保存: {out_json}")
         return out_file
 
     @staticmethod
