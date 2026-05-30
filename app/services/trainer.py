@@ -93,6 +93,13 @@ class SimpleTrainer:
                 log(f"CNN 検証精度: {self.val_accuracy:.3f}")
                 if fever[1]:
                     log(f"fever(val): {fever[0]}/{fever[1]}")
+                weak = [
+                    f"{cls}:{ok}/{total}"
+                    for cls, (ok, total) in sorted(per_val.items())
+                    if total and ok / total < 0.7
+                ]
+                if weak:
+                    log(f"val で弱いクラス: {', '.join(weak)}")
             except Exception as exc:
                 log(f"CNN 学習失敗: {exc}")
                 self.is_running = False
@@ -171,6 +178,18 @@ class SimpleTrainer:
         self.model_root.mkdir(parents=True, exist_ok=True)
         out_dir = self.model_root / version
         out_dir.mkdir(parents=True, exist_ok=True)
+        prev_val_acc: float | None = None
+        if (out_dir / "model_meta.json").exists():
+            try:
+                prev_meta = json.loads((out_dir / "model_meta.json").read_text(encoding="utf-8"))
+                prev_val_acc = float(prev_meta.get("val_accuracy", 0.0))
+            except Exception:
+                prev_val_acc = None
+        if prev_val_acc is not None and self.val_accuracy + 0.005 < prev_val_acc:
+            log(
+                f"警告: 検証精度 {self.val_accuracy:.3f} は前回保存 ({prev_val_acc:.3f}) より低いです。"
+                " 解析中の修正画像が増えすぎていないか、val 画像を見直してください。"
+            )
         out_file = out_dir / "model_meta.txt"
         out_json = out_dir / "model_meta.json"
         out_scene_model = out_dir / "scene_model.json"
@@ -187,6 +206,12 @@ class SimpleTrainer:
             "val_accuracy": self.val_accuracy,
             "scene_backend": self.scene_backend,
         }
+        if self.scene_backend == "cnn" and self.scene_cnn.is_loaded():
+            per_val = self.scene_cnn.evaluate_val(self.images_root)
+            meta_payload["per_class_val_accuracy"] = {
+                cls: (ok / total if total else 0.0)
+                for cls, (ok, total) in per_val.items()
+            }
         if self.scene_backend == "centroid":
             meta_payload["fever_calib"] = self.scene_model.fever_calib
             meta_payload.update(

@@ -222,6 +222,7 @@ class SceneCnnClassifier:
         epochs: int = 25,
         batch_size: int = 16,
         lr: float = 1e-3,
+        early_stop_patience: int = 8,
         log: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, float]:
         if not _TORCH_OK:
@@ -270,8 +271,27 @@ class SceneCnnClassifier:
 
         net = SmallSceneCNN(len(self.classes))
         net.to(self.device)
-        opt = torch.optim.Adam(net.parameters(), lr=lr)
-        criterion = nn.CrossEntropyLoss()
+        opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
+
+        from collections import Counter
+
+        label_counts = Counter(label for _, label in train_ds.samples)
+        n_train = max(len(train_ds), 1)
+        n_classes = len(self.classes)
+        class_weights = [
+            n_train / (n_classes * max(label_counts.get(i, 0), 1))
+            for i in range(n_classes)
+        ]
+        weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
+        criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+        imbalanced = max(class_weights) / max(min(class_weights), 1e-6)
+        if imbalanced > 3.0:
+            none_idx = self.class_to_idx.get("none")
+            none_n = label_counts.get(none_idx, 0) if none_idx is not None else 0
+            _log(
+                f"  クラス不均衡: 最大/最小 weight={imbalanced:.1f} "
+                f"(none={none_n}枚など、少数クラスに重み付け)"
+            )
 
         _log(f"CNN 学習: クラス={self.classes}")
         _log(f"  train={len(train_ds)} val={len(val_ds)} device={describe_torch_device(self.device)}")
@@ -282,6 +302,9 @@ class SceneCnnClassifier:
             )
 
         best_acc = 0.0
+        best_epoch = 0
+        best_state: Optional[Dict[str, "torch.Tensor"]] = None
+        stale_epochs = 0
         for epoch in range(1, epochs + 1):
             net.train()
             running = 0.0
@@ -307,20 +330,46 @@ class SceneCnnClassifier:
                         correct += int((pred == yb).sum().item())
                         total += int(yb.size(0))
                 val_acc = (correct / total) if total > 0 else 0.0
-                best_acc = max(best_acc, val_acc)
+                if val_acc > best_acc + 1e-6:
+                    best_acc = val_acc
+                    best_epoch = epoch
+                    best_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+                    stale_epochs = 0
+                else:
+                    stale_epochs += 1
 
             if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
+                mark = ""
+                if val_loader is not None and epoch == best_epoch:
+                    mark = " *best*"
                 _log(
                     f"  epoch {epoch}/{epochs} loss={running / max(len(train_loader), 1):.4f} "
-                    f"val_acc={val_acc:.3f}"
+                    f"val_acc={val_acc:.3f}{mark}"
                 )
 
+            if val_loader is not None and stale_epochs >= early_stop_patience and best_state is not None:
+                _log(
+                    f"  early stop: epoch {epoch}（best val={best_acc:.3f} @ epoch {best_epoch}）"
+                )
+                break
+
+        if best_state is not None:
+            net.load_state_dict(best_state)
         self.model = net.eval()
-        self.val_accuracy = best_acc
+        self.val_accuracy = best_acc if best_state is not None else 0.0
         per_class_val = self.evaluate_val(images_root) if val_loader else {}
         fever_total = per_class_val.get("fever", (0, 0))[1]
         fever_ok = per_class_val.get("fever", (0, 0))[0]
-        _log(f"CNN 学習完了: val精度={best_acc:.3f}")
+        _log(
+            f"CNN 学習完了: 保存する重み=epoch {best_epoch or '-'} val精度={self.val_accuracy:.3f}"
+        )
+        weak = [
+            f"{cls}:{ok}/{total}"
+            for cls, (ok, total) in sorted(per_class_val.items())
+            if total and ok / total < 0.7
+        ]
+        if weak:
+            _log(f"  val で弱いクラス: {', '.join(weak)}")
         if fever_total:
             _log(f"  fever(val): {fever_ok}/{fever_total}")
         return {"val_accuracy": best_acc, "per_class_val": per_class_val}
