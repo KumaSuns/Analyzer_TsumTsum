@@ -4,9 +4,9 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from app.services.scene_cnn import SceneCnnClassifier
-from app.services.scene_model import SceneCentroidModel
+from app.services.scene_model import SCENE_CLASSES, SceneCentroidModel
 
-SCENE_LABELS = ["none", "item", "ready", "go", "fever", "timeup", "bonus", "result"]
+SCENE_LABELS = SCENE_CLASSES
 
 
 @dataclass
@@ -144,8 +144,8 @@ class VideoAnalyzer:
             self.scene_class_count = len(self.scene_classifier.cnn.classes)
         else:
             self.scene_class_count = self.scene_classifier.centroid.class_count()
-            if self.scene_model_loaded:
-                self.scene_classifier.centroid.rebuild_none_veto_exemplars(self.images_root)
+        if self.scene_model_loaded:
+            self.scene_classifier.centroid.rebuild_none_veto_exemplars(self.images_root)
         self.item_skill_classifier.reload()
 
     def apply_scene_centroids(

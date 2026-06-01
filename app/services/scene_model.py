@@ -17,7 +17,7 @@ except ImportError:
     np = None  # type: ignore
 
 
-SCENE_CLASSES = ["none", "item", "ready", "go", "fever", "timeup", "bonus", "result"]
+SCENE_CLASSES = ["none", "item", "ready", "go", "fever", "timeup", "bonus", "coin", "result"]
 # 学習・評価で扱う画像（.gitkeep 等は除外）
 SCENE_DATASET_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"})
 
@@ -261,6 +261,16 @@ def l1_distance(a: List[float], b: List[float]) -> float:
     return total / n
 
 
+def feature_matches_none_exemplars(
+    feat: List[float],
+    exemplars: List[List[float]],
+    max_dist: float,
+) -> bool:
+    if not feat or not exemplars:
+        return False
+    return min(l1_distance(feat, ex) for ex in exemplars) <= max_dist
+
+
 def _distance_map(ranked: List[Tuple[str, float]]) -> Dict[str, float]:
     return {cls: dist for cls, dist in ranked}
 
@@ -305,6 +315,10 @@ _IN_GAME_FEVER_NEAR_ENDGAME = 0.028
 # train/none の実画像（新しい順）に近いフレームは fever 候補から外す（centroid 平均だけでは効かない誤検知向け）
 _NONE_VETO_EXEMPLAR_MAX = 60
 _NONE_VETO_MARGIN = 0.005
+# CNN 利用時（centroid なし）: train/none  exemplar との L1 がこれ以下なら fever 抑制
+_NONE_VETO_ABSOLUTE_MAX = 0.012
+# 解析中にユーザーが fever 誤検知で none 保存したフレームのみ（ほぼ同一）
+_NONE_VETO_SESSION_MAX = 0.007
 
 DEFAULT_FEVER_CALIB: Dict[str, float] = {
     "top1_lead": 0.003,
@@ -646,13 +660,19 @@ class SceneCentroidModel:
                 self.none_veto_exemplars.append(feat)
         return len(self.none_veto_exemplars)
 
+    def none_veto_blocks_fever(self, feat: List[float]) -> bool:
+        """保存済み train/none に近いフレームは fever 扱いにしない（CNN でも有効）。"""
+        if not feat or not self.none_veto_exemplars:
+            return False
+        best_none = min(l1_distance(feat, ex) for ex in self.none_veto_exemplars)
+        if self.centroids and "fever" in self.centroids:
+            df = l1_distance(feat, self.centroids["fever"])
+            return best_none + 0.002 < df
+        return best_none <= _NONE_VETO_ABSOLUTE_MAX
+
     def exemplar_blocks_fever(self, feat: List[float]) -> bool:
         """保存した none 実画像にほぼ同一のフレームだけ fever を止める（誤判定を広げない）。"""
-        if not feat or not self.none_veto_exemplars or "fever" not in self.centroids:
-            return False
-        df = l1_distance(feat, self.centroids["fever"])
-        best_none = min(l1_distance(feat, ex) for ex in self.none_veto_exemplars)
-        return best_none + 0.002 < df
+        return self.none_veto_blocks_fever(feat)
 
     def in_game_fever_raw(self, ranked: List[Tuple[str, float]]) -> str:
         return in_game_fever_raw_from_ranked(ranked, self.fever_calib)

@@ -46,7 +46,10 @@ from app.services.analyzer import VideoAnalyzer
 from app.services.image_save import save_training_png
 from app.services.scene_model import (
     SceneCentroidModel,
+    _NONE_VETO_ABSOLUTE_MAX,
     _NONE_VETO_EXEMPLAR_MAX,
+    _NONE_VETO_SESSION_MAX,
+    feature_matches_none_exemplars,
     image_to_feature,
 )
 from app.services.trainer import SimpleTrainer
@@ -65,7 +68,7 @@ from app.services.file_video import FileVideoSource, is_file_video_available
 # 解析テスト: item〜result を「シーンに入った瞬間」で確認モーダルする対象にできる（none 除く）
 _ANALYSIS_SCENE_CONFIRM_LABELS = tuple(c for c in SimpleTrainer.CLASSES if c != "none")
 # 初回起動時に確認モーダルを ON にするシーン
-_SCENE_CONFIRM_DEFAULT_ON = frozenset({"ready", "go", "fever"})
+_SCENE_CONFIRM_DEFAULT_ON = frozenset({"ready", "go", "fever", "timeup", "bonus", "result"})
 # IN_GAME: 弱い fever は連続2サンプル（1サンプルだけの誤検知を出さない）
 _FEVER_WEAK_STREAK_REQUIRED = 2
 # go 画面を逃したとき、プレイ画面(none)が続いたら IN_GAME に入る（短すぎると go 未検知になる）
@@ -82,12 +85,33 @@ _CNN_PREGAME_MARGIN_MAX = 0.30
 _CNN_READY_MARGIN_MAX = 0.45
 # top1 以外の候補は連続 N サンプルで確定
 _PREGAME_READY_STREAK_WEAK = 1
-_PREGAME_GO_STREAK_WEAK = 2
-# item 確定後、ready 取りこぼし防止の猶予サンプル数
+_PREGAME_GO_STREAK_WEAK = 1
+# ready/go 候補の間に none が挟まってもストリークを維持
+_PREGAME_HIT_NONE_GAP = 3
+_CNN_GO_MARGIN_MAX = 0.45
+# item 確定後の ready 探索（猶予は streak 用。WAIT_GO へ進むのは CNN ready のみ）
 _WAIT_READY_GRACE_SAMPLES = 60
+# item 選択画面の crop キー（use_tsum は使用アイテムに含めない）
+_ITEM_SELECT_KEYS = ("score", "coin", "exp", "time", "bomb", "five_to_four", "combo")
 # CNN: fever 候補（score = 1 - softmax、小さいほど fever らしい）
 _CNN_FEVER_SCORE_MAX = 0.62
 _CNN_FEVER_STRONG_SCORE_MAX = 0.38
+# IN_GAME 確定: top1=fever かつ score がこれ未満（val 49/49、誤検知0.354は除外）
+_CNN_FEVER_DETECT_MAX = 0.34
+_CNN_FEVER_RANKED_TOP = 8
+_SESSION_FEVER_NONE_VETO_MAX = 30
+# IN_GAME 確定: top1=timeup かつ score がこれ未満（val 23/23、max≈0.33）
+_CNN_TIMEUP_DETECT_MAX = 0.34
+_SESSION_TIMEUP_NONE_VETO_MAX = 30
+_TIMEUP_REJECT_COOLDOWN_SAMPLES = 24
+# WAIT_BONUS 確定: top1=bonus かつ score がこれ未満（val 16/16、max≈0.508）
+_CNN_BONUS_DETECT_MAX = 0.52
+_SESSION_BONUS_NONE_VETO_MAX = 30
+_BONUS_REJECT_COOLDOWN_SAMPLES = 24
+# WAIT_RESULT 確定: top1=result かつ score がこれ未満（val 26/26、max≈0.0125）
+_CNN_RESULT_DETECT_MAX = 0.10
+_SESSION_RESULT_NONE_VETO_MAX = 30
+_RESULT_REJECT_COOLDOWN_SAMPLES = 24
 # CNN fever: 連続 N 回で確定 → M サンプルは fever 維持（点滅防止）
 _FEVER_CNN_CONFIRM_STREAK = 2
 _FEVER_LATCH_HOLD_SAMPLES = 16
@@ -109,8 +133,6 @@ _CNN_TIMEUP_SCORE_MAX = 0.58
 _CNN_BONUS_SCORE_MAX = 0.58
 _CNN_RESULT_SCORE_MAX = 0.58
 _TIMEUP_STOP_CONFIRM_REQUIRED = 2
-# IN_GAMEへ遷移直後だけ go を救済（go(raw)取りこぼし対策）
-_INGAME_GO_GRACE_SAMPLES = 18
 
 _SCENE_CONFIRM_PREVIEW_MAX_W = 560
 _SCENE_CONFIRM_PREVIEW_MAX_H = 315
@@ -219,6 +241,12 @@ def _is_alive_qobject(obj) -> bool:
         return True
     except RuntimeError:
         return False
+
+
+def _item_select_keys_from(targets: list[str]) -> list[str]:
+    """アイテム選択画面の7種（Score〜Combo）。use_tsum は除外。"""
+    picked = {k for k in targets if k in _ITEM_SELECT_KEYS}
+    return [k for k in _ITEM_SELECT_KEYS if k in picked]
 
 
 class AspectFitVideoContainer(QWidget):
@@ -424,6 +452,17 @@ class MainWindow(QMainWindow):
         self._fever_raw_streak = 0
         self._fever_none_gap_used = 0
         self._fever_reject_cooldown = 0
+        self._fever_veto_frame_indices: set[int] = set()
+        self._analysis_fever_none_veto: list[list[float]] = []
+        self._analysis_timeup_none_veto: list[list[float]] = []
+        self._timeup_veto_frame_indices: set[int] = set()
+        self._timeup_reject_cooldown = 0
+        self._analysis_bonus_none_veto: list[list[float]] = []
+        self._bonus_veto_frame_indices: set[int] = set()
+        self._bonus_reject_cooldown = 0
+        self._analysis_result_none_veto: list[list[float]] = []
+        self._result_veto_frame_indices: set[int] = set()
+        self._result_reject_cooldown = 0
         self._in_game_fever_warmup = 0
         self._last_raw_scene_in_game = ""
         self._fever_count = 0
@@ -445,9 +484,14 @@ class MainWindow(QMainWindow):
         self._ingame_sample_saved: Optional[int] = None
         self._pregame_ready_streak = 0
         self._pregame_go_streak = 0
+        self._pregame_ready_none_gap = 0
+        self._pregame_go_none_gap = 0
         self._pregame_ready_pending = False
-        self._ready_emitted_this_game = False
+        self._ready_confirmed_this_game = False
         self._wait_ready_grace = 0
+        self._item_scan_targets: set[str] = set()
+        self._item_scene_active = False
+        self._item_use_tsum_pending = "-"
         self.pending_crop_rect = None
         self.current_video_container: Optional[AspectFitVideoContainer] = None
         self.current_video_frame_image = None
@@ -861,7 +905,7 @@ class MainWindow(QMainWindow):
         return False, str(out_path)
 
     def _append_none_veto_from_frame(self, frame_image) -> None:
-        """修正保存した none 画面を即座に誤検知リストへ（再計算を待たない）。"""
+        """修正保存した none 画面を centroid 誤検知リストへ（CNN 解析中は使わない）。"""
         if frame_image is None or frame_image.isNull():
             return
         feat = image_to_feature(frame_image)
@@ -870,6 +914,328 @@ class MainWindow(QMainWindow):
         model = self.video_analyzer.scene_classifier.model
         model.none_veto_exemplars.insert(0, feat)
         del model.none_veto_exemplars[_NONE_VETO_EXEMPLAR_MAX:]
+
+    def _append_session_fever_none_veto(self, frame_image) -> None:
+        """今回の解析で fever 誤検知として none にしたフレームだけ記録。"""
+        if frame_image is None or frame_image.isNull():
+            return
+        feat = image_to_feature(frame_image)
+        if not feat:
+            return
+        self._analysis_fever_none_veto.insert(0, feat)
+        del self._analysis_fever_none_veto[_SESSION_FEVER_NONE_VETO_MAX:]
+
+    @staticmethod
+    def _fever_score_from_ranked(ranked: list) -> float | None:
+        for cls, score in ranked:
+            if cls == "fever":
+                return float(score)
+        return None
+
+    def _fever_cnn_top1_detected(self, ranked: list) -> bool:
+        """CNN top1 が fever かつ val 学習データと同程度の自信度。"""
+        return bool(ranked) and ranked[0][0] == "fever" and ranked[0][1] < _CNN_FEVER_DETECT_MAX
+
+    def _fever_strong_cnn_signal(
+        self, ranked: list, *, fever_strong_hit: bool, fever_top1: bool
+    ) -> bool:
+        return self._fever_cnn_top1_detected(ranked)
+
+    def _fever_clear_cnn_signal(
+        self, ranked: list, *, fever_strong_hit: bool, fever_top1: bool
+    ) -> bool:
+        return self._fever_cnn_top1_detected(ranked)
+
+    def _fever_cnn_confirm_need(
+        self, ranked: list, *, fever_strong_hit: bool, fever_top1: bool
+    ) -> int:
+        return 1 if self._fever_cnn_top1_detected(ranked) else _FEVER_CNN_CONFIRM_STREAK
+
+    def _fever_cnn_gates_ok(
+        self, ranked: list, *, fever_strong_hit: bool, fever_top1: bool
+    ) -> bool:
+        """誤検知拒否直後でも、はっきりした fever は通す。"""
+        if self._fever_reject_cooldown <= 0:
+            return True
+        return self._fever_clear_cnn_signal(
+            ranked, fever_strong_hit=fever_strong_hit, fever_top1=fever_top1
+        )
+
+    def _fever_blocked_by_none_veto(
+        self,
+        frame_image,
+        scene_feature=None,
+        *,
+        ranked: list | None = None,
+        fever_strong_hit: bool = False,
+        fever_top1: bool = False,
+    ) -> bool:
+        if self._fever_clear_cnn_signal(
+            ranked or [], fever_strong_hit=fever_strong_hit, fever_top1=fever_top1
+        ):
+            return False
+        if self.video_analyzer.scene_classifier.uses_cnn():
+            exemplars = self._analysis_fever_none_veto
+            max_dist = _NONE_VETO_SESSION_MAX
+        else:
+            exemplars = self.video_analyzer.scene_classifier.model.none_veto_exemplars
+            max_dist = _NONE_VETO_ABSOLUTE_MAX
+        feat = scene_feature
+        if not feat and frame_image is not None and not frame_image.isNull():
+            feat = image_to_feature(frame_image)
+        if not feat:
+            return False
+        return feature_matches_none_exemplars(feat, exemplars, max_dist)
+
+    def _fever_frame_vetoed(self, frame_index: int) -> bool:
+        indices = getattr(self, "_fever_veto_frame_indices", None)
+        if not indices:
+            return False
+        return int(frame_index) in indices
+
+    def _record_fever_none_rejection(self, frame_image, frame_index: int) -> None:
+        self._reset_fever_latch()
+        self._fever_raw_streak = 0
+        self._fever_none_gap_used = 0
+        self._append_session_fever_none_veto(frame_image)
+        self._fever_veto_frame_indices.add(int(frame_index))
+        self._fever_reject_cooldown = _FEVER_REJECT_COOLDOWN_SAMPLES
+
+    def _reject_fever_detection(self, frame_image=None, frame_index: int = -1) -> None:
+        """モーダルで fever を拒否した直後: ラッチ解除・再検知抑止。"""
+        self._reset_fever_latch()
+        self._fever_raw_streak = 0
+        self._fever_none_gap_used = 0
+        self._fever_reject_cooldown = _FEVER_REJECT_COOLDOWN_SAMPLES
+        if frame_index >= 0:
+            self._fever_veto_frame_indices.add(int(frame_index))
+        if frame_image is not None and not frame_image.isNull():
+            self._append_session_fever_none_veto(frame_image)
+
+    @staticmethod
+    def _timeup_score_from_ranked(ranked: list) -> float | None:
+        for cls, score in ranked:
+            if cls == "timeup":
+                return float(score)
+        return None
+
+    def _timeup_cnn_top1_detected(self, ranked: list) -> bool:
+        return bool(ranked) and ranked[0][0] == "timeup" and ranked[0][1] < _CNN_TIMEUP_DETECT_MAX
+
+    def _append_session_timeup_none_veto(self, frame_image) -> None:
+        if frame_image is None or frame_image.isNull():
+            return
+        feat = image_to_feature(frame_image)
+        if not feat:
+            return
+        self._analysis_timeup_none_veto.insert(0, feat)
+        del self._analysis_timeup_none_veto[_SESSION_TIMEUP_NONE_VETO_MAX:]
+
+    def _timeup_frame_vetoed(self, frame_index: int) -> bool:
+        return int(frame_index) in self._timeup_veto_frame_indices
+
+    def _timeup_blocked_by_session_veto(
+        self, frame_image, scene_feature=None, ranked: list | None = None
+    ) -> bool:
+        if ranked and self._timeup_cnn_top1_detected(ranked):
+            return False
+        if not self._analysis_timeup_none_veto:
+            return False
+        feat = scene_feature
+        if not feat and frame_image is not None and not frame_image.isNull():
+            feat = image_to_feature(frame_image)
+        if not feat:
+            return False
+        return feature_matches_none_exemplars(
+            feat, self._analysis_timeup_none_veto, _NONE_VETO_SESSION_MAX
+        )
+
+    def _confirm_timeup_detection(self) -> None:
+        self.flow_phase = "WAIT_BONUS"
+        self.timeup_confirm_count = 0
+        self._reset_fever_latch()
+        if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
+            self.counter_analysis_state_label
+        ):
+            self.counter_analysis_state_label.setText(
+                f"解析状態: G{self.flow_game_index} {self.flow_phase}"
+            )
+
+    def _record_timeup_none_rejection(self, frame_image, frame_index: int) -> None:
+        self._timeup_reject_cooldown = _TIMEUP_REJECT_COOLDOWN_SAMPLES
+        self._append_session_timeup_none_veto(frame_image)
+        self._timeup_veto_frame_indices.add(int(frame_index))
+        self._analysis_confirm_edge_key = ""
+
+    def _reject_timeup_detection(self, frame_image=None, frame_index: int = -1) -> None:
+        self.flow_phase = "IN_GAME"
+        self.timeup_confirm_count = 0
+        self._timeup_reject_cooldown = _TIMEUP_REJECT_COOLDOWN_SAMPLES
+        if frame_index >= 0:
+            self._timeup_veto_frame_indices.add(int(frame_index))
+        if frame_image is not None and not frame_image.isNull():
+            self._append_session_timeup_none_veto(frame_image)
+        self._analysis_confirm_edge_key = ""
+        if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
+            self.counter_analysis_state_label
+        ):
+            self.counter_analysis_state_label.setText(
+                f"解析状態: G{self.flow_game_index} {self.flow_phase}"
+            )
+
+    @staticmethod
+    def _bonus_score_from_ranked(ranked: list) -> float | None:
+        for cls, score in ranked:
+            if cls == "bonus":
+                return float(score)
+        return None
+
+    def _bonus_cnn_top1_detected(self, ranked: list) -> bool:
+        return bool(ranked) and ranked[0][0] == "bonus" and ranked[0][1] < _CNN_BONUS_DETECT_MAX
+
+    def _append_session_bonus_none_veto(self, frame_image) -> None:
+        if frame_image is None or frame_image.isNull():
+            return
+        feat = image_to_feature(frame_image)
+        if not feat:
+            return
+        self._analysis_bonus_none_veto.insert(0, feat)
+        del self._analysis_bonus_none_veto[_SESSION_BONUS_NONE_VETO_MAX:]
+
+    def _bonus_frame_vetoed(self, frame_index: int) -> bool:
+        return int(frame_index) in self._bonus_veto_frame_indices
+
+    def _bonus_blocked_by_session_veto(
+        self, frame_image, scene_feature=None, ranked: list | None = None
+    ) -> bool:
+        if ranked and self._bonus_cnn_top1_detected(ranked):
+            return False
+        if not self._analysis_bonus_none_veto:
+            return False
+        feat = scene_feature
+        if not feat and frame_image is not None and not frame_image.isNull():
+            feat = image_to_feature(frame_image)
+        if not feat:
+            return False
+        return feature_matches_none_exemplars(
+            feat, self._analysis_bonus_none_veto, _NONE_VETO_SESSION_MAX
+        )
+
+    def _confirm_bonus_detection(self) -> None:
+        self.flow_phase = "WAIT_RESULT"
+        if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
+            self.counter_analysis_state_label
+        ):
+            self.counter_analysis_state_label.setText(
+                f"解析状態: G{self.flow_game_index} {self.flow_phase}"
+            )
+
+    def _record_bonus_none_rejection(self, frame_image, frame_index: int) -> None:
+        self._bonus_reject_cooldown = _BONUS_REJECT_COOLDOWN_SAMPLES
+        self._append_session_bonus_none_veto(frame_image)
+        self._bonus_veto_frame_indices.add(int(frame_index))
+        self._analysis_confirm_edge_key = ""
+
+    def _reject_bonus_detection(self, frame_image=None, frame_index: int = -1) -> None:
+        self.flow_phase = "WAIT_BONUS"
+        self._bonus_reject_cooldown = _BONUS_REJECT_COOLDOWN_SAMPLES
+        if frame_index >= 0:
+            self._bonus_veto_frame_indices.add(int(frame_index))
+        if frame_image is not None and not frame_image.isNull():
+            self._append_session_bonus_none_veto(frame_image)
+        self._analysis_confirm_edge_key = ""
+        if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
+            self.counter_analysis_state_label
+        ):
+            self.counter_analysis_state_label.setText(
+                f"解析状態: G{self.flow_game_index} {self.flow_phase}"
+            )
+
+    @staticmethod
+    def _result_score_from_ranked(ranked: list) -> float | None:
+        for cls, score in ranked:
+            if cls == "result":
+                return float(score)
+        return None
+
+    def _result_cnn_top1_detected(self, ranked: list) -> bool:
+        return bool(ranked) and ranked[0][0] == "result" and ranked[0][1] < _CNN_RESULT_DETECT_MAX
+
+    def _append_session_result_none_veto(self, frame_image) -> None:
+        if frame_image is None or frame_image.isNull():
+            return
+        feat = image_to_feature(frame_image)
+        if not feat:
+            return
+        self._analysis_result_none_veto.insert(0, feat)
+        del self._analysis_result_none_veto[_SESSION_RESULT_NONE_VETO_MAX:]
+
+    def _result_frame_vetoed(self, frame_index: int) -> bool:
+        return int(frame_index) in self._result_veto_frame_indices
+
+    def _result_blocked_by_session_veto(
+        self, frame_image, scene_feature=None, ranked: list | None = None
+    ) -> bool:
+        if ranked and self._result_cnn_top1_detected(ranked):
+            return False
+        if not self._analysis_result_none_veto:
+            return False
+        feat = scene_feature
+        if not feat and frame_image is not None and not frame_image.isNull():
+            feat = image_to_feature(frame_image)
+        if not feat:
+            return False
+        return feature_matches_none_exemplars(
+            feat, self._analysis_result_none_veto, _NONE_VETO_SESSION_MAX
+        )
+
+    def _advance_after_result_confirmed(self) -> None:
+        self.flow_game_index += 1
+        self.flow_phase = "WAIT_ITEM"
+        self.timeup_confirm_count = 0
+        self.locked_item_targets = []
+        self.locked_use_tsum = "-"
+        self.locked_item_fixed = False
+        self._ready_confirmed_this_game = False
+        self._pregame_ready_pending = False
+        self._pregame_ready_streak = 0
+        self._pregame_go_streak = 0
+        self._pregame_ready_none_gap = 0
+        self._pregame_go_none_gap = 0
+        self._wait_ready_grace = 0
+        self._item_scan_targets = set()
+        self._item_scene_active = False
+        self._item_use_tsum_pending = "-"
+        if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
+            self.counter_analysis_state_label
+        ):
+            self.counter_analysis_state_label.setText(
+                f"解析状態: G{self.flow_game_index} {self.flow_phase}"
+            )
+
+    def _confirm_result_detection(self) -> None:
+        self._advance_after_result_confirmed()
+
+    def _record_result_none_rejection(self, frame_image, frame_index: int) -> None:
+        self._result_reject_cooldown = _RESULT_REJECT_COOLDOWN_SAMPLES
+        self._append_session_result_none_veto(frame_image)
+        self._result_veto_frame_indices.add(int(frame_index))
+        self._analysis_confirm_edge_key = ""
+
+    def _reject_result_detection(self, frame_image=None, frame_index: int = -1) -> None:
+        self.flow_phase = "WAIT_RESULT"
+        self._result_reject_cooldown = _RESULT_REJECT_COOLDOWN_SAMPLES
+        if frame_index >= 0:
+            self._result_veto_frame_indices.add(int(frame_index))
+        if frame_image is not None and not frame_image.isNull():
+            self._append_session_result_none_veto(frame_image)
+        self._analysis_confirm_edge_key = ""
+        if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
+            self.counter_analysis_state_label
+        ):
+            self.counter_analysis_state_label.setText(
+                f"解析状態: G{self.flow_game_index} {self.flow_phase}"
+            )
 
     def _refit_scene_model_after_correction(self, choice: str, frame_image=None) -> None:
         """解析中の修正保存後、モデルを更新（CNN は学習タブで保存が必要）。"""
@@ -1067,9 +1433,10 @@ class MainWindow(QMainWindow):
             self.left_layout.addWidget(self.start_from_zero_check)
 
             self.analysis_stop_on_timeup_check = QCheckBox("timeupで解析を自動停止")
-            self.analysis_stop_on_timeup_check.setChecked(True)
+            self.analysis_stop_on_timeup_check.setChecked(False)
             self.analysis_stop_on_timeup_check.setToolTip(
-                "オフにすると誤検知の timeup でも最後まで再生します（fever 確認向け）。"
+                "オンにすると timeup 確定後に解析を止めます。"
+                "オフ（推奨）なら bonus/result まで続けます。"
             )
             self.left_layout.addWidget(self.analysis_stop_on_timeup_check)
 
@@ -2224,9 +2591,8 @@ class MainWindow(QMainWindow):
                 f"{pregame_note}"
             )
             self.log_view.append(
-                "※ 学習データを変えたら「学習開始」→「モデル保存」。解析タブの「モデル」選択版を読み込みます。"
+                f"scene_model: {self.video_analyzer.scene_model_path}"
             )
-            self.log_view.append(f"scene_model: {self.video_analyzer.scene_model_path}")
             meta = self.video_analyzer.active_model_meta()
             if meta.get("saved_at"):
                 self.log_view.append(
@@ -2344,6 +2710,7 @@ class MainWindow(QMainWindow):
         go_hit: bool,
         ready_hit: bool,
         flow_phase: str,
+        ready_confirmed: bool = False,
     ) -> str:
         """フロー上 none でも、go/ready 候補なら確認ダイアログ用ラベルにする。"""
         if scene_label in _ANALYSIS_SCENE_CONFIRM_LABELS:
@@ -2353,7 +2720,7 @@ class MainWindow(QMainWindow):
             return raw_scene
         if raw_scene == "ready" and flow_phase in ("WAIT_ITEM", "WAIT_READY"):
             return raw_scene
-        if raw_scene == "go" and flow_phase in ("WAIT_READY", "WAIT_GO"):
+        if raw_scene == "go" and flow_phase == "WAIT_GO" and ready_confirmed:
             return raw_scene
         if raw_scene == "fever" and flow_phase in ("WAIT_GO", "IN_GAME"):
             return raw_scene
@@ -2363,7 +2730,7 @@ class MainWindow(QMainWindow):
             return raw_scene
         if raw_scene == "result" and flow_phase == "WAIT_RESULT":
             return raw_scene
-        if flow_phase in ("WAIT_READY", "WAIT_GO") and go_hit:
+        if flow_phase == "WAIT_GO" and ready_confirmed and go_hit:
             return "go"
         if flow_phase in ("WAIT_ITEM", "WAIT_READY") and ready_hit:
             return "ready"
@@ -2382,7 +2749,7 @@ class MainWindow(QMainWindow):
     ) -> bool:
         """CNN: 2回で fever 確定し、取りこぼしサンプルがあってもしばらく fever を維持する。"""
         if not gates_ok:
-            return self._fever_episode_latched and self._fever_episode_hold > 0
+            return False
 
         signal = fever_hit or fever_strong_hit
         if signal:
@@ -2392,9 +2759,9 @@ class MainWindow(QMainWindow):
             self._fever_confirm_streak = 0
 
         if not self._fever_episode_latched:
-            need = 1 if fever_strong_hit else _FEVER_CNN_CONFIRM_STREAK
-            if fever_top1 and ranked and ranked[0][1] < 0.45:
-                need = 1
+            need = self._fever_cnn_confirm_need(
+                ranked, fever_strong_hit=fever_strong_hit, fever_top1=fever_top1
+            )
             if self._fever_confirm_streak >= need:
                 self._fever_episode_latched = True
                 self._fever_episode_hold = _FEVER_LATCH_HOLD_SAMPLES
@@ -2422,7 +2789,7 @@ class MainWindow(QMainWindow):
         use_cnn = self.video_analyzer.scene_classifier.uses_cnn()
         self._in_game_fever_warmup = 0 if use_cnn else _FEVER_IN_GAME_WARMUP_SAMPLES
         self._ingame_entered_logged = True
-        self._ingame_go_grace = _INGAME_GO_GRACE_SAMPLES
+        self._ingame_go_grace = 0
         self._restore_analysis_sampling()
         if use_cnn:
             self._boost_analysis_sampling_for_ingame()
@@ -2459,12 +2826,13 @@ class MainWindow(QMainWindow):
         use_cnn: bool,
         target: str,
         cnn_max_score: float = _CNN_GO_SCORE_MAX,
+        top_n: int = 4,
     ) -> bool:
         if raw_scene == target:
             return True
         if not ranked:
             return False
-        for cls, score in ranked[:4]:
+        for cls, score in ranked[:top_n]:
             if cls != target:
                 continue
             if use_cnn:
@@ -2477,6 +2845,13 @@ class MainWindow(QMainWindow):
                 if score <= top_score * 1.08:
                     return True
         return False
+
+    @staticmethod
+    def _pregame_scene_strong(raw_scene: str, ranked: list, target: str) -> bool:
+        """ready/go フェーズ遷移: CNN の raw または top1 のみ（weak・margin 不可）。"""
+        if raw_scene == target:
+            return True
+        return bool(ranked) and ranked[0][0] == target
 
     def _pregame_class_hit(
         self,
@@ -2527,6 +2902,70 @@ class MainWindow(QMainWindow):
         ):
             return "weak"
         return "none"
+
+    def _bump_pregame_streak(self, hit: bool, *, streak_attr: str, gap_attr: str) -> int:
+        streak = int(getattr(self, streak_attr, 0))
+        gap = int(getattr(self, gap_attr, 0))
+        if hit:
+            streak = min(streak + 1, 30)
+            gap = 0
+        else:
+            gap += 1
+            if gap > _PREGAME_HIT_NONE_GAP:
+                streak = 0
+                gap = 0
+        setattr(self, streak_attr, streak)
+        setattr(self, gap_attr, gap)
+        return streak
+
+    def _analysis_scene_confirm_enabled(self, scene_key: str) -> bool:
+        checks = getattr(self, "analysis_scene_confirm_checks", None)
+        if not isinstance(checks, dict):
+            return False
+        cb = checks.get(scene_key)
+        return cb is not None and _is_alive_qobject(cb) and cb.isChecked()
+
+    def _refresh_flow_phase_label(self) -> None:
+        if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
+            self.counter_analysis_state_label
+        ):
+            self.counter_analysis_state_label.setText(
+                f"解析状態: G{self.flow_game_index} {self.flow_phase}"
+            )
+
+    def _confirm_pregame_ready(self) -> None:
+        self.flow_phase = "WAIT_GO"
+        self._ready_confirmed_this_game = True
+        self._pregame_ready_pending = False
+        self._pregame_ready_streak = 0
+        self._pregame_ready_none_gap = 0
+        self._pregame_go_streak = 0
+        self._pregame_go_none_gap = 0
+        self._ingame_entry_none_streak = 0
+        self._boost_analysis_sampling_for_pregame()
+        self._refresh_flow_phase_label()
+
+    def _reject_pregame_ready(self) -> None:
+        self.flow_phase = "WAIT_READY"
+        self._ready_confirmed_this_game = False
+        self._analysis_confirm_edge_key = ""
+        if self._analysis_last_logged_scene == "ready":
+            self._analysis_last_logged_scene = "none"
+        self._refresh_flow_phase_label()
+
+    def _confirm_pregame_go(self) -> None:
+        if not self._ready_confirmed_this_game:
+            return
+        self.flow_phase = "IN_GAME"
+        self._enter_ingame_log("go")
+        self._refresh_flow_phase_label()
+
+    def _reject_pregame_go(self) -> None:
+        self.flow_phase = "WAIT_GO" if self._ready_confirmed_this_game else "WAIT_READY"
+        self._analysis_confirm_edge_key = ""
+        if self._analysis_last_logged_scene == "go":
+            self._analysis_last_logged_scene = "none"
+        self._refresh_flow_phase_label()
 
     def _selected_analysis_model_version(self) -> str:
         combo = getattr(self, "model_version_combo", None)
@@ -2598,7 +3037,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "analysis_stop_on_timeup_check") and _is_alive_qobject(
             self.analysis_stop_on_timeup_check
         ):
-            _set_check(self.analysis_stop_on_timeup_check, "analysis/stop_on_timeup", True)
+            _set_check(self.analysis_stop_on_timeup_check, "analysis/stop_on_timeup", False)
         checks = getattr(self, "analysis_scene_confirm_checks", None)
         if isinstance(checks, dict):
             for scene_key, cb in checks.items():
@@ -3083,17 +3522,22 @@ class MainWindow(QMainWindow):
                 ranked = scene_model.ranked_from_feature(scene_feature)
             fever_top1 = False
             if use_scene_cnn:
-                fever_hit = self._scene_likely_class(
-                    raw_scene,
-                    ranked,
-                    use_cnn=True,
-                    target="fever",
-                    cnn_max_score=_CNN_FEVER_SCORE_MAX,
-                )
                 fever_top1 = bool(ranked) and ranked[0][0] == "fever"
-                fever_strong_hit = fever_top1 and ranked[0][1] < _CNN_FEVER_STRONG_SCORE_MAX
-                if fever_hit and not fever_strong_hit and fever_top1:
-                    fever_strong_hit = ranked[0][1] < _CNN_FEVER_SCORE_MAX
+                fever_detected = self._fever_cnn_top1_detected(ranked)
+                fever_hit = fever_detected
+                fever_strong_hit = fever_detected
+                if (
+                    not fever_detected
+                    and fever_top1
+                    and scene_feature
+                    and feature_matches_none_exemplars(
+                        scene_feature,
+                        self._analysis_fever_none_veto,
+                        _NONE_VETO_SESSION_MAX,
+                    )
+                ):
+                    fever_hit = False
+                    fever_strong_hit = False
                 fever_raw = "fever" if fever_hit else raw_scene
             elif ranked:
                 fever_strong_hit = scene_model.fever_strong(ranked)
@@ -3127,7 +3571,11 @@ class MainWindow(QMainWindow):
             )
             if self.flow_phase in ("WAIT_READY", "WAIT_GO"):
                 go_hit_pre = self._pregame_class_hit(
-                    raw_scene, ranked, use_cnn=use_scene_cnn, target="go"
+                    raw_scene,
+                    ranked,
+                    use_cnn=use_scene_cnn,
+                    target="go",
+                    margin_max=_CNN_GO_MARGIN_MAX,
                 )
             if self.flow_phase in ("WAIT_ITEM", "WAIT_READY"):
                 ready_hit_pre = self._pregame_class_hit(
@@ -3159,29 +3607,53 @@ class MainWindow(QMainWindow):
                 cnn_max_score=_CNN_RESULT_SCORE_MAX,
             )
             flow_phase_before = self.flow_phase
+            ready_confirmed_before = self._ready_confirmed_this_game
             evaluations: dict[str, dict] = {}
             item_debug = ""
+            item_detected = False
+            selected_targets: list[str] = []
+            use_tsum_detected = "-"
             if self.flow_phase == "WAIT_ITEM":
-                selected_targets, evaluations = self._evaluate_targets(frame_image, self.crop_positions_for_analysis)
-                used_item_keys = [k for k in selected_targets if k != "use_tsum"]
-                item_detected = len(used_item_keys) > 0
-                use_tsum_detected = "-"
-                if selected_tsum == "auto":
-                    use_tsum_detected = self._detect_use_tsum(frame_image)
-                else:
-                    use_tsum_detected = selected_tsum
+                raw_item_scene = result.scene_label == "item"
+                leaving_item_scene = self._item_scene_active and not raw_item_scene
+                if raw_item_scene:
+                    self._item_scene_active = True
+                    selected_targets, evaluations = self._evaluate_targets(
+                        frame_image, self.crop_positions_for_analysis
+                    )
+                    self._item_scan_targets.update(_item_select_keys_from(selected_targets))
+                    self._refresh_item_counter_labels()
+                    if selected_tsum == "auto":
+                        use_tsum_detected = self._detect_use_tsum(frame_image)
+                    else:
+                        use_tsum_detected = selected_tsum
+                    if use_tsum_detected not in {"-", "unknown", ""}:
+                        self._item_use_tsum_pending = use_tsum_detected
+                elif leaving_item_scene:
+                    # CNN が先に item を外しても、遷移フレームで crop を拾う
+                    selected_targets, evaluations = self._evaluate_targets(
+                        frame_image, self.crop_positions_for_analysis
+                    )
+                    self._item_scan_targets.update(_item_select_keys_from(selected_targets))
+                if leaving_item_scene:
+                    self.locked_item_targets = _item_select_keys_from(list(self._item_scan_targets))
+                    if self._item_use_tsum_pending not in {"-", "unknown", ""}:
+                        self.locked_use_tsum = self._item_use_tsum_pending
+                    self.locked_item_fixed = True
+                    self._item_scene_active = False
+                    self._refresh_item_counter_labels()
+                item_detected = bool(self._item_scan_targets) or self.locked_item_fixed
                 scene_label = self._apply_scene_flow(
                     result.scene_label,
-                    item_detected,
+                    leaving_item_scene,
                     use_tsum_detected,
                     result.timestamp_ms,
                     ranked=ranked,
                     use_scene_cnn=use_scene_cnn,
+                    frame_index=result.frame_index,
+                    scene_feature=scene_feature,
+                    frame_image=frame_image,
                 )
-                if item_detected and not self.locked_item_fixed:
-                    self.locked_item_targets = used_item_keys
-                    self.locked_use_tsum = use_tsum_detected
-                    self.locked_item_fixed = True
                 item_debug = self._format_item_debug(evaluations, selected_targets)
             else:
                 # After item is established, never re-detect until next game.
@@ -3190,7 +3662,7 @@ class MainWindow(QMainWindow):
                 use_tsum_detected = self.locked_use_tsum if self.locked_item_fixed else "-"
                 scene_label = self._apply_scene_flow(
                     result.scene_label,
-                    item_detected,
+                    False,
                     use_tsum_detected,
                     result.timestamp_ms,
                     fever_raw=fever_raw,
@@ -3201,12 +3673,11 @@ class MainWindow(QMainWindow):
                     skill_detected_now=skill_detected_now,
                     ranked=ranked,
                     use_scene_cnn=use_scene_cnn,
+                    frame_index=result.frame_index,
+                    scene_feature=scene_feature,
+                    frame_image=frame_image,
                 )
                 item_debug = "item_lock:ON"
-            if scene_label == "timeup" and not self._analysis_stop_on_timeup_enabled():
-                self.flow_phase = "IN_GAME"
-                self.timeup_confirm_count = 0
-                scene_label = "fever" if fever_hit else "none"
             result.scene_label = scene_label
             skill_tsum_dir = (
                 self._resolve_tsum_dir(self.locked_use_tsum) if self.locked_item_fixed else use_tsum_dir
@@ -3253,10 +3724,71 @@ class MainWindow(QMainWindow):
                 go_hit=go_hit_pre,
                 ready_hit=ready_hit_pre,
                 flow_phase=flow_phase_before,
+                ready_confirmed=ready_confirmed_before,
             )
+            if confirm_label == "fever" and (
+                self._fever_frame_vetoed(result.frame_index)
+                or self._fever_blocked_by_none_veto(
+                    frame_image,
+                    scene_feature,
+                    ranked=ranked,
+                    fever_strong_hit=fever_strong_hit,
+                    fever_top1=fever_top1,
+                )
+            ):
+                confirm_label = scene_label
+            if confirm_label == "timeup" and (
+                self._timeup_frame_vetoed(result.frame_index)
+                or self._timeup_blocked_by_session_veto(
+                    frame_image, scene_feature, ranked=ranked
+                )
+            ):
+                confirm_label = "none"
+            if confirm_label == "bonus" and (
+                self._bonus_frame_vetoed(result.frame_index)
+                or self._bonus_blocked_by_session_veto(
+                    frame_image, scene_feature, ranked=ranked
+                )
+            ):
+                confirm_label = "none"
+            if confirm_label == "result" and (
+                self._result_frame_vetoed(result.frame_index)
+                or self._result_blocked_by_session_veto(
+                    frame_image, scene_feature, ranked=ranked
+                )
+            ):
+                confirm_label = "none"
             self._maybe_modal_scene_confirm(
-                confirm_label, frame_image, flow_scene=scene_label
+                confirm_label,
+                frame_image,
+                flow_scene=scene_label,
+                ready_confirmed=ready_confirmed_before,
+                frame_index=result.frame_index,
             )
+            if scene_label == "ready" and not self._ready_confirmed_this_game:
+                scene_label = "none"
+            elif scene_label == "go" and self.flow_phase != "IN_GAME":
+                scene_label = "none"
+            elif scene_label == "fever" and self._fever_frame_vetoed(result.frame_index):
+                scene_label = "none"
+            elif (
+                self._analysis_last_logged_scene == "fever"
+                and scene_label != "fever"
+            ):
+                self._analysis_confirm_edge_key = ""
+            elif scene_label == "timeup" and self.flow_phase != "WAIT_BONUS":
+                scene_label = "none"
+            elif scene_label == "timeup" and self._timeup_frame_vetoed(result.frame_index):
+                scene_label = "none"
+            elif scene_label == "bonus" and self.flow_phase != "WAIT_RESULT":
+                scene_label = "none"
+            elif scene_label == "bonus" and self._bonus_frame_vetoed(result.frame_index):
+                scene_label = "none"
+            elif scene_label == "result" and self.flow_phase != "WAIT_ITEM":
+                scene_label = "none"
+            elif scene_label == "result" and self._result_frame_vetoed(result.frame_index):
+                scene_label = "none"
+            result.scene_label = scene_label
             if skill_new or scene_label != self._analysis_last_logged_scene:
                 self._append_analysis_log(
                     result,
@@ -3268,7 +3800,79 @@ class MainWindow(QMainWindow):
                     skill_tsum_dir=skill_log_dir,
                 )
                 self._analysis_last_logged_scene = scene_label
-            if scene_label == "timeup" and self._analysis_stop_on_timeup_enabled():
+            if (
+                use_scene_cnn
+                and self.flow_phase == "IN_GAME"
+                and ranked
+                and hasattr(self, "log_view")
+                and _is_alive_qobject(self.log_view)
+                and hasattr(self, "detail_log_check")
+                and self.detail_log_check.isChecked()
+            ):
+                fs = self._fever_score_from_ranked(ranked)
+                top = ranked[0][0] if ranked else "-"
+                if top == "fever" or (fs is not None and fs < 0.50):
+                    det = self._fever_cnn_top1_detected(ranked)
+                    self.log_view.append(
+                        f"  fever_cnn: top1={top} score={fs:.3f} "
+                        f"detect={'YES' if det else 'NO'} (閾値<{_CNN_FEVER_DETECT_MAX})"
+                    )
+            if (
+                use_scene_cnn
+                and self.flow_phase in ("IN_GAME", "WAIT_BONUS")
+                and ranked
+                and hasattr(self, "log_view")
+                and _is_alive_qobject(self.log_view)
+                and hasattr(self, "detail_log_check")
+                and self.detail_log_check.isChecked()
+            ):
+                ts = self._timeup_score_from_ranked(ranked)
+                top = ranked[0][0] if ranked else "-"
+                if top == "timeup" or (ts is not None and ts < 0.50):
+                    det = self._timeup_cnn_top1_detected(ranked)
+                    self.log_view.append(
+                        f"  timeup_cnn: top1={top} score={ts:.3f} "
+                        f"detect={'YES' if det else 'NO'} (閾値<{_CNN_TIMEUP_DETECT_MAX})"
+                    )
+            if (
+                use_scene_cnn
+                and self.flow_phase == "WAIT_BONUS"
+                and ranked
+                and hasattr(self, "log_view")
+                and _is_alive_qobject(self.log_view)
+                and hasattr(self, "detail_log_check")
+                and self.detail_log_check.isChecked()
+            ):
+                bs = self._bonus_score_from_ranked(ranked)
+                top = ranked[0][0] if ranked else "-"
+                if top == "bonus" or (bs is not None and bs < 0.55):
+                    det = self._bonus_cnn_top1_detected(ranked)
+                    self.log_view.append(
+                        f"  bonus_cnn: top1={top} score={bs:.3f} "
+                        f"detect={'YES' if det else 'NO'} (閾値<{_CNN_BONUS_DETECT_MAX})"
+                    )
+            if (
+                use_scene_cnn
+                and self.flow_phase == "WAIT_RESULT"
+                and ranked
+                and hasattr(self, "log_view")
+                and _is_alive_qobject(self.log_view)
+                and hasattr(self, "detail_log_check")
+                and self.detail_log_check.isChecked()
+            ):
+                rs = self._result_score_from_ranked(ranked)
+                top = ranked[0][0] if ranked else "-"
+                if top == "result" or (rs is not None and rs < 0.20):
+                    det = self._result_cnn_top1_detected(ranked)
+                    self.log_view.append(
+                        f"  result_cnn: top1={top} score={rs:.3f} "
+                        f"detect={'YES' if det else 'NO'} (閾値<{_CNN_RESULT_DETECT_MAX})"
+                    )
+            if (
+                scene_label == "timeup"
+                and self.flow_phase == "WAIT_BONUS"
+                and self._analysis_stop_on_timeup_enabled()
+            ):
                 self._timeup_stop_seen += 1
                 if self._timeup_stop_seen < _TIMEUP_STOP_CONFIRM_REQUIRED:
                     if hasattr(self, "log_view"):
@@ -3301,6 +3905,17 @@ class MainWindow(QMainWindow):
         self._fever_raw_streak = 0
         self._fever_none_gap_used = 0
         self._fever_reject_cooldown = 0
+        self._fever_veto_frame_indices = set()
+        self._analysis_fever_none_veto = []
+        self._analysis_timeup_none_veto = []
+        self._timeup_veto_frame_indices = set()
+        self._timeup_reject_cooldown = 0
+        self._analysis_bonus_none_veto = []
+        self._bonus_veto_frame_indices = set()
+        self._bonus_reject_cooldown = 0
+        self._analysis_result_none_veto = []
+        self._result_veto_frame_indices = set()
+        self._result_reject_cooldown = 0
         self._in_game_fever_warmup = 0
         self._last_raw_scene_in_game = ""
         self._fever_count = 0
@@ -3313,9 +3928,14 @@ class MainWindow(QMainWindow):
         self._ingame_entry_none_streak = 0
         self._pregame_ready_streak = 0
         self._pregame_go_streak = 0
+        self._pregame_ready_none_gap = 0
+        self._pregame_go_none_gap = 0
         self._pregame_ready_pending = False
-        self._ready_emitted_this_game = False
+        self._ready_confirmed_this_game = False
         self._wait_ready_grace = 0
+        self._item_scan_targets = set()
+        self._item_scene_active = False
+        self._item_use_tsum_pending = "-"
         self._skill_count = 0
         self._skill_episode_active = False
         self._skill_off_streak = 0
@@ -3323,6 +3943,9 @@ class MainWindow(QMainWindow):
         self.locked_item_targets = []
         self.locked_use_tsum = "-"
         self.locked_item_fixed = False
+        self._item_scan_targets = set()
+        self._item_scene_active = False
+        self._item_use_tsum_pending = "-"
         self._restore_analysis_sampling()
         self._ingame_sample_saved = None
         if hasattr(self, "counter_fever_count_label") and _is_alive_qobject(self.counter_fever_count_label):
@@ -3350,7 +3973,7 @@ class MainWindow(QMainWindow):
     def _apply_scene_flow(
         self,
         raw_scene: str,
-        item_detected: bool,
+        item_phase_completed: bool,
         use_tsum_detected: str,
         position_ms: int,
         *,
@@ -3362,6 +3985,9 @@ class MainWindow(QMainWindow):
         skill_detected_now: bool = False,
         ranked: Optional[list] = None,
         use_scene_cnn: bool = False,
+        frame_index: int = -1,
+        scene_feature=None,
+        frame_image=None,
     ) -> str:
         """Apply game-order constraints:
         item -> ready -> go -> fever/timeup -> bonus -> result -> next game.
@@ -3369,8 +3995,6 @@ class MainWindow(QMainWindow):
         phase = self.flow_phase
         now_ms = max(0, int(position_ms))
         fever_signal = fever_raw if fever_raw is not None else raw_scene
-        has_tsum = use_tsum_detected not in {"-", "unknown", ""}
-        item_established = item_detected or has_tsum
 
         scene = "none"
         ranked = ranked or []
@@ -3394,115 +4018,78 @@ class MainWindow(QMainWindow):
             _TIMEUP_RAW_STREAK_REQUIRED_CNN if fever_simple else _TIMEUP_RAW_STREAK_REQUIRED
         )
         if phase == "WAIT_ITEM":
-            ready_strength_item = self._pregame_hit_strength(
-                raw_scene,
-                ranked,
-                use_cnn=use_scene_cnn,
-                target="ready",
-                margin_max=_CNN_READY_MARGIN_MAX,
-            )
-            if ready_strength_item != "none":
-                self._pregame_ready_pending = True
-            if item_established:
+            if raw_scene == "item":
                 scene = "item"
+            if item_phase_completed:
                 self.flow_phase = "WAIT_READY"
                 self._wait_ready_grace = _WAIT_READY_GRACE_SAMPLES
                 self._boost_analysis_sampling_for_pregame()
                 phase = "WAIT_READY"
 
         if phase == "WAIT_READY":
-            if self._wait_ready_grace > 0:
-                self._wait_ready_grace -= 1
-            ready_strength = self._pregame_hit_strength(
-                raw_scene,
-                ranked,
-                use_cnn=use_scene_cnn,
-                target="ready",
-                margin_max=_CNN_READY_MARGIN_MAX,
-            )
-            if ready_strength != "none":
-                self._pregame_ready_pending = True
-                self._pregame_ready_streak = min(self._pregame_ready_streak + 1, 10)
-            else:
-                self._pregame_ready_streak = 0
-            ready_weak_need = _PREGAME_READY_STREAK_WEAK
-            if self._wait_ready_grace > 0 or self._pregame_ready_pending:
-                ready_weak_need = 1
-            ready_hit = ready_strength == "strong" or (
-                ready_strength == "weak" and self._pregame_ready_streak >= ready_weak_need
-            )
-            if ready_hit:
+            if self._pregame_scene_strong(raw_scene, ranked, "ready"):
                 scene = "ready"
-                self.flow_phase = "WAIT_GO"
-                self._ready_emitted_this_game = True
-                self._pregame_ready_pending = False
-                self._pregame_ready_streak = 0
-                self._pregame_go_streak = 0
-                self._ingame_entry_none_streak = 0
-                self._boost_analysis_sampling_for_pregame()
+                if not self._analysis_scene_confirm_enabled("ready"):
+                    self._confirm_pregame_ready()
         elif phase == "WAIT_GO":
-            if not self._ready_emitted_this_game:
-                late_ready = self._pregame_hit_strength(
-                    raw_scene,
-                    ranked,
-                    use_cnn=use_scene_cnn,
-                    target="ready",
-                    margin_max=_CNN_READY_MARGIN_MAX,
-                )
-                if late_ready != "none":
-                    scene = "ready"
-                    self._ready_emitted_this_game = True
-                    self._pregame_ready_pending = False
-            go_strength = self._pregame_hit_strength(
-                raw_scene, ranked, use_cnn=use_scene_cnn, target="go"
-            )
-            if go_strength != "none":
-                self._pregame_go_streak = min(self._pregame_go_streak + 1, 10)
-            else:
-                self._pregame_go_streak = 0
-            go_hit = go_strength == "strong" or (
-                go_strength == "weak" and self._pregame_go_streak >= _PREGAME_GO_STREAK_WEAK
-            )
-            if go_hit and self._ready_emitted_this_game and scene != "ready":
+            if self._pregame_scene_strong(raw_scene, ranked, "go") and self._ready_confirmed_this_game:
                 scene = "go"
-                self.flow_phase = "IN_GAME"
-                self._enter_ingame_log("go")
-                self._ingame_entry_none_streak = 0
+                if not self._analysis_scene_confirm_enabled("go"):
+                    self.flow_phase = "IN_GAME"
+                    self._enter_ingame_log("go")
+                    self._ingame_entry_none_streak = 0
+                else:
+                    self._ingame_entry_none_streak = 0
             else:
                 self._ingame_entry_none_streak = 0
         elif phase == "IN_GAME":
-            if self._ingame_go_grace > 0:
-                self._ingame_go_grace -= 1
             if self._fever_reject_cooldown > 0:
                 self._fever_reject_cooldown -= 1
+            if self._timeup_reject_cooldown > 0:
+                self._timeup_reject_cooldown -= 1
             if self._in_game_fever_warmup > 0:
                 self._in_game_fever_warmup -= 1
-            gates_ok = self._fever_reject_cooldown <= 0
+            gates_ok = self._fever_cnn_gates_ok(
+                ranked or [],
+                fever_strong_hit=fever_strong_hit,
+                fever_top1=fever_top1,
+            ) if fever_simple else self._fever_reject_cooldown <= 0
             loose_ok = self._in_game_fever_warmup <= 0 and gates_ok
             fever_latched = False
             if fever_simple:
-                fever_latched = self._update_cnn_fever_latch(
-                    fever_hit=fever_hit,
-                    fever_strong_hit=fever_strong_hit,
-                    fever_top1=fever_top1,
-                    ranked=ranked,
-                    gates_ok=gates_ok,
+                if self._fever_cnn_top1_detected(ranked) and gates_ok:
+                    self._fever_episode_latched = True
+                    self._fever_episode_hold = _FEVER_LATCH_HOLD_SAMPLES
+                    fever_latched = True
+                elif self._fever_episode_latched and self._fever_episode_hold > 0:
+                    self._fever_episode_hold -= 1
+                    fever_latched = True
+                elif not self._fever_cnn_top1_detected(ranked):
+                    self._fever_clear_streak += 1
+                    if self._fever_clear_streak >= _FEVER_LATCH_RELEASE_STREAK:
+                        self._reset_fever_latch()
+            if (
+                fever_simple
+                and self._timeup_cnn_top1_detected(ranked)
+                and self._timeup_reject_cooldown <= 0
+                and not (
+                    (frame_index >= 0 and self._timeup_frame_vetoed(frame_index))
+                    or self._timeup_blocked_by_session_veto(
+                        frame_image, scene_feature, ranked=ranked
+                    )
                 )
-            if self._ingame_go_grace > 0 and self._pregame_class_hit(
-                raw_scene, ranked, use_cnn=use_scene_cnn, target="go"
             ):
-                scene = "go"
-                self.timeup_confirm_count = 0
-            elif timeup_signal and not fever_hit and not fever_latched:
+                scene = "timeup"
+                if not self._analysis_scene_confirm_enabled("timeup"):
+                    self._confirm_timeup_detection()
+            elif not fever_simple and timeup_signal and not fever_hit and not fever_latched:
                 self.timeup_confirm_count += 1
                 if self.timeup_confirm_count >= timeup_streak_required:
                     scene = "timeup"
-                    self.flow_phase = "WAIT_BONUS"
-                    self.timeup_confirm_count = 0
-                    self._fever_raw_streak = 0
-                    self._fever_none_gap_used = 0
-                    if fever_simple:
-                        self._reset_fever_latch()
+                    if not self._analysis_scene_confirm_enabled("timeup"):
+                        self._confirm_timeup_detection()
+                    else:
+                        self.timeup_confirm_count = 0
                 else:
                     scene = "none"
             elif fever_latched:
@@ -3555,24 +4142,48 @@ class MainWindow(QMainWindow):
             self._last_raw_scene_in_game = fever_signal if fever_signal == "fever" else raw_scene
         elif phase == "WAIT_BONUS":
             self._reset_fever_latch()
-            if raw_scene == "bonus" or bonus_hit:
+            if self._bonus_reject_cooldown > 0:
+                self._bonus_reject_cooldown -= 1
+            bonus_detected = False
+            if use_scene_cnn:
+                bonus_detected = (
+                    self._bonus_cnn_top1_detected(ranked)
+                    and self._bonus_reject_cooldown <= 0
+                    and not (
+                        (frame_index >= 0 and self._bonus_frame_vetoed(frame_index))
+                        or self._bonus_blocked_by_session_veto(
+                            frame_image, scene_feature, ranked=ranked
+                        )
+                    )
+                )
+            elif raw_scene == "bonus" or bonus_hit:
+                bonus_detected = True
+            if bonus_detected:
                 scene = "bonus"
-                self.flow_phase = "WAIT_RESULT"
+                if not self._analysis_scene_confirm_enabled("bonus"):
+                    self._confirm_bonus_detection()
         elif phase == "WAIT_RESULT":
             self._reset_fever_latch()
-            if raw_scene == "result" or result_hit:
+            if self._result_reject_cooldown > 0:
+                self._result_reject_cooldown -= 1
+            result_detected = False
+            if use_scene_cnn:
+                result_detected = (
+                    self._result_cnn_top1_detected(ranked)
+                    and self._result_reject_cooldown <= 0
+                    and not (
+                        (frame_index >= 0 and self._result_frame_vetoed(frame_index))
+                        or self._result_blocked_by_session_veto(
+                            frame_image, scene_feature, ranked=ranked
+                        )
+                    )
+                )
+            elif raw_scene == "result" or result_hit:
+                result_detected = True
+            if result_detected:
                 scene = "result"
-                self.flow_game_index += 1
-                self.flow_phase = "WAIT_ITEM"
-                self.timeup_confirm_count = 0
-                self.locked_item_targets = []
-                self.locked_use_tsum = "-"
-                self.locked_item_fixed = False
-                self._ready_emitted_this_game = False
-                self._pregame_ready_pending = False
-                self._pregame_ready_streak = 0
-                self._pregame_go_streak = 0
-                self._wait_ready_grace = 0
+                if not self._analysis_scene_confirm_enabled("result"):
+                    self._confirm_result_detection()
 
         if hasattr(self, "counter_analysis_state_label"):
             self.counter_analysis_state_label.setText(f"解析状態: G{self.flow_game_index} {self.flow_phase}")
@@ -3745,12 +4356,32 @@ class MainWindow(QMainWindow):
         self._train_log("スキル・使用ツムモデルの再学習が完了しました。")
 
     def _maybe_modal_scene_confirm(
-        self, confirm_label: str, frame_image, *, flow_scene: str = ""
+        self,
+        confirm_label: str,
+        frame_image,
+        *,
+        flow_scene: str = "",
+        ready_confirmed: bool = False,
+        frame_index: int = -1,
     ) -> None:
         """チェックされたシーンへ遷移した最初のフレームで確認（プレビュー付き）。誤りならクラス選択して保存。"""
         checks = getattr(self, "analysis_scene_confirm_checks", None)
         if checks is None or not self.analysis_running:
             return
+        if confirm_label == "go" and not ready_confirmed and not self._ready_confirmed_this_game:
+            return
+        if confirm_label == "fever" and frame_index >= 0:
+            if self._fever_frame_vetoed(frame_index):
+                return
+        if confirm_label == "timeup" and frame_index >= 0:
+            if self._timeup_frame_vetoed(frame_index):
+                return
+        if confirm_label == "bonus" and frame_index >= 0:
+            if self._bonus_frame_vetoed(frame_index):
+                return
+        if confirm_label == "result" and frame_index >= 0:
+            if self._result_frame_vetoed(frame_index):
+                return
         watched = [
             c
             for c in _ANALYSIS_SCENE_CONFIRM_LABELS
@@ -3759,7 +4390,16 @@ class MainWindow(QMainWindow):
         if confirm_label not in watched:
             return
         flow_scene = flow_scene or confirm_label
-        edge_key = f"{confirm_label}:{flow_scene}"
+        if confirm_label == "fever" and frame_index >= 0:
+            edge_key = f"fever:{frame_index}"
+        elif confirm_label == "timeup" and frame_index >= 0:
+            edge_key = f"timeup:{frame_index}"
+        elif confirm_label == "bonus" and frame_index >= 0:
+            edge_key = f"bonus:{frame_index}"
+        elif confirm_label == "result" and frame_index >= 0:
+            edge_key = f"result:{frame_index}"
+        else:
+            edge_key = f"{confirm_label}:{flow_scene}"
         prev_key = getattr(self, "_analysis_confirm_edge_key", "")
         if edge_key == prev_key:
             return
@@ -3773,11 +4413,33 @@ class MainWindow(QMainWindow):
                 self.player.pause()
 
         try:
-            if not self._exec_scene_confirm_dialog(frame_image, confirm_label):
+            if self._exec_scene_confirm_dialog(frame_image, confirm_label):
+                # フェーズ進行はフローが strong 判定したシーンと一致したときだけ
+                if confirm_label == "ready" and flow_scene == "ready":
+                    self._confirm_pregame_ready()
+                elif (
+                    confirm_label == "go"
+                    and flow_scene == "go"
+                    and self._ready_confirmed_this_game
+                ):
+                    self._confirm_pregame_go()
+                elif confirm_label == "timeup" and flow_scene == "timeup":
+                    self._confirm_timeup_detection()
+                elif confirm_label == "bonus" and flow_scene == "bonus":
+                    self._confirm_bonus_detection()
+                elif confirm_label == "result" and flow_scene == "result":
+                    self._confirm_result_detection()
+            else:
                 choice, ok = self._exec_scene_correction_dialog(frame_image, confirm_label)
                 if ok and choice:
                     if choice == "none" and confirm_label == "fever":
-                        self._fever_reject_cooldown = _FEVER_REJECT_COOLDOWN_SAMPLES
+                        self._record_fever_none_rejection(frame_image, frame_index)
+                    if choice == "none" and confirm_label == "timeup":
+                        self._record_timeup_none_rejection(frame_image, frame_index)
+                    if choice == "none" and confirm_label == "bonus":
+                        self._record_bonus_none_rejection(frame_image, frame_index)
+                    if choice == "none" and confirm_label == "result":
+                        self._record_result_none_rejection(frame_image, frame_index)
                     save_ok, msg = self._save_frame_to_scene_class(frame_image, choice)
                     if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
                         self.log_view.append(("修正保存: " if save_ok else "修正保存失敗: ") + msg)
@@ -3795,10 +4457,68 @@ class MainWindow(QMainWindow):
                                     self.log_view.append(
                                         "この画面を誤検知リストに追加しました（同じ見た目はしばらく fever しません）。"
                                     )
+                        if choice == "none" and confirm_label == "timeup":
+                            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                                if self.video_analyzer.scene_classifier.uses_cnn():
+                                    self.log_view.append(
+                                        "timeup 誤検知として train/none に保存しました。"
+                                        "学習タブで「学習開始」→「モデル保存」で反映してください。"
+                                    )
+                        if choice == "none" and confirm_label == "bonus":
+                            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                                if self.video_analyzer.scene_classifier.uses_cnn():
+                                    self.log_view.append(
+                                        "bonus 誤検知として train/none に保存しました。"
+                                        "学習タブで「学習開始」→「モデル保存」で反映してください。"
+                                    )
+                        if choice == "none" and confirm_label == "result":
+                            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                                if self.video_analyzer.scene_classifier.uses_cnn():
+                                    self.log_view.append(
+                                        "result 誤検知として train/none に保存しました。"
+                                        "学習タブで「学習開始」→「モデル保存」で反映してください。"
+                                    )
+                    if confirm_label == "ready":
+                        if choice == "ready":
+                            self._confirm_pregame_ready()
+                        elif flow_scene == "ready":
+                            self._reject_pregame_ready()
+                    elif confirm_label == "go":
+                        if choice == "go" and self._ready_confirmed_this_game:
+                            self._confirm_pregame_go()
+                        elif flow_scene == "go":
+                            self._reject_pregame_go()
+                    elif confirm_label == "timeup":
+                        if choice == "timeup":
+                            self._confirm_timeup_detection()
+                        elif flow_scene == "timeup":
+                            self._reject_timeup_detection(frame_image, frame_index)
+                    elif confirm_label == "bonus":
+                        if choice == "bonus":
+                            self._confirm_bonus_detection()
+                        elif flow_scene == "bonus":
+                            self._reject_bonus_detection(frame_image, frame_index)
+                    elif confirm_label == "result":
+                        if choice == "result":
+                            self._confirm_result_detection()
+                        elif flow_scene == "result":
+                            self._reject_result_detection(frame_image, frame_index)
+                elif confirm_label == "ready" and flow_scene == "ready":
+                    self._reject_pregame_ready()
+                elif confirm_label == "go" and flow_scene == "go":
+                    self._reject_pregame_go()
+                elif confirm_label == "fever":
+                    self._reject_fever_detection(frame_image, frame_index)
+                elif confirm_label == "timeup" and flow_scene == "timeup":
+                    self._reject_timeup_detection(frame_image, frame_index)
+                elif confirm_label == "bonus" and flow_scene == "bonus":
+                    self._reject_bonus_detection(frame_image, frame_index)
+                elif confirm_label == "result" and flow_scene == "result":
+                    self._reject_result_detection(frame_image, frame_index)
         finally:
             self._analysis_confirm_edge_key = edge_key
             self._analysis_confirm_edge_prev = confirm_label
-            resume = was_playing and self.analysis_running and confirm_label != "timeup"
+            resume = was_playing and self.analysis_running
             if resume:
                 if was_cv:
                     self._cv_play()
@@ -3821,15 +4541,18 @@ class MainWindow(QMainWindow):
             selected_targets = []
         seconds = result.timestamp_ms / 1000.0
         selected_text = ",".join(selected_targets) if selected_targets else "-"
-        used_item_keys = [k for k in selected_targets if k != "use_tsum"]
+        used_item_keys = _item_select_keys_from(selected_targets)
         used_item_names = [self.crop_target_display.get(k, k) for k in used_item_keys]
         used_items_text = ",".join(used_item_names) if used_item_names else "-"
-        if self.locked_item_fixed:
+        if self.locked_item_fixed and self.locked_item_targets:
             locked_item_names = [self.crop_target_display.get(k, k) for k in self.locked_item_targets]
-            display_used_items = ",".join(locked_item_names) if locked_item_names else "-"
+            display_used_items = ",".join(locked_item_names)
             display_use_tsum = self.locked_use_tsum
+        elif result.scene_label == "item" and used_items_text != "-":
+            display_used_items = used_items_text
+            display_use_tsum = use_tsum_detected if use_tsum_detected not in {"-", ""} else "-"
         else:
-            display_used_items = used_items_text if result.scene_label == "item" else "-"
+            display_used_items = "-"
             display_use_tsum = use_tsum_detected if result.scene_label == "item" else "-"
         if hasattr(self, "counter_use_item_label"):
             self.counter_use_item_label.setText(f"使用アイテム: {display_used_items}")
@@ -3913,16 +4636,36 @@ class MainWindow(QMainWindow):
             if self._analysis_log_scroll_counter % 16 == 0:
                 self.log_view.ensureCursorVisible()
 
+    def _refresh_item_counter_labels(self) -> None:
+        if hasattr(self, "counter_use_item_label") and _is_alive_qobject(self.counter_use_item_label):
+            if self.locked_item_fixed and self.locked_item_targets:
+                keys = self.locked_item_targets
+            elif self._item_scan_targets:
+                keys = _item_select_keys_from(list(self._item_scan_targets))
+            else:
+                keys = []
+            if keys:
+                names = [self.crop_target_display.get(k, k) for k in keys]
+                text = ",".join(names)
+            else:
+                text = "--"
+            self.counter_use_item_label.setText(f"使用アイテム: {text}")
+        if hasattr(self, "counter_use_tsum_label") and _is_alive_qobject(self.counter_use_tsum_label):
+            tsum = self.locked_use_tsum if self.locked_item_fixed else "--"
+            if tsum in {"-", ""}:
+                tsum = "--"
+            self.counter_use_tsum_label.setText(f"使用ツム: {tsum}")
+
     def _format_item_debug(self, evaluations: dict[str, dict], selected_targets: list[str]) -> str:
         parts = []
-        for key in ["bomb", "five_to_four", "time"]:
+        for key in _ITEM_SELECT_KEYS:
             ev = evaluations.get(key)
             if ev is None:
                 parts.append(f"{self.crop_target_display.get(key, key)}:NA")
                 continue
             y = float(ev.get("yellow_ratio", 0.0))
             b = float(ev.get("blue_ratio", 0.0))
-            mark = "ON" if key in selected_targets else "OFF"
+            mark = "ON" if key in _item_select_keys_from(selected_targets) else "OFF"
             parts.append(f"{self.crop_target_display.get(key, key)} Y={y:.3f} B={b:.3f} {mark}")
         return " | ".join(parts)
 

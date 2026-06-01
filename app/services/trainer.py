@@ -8,6 +8,7 @@ from typing import Callable
 
 from app.services.scene_cnn import SceneCnnClassifier, torch_available
 from app.services.scene_model import (
+    SCENE_CLASSES,
     SceneCentroidModel,
     describe_training_image_load_failure,
     iter_scene_dataset_images,
@@ -24,7 +25,7 @@ class DatasetSummary:
 class SimpleTrainer:
     """シーン分類の学習（CNN 優先。torch 未導入時のみ centroid）。"""
 
-    CLASSES = ["none", "item", "ready", "go", "fever", "timeup", "bonus", "result"]
+    CLASSES = SCENE_CLASSES
 
     def __init__(self, images_root: Path, model_root: Path) -> None:
         self.images_root = images_root
