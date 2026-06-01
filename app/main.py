@@ -43,14 +43,19 @@ def _detect_compute_device() -> str:
         if dev.type == "cuda":
             return f"GPU:使用(CUDA) {describe_torch_device(dev)}"
         if dev.type == "mps":
-            return "GPU:使用(MPS)"
+            return f"GPU:使用(MPS) {describe_torch_device(dev)}"
+        return f"CPU:使用 ({describe_torch_device(dev)})"
     except Exception:
         pass
 
-    return "CPU:使用 / GPU:未使用（CUDA版 torch を入れると GPU 学習可）"
+    return "CPU:使用 / GPU:未使用"
 
 
 def main() -> int:
+    # Intel Mac の AMD GPU では PyTorch MPS が Metal エラーになるため CPU 固定
+    if platform.machine() != "arm64":
+        os.environ.setdefault("ANALYZER_TORCH_DEVICE", "cpu")
+
     app = QApplication(sys.argv)
     os_info = platform.platform()
     compute_status = _detect_compute_device()

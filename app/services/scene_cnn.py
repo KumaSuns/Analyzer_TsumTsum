@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import pickle
+import platform
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -33,13 +36,37 @@ def torch_available() -> bool:
     return _TORCH_OK
 
 
+def _env_forced_torch_device() -> Optional[str]:
+    """ANALYZER_TORCH_DEVICE=cpu|cuda|mps で明示指定（未設定なら自動）。"""
+    name = os.environ.get("ANALYZER_TORCH_DEVICE", "").strip().lower()
+    if name in ("cpu", "cuda", "mps"):
+        return name
+    return None
+
+
+def _mps_usable() -> bool:
+    """MPS は Apple Silicon 向け。Intel Mac + AMD では Metal エラーになるため使わない。"""
+    if platform.machine() != "arm64":
+        return False
+    return bool(
+        hasattr(torch.backends, "mps") and torch.backends.mps.is_available()  # type: ignore[union-attr]
+    )
+
+
 def pick_torch_device() -> "torch.device":
-    """CUDA が使える環境では GPU、それ以外は CPU。"""
+    """CUDA → Apple Silicon MPS → CPU（Intel Mac は常に CPU）。"""
     if not _TORCH_OK:
         return torch.device("cpu")  # type: ignore[union-attr]
+    forced = _env_forced_torch_device()
+    if forced == "cuda":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if forced == "mps":
+        return torch.device("mps" if _mps_usable() else "cpu")
+    if forced == "cpu":
+        return torch.device("cpu")
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    if _mps_usable():
         return torch.device("mps")
     return torch.device("cpu")
 
@@ -67,6 +94,38 @@ def verify_torch_install() -> Optional[str]:
     return None
 
 
+def _probe_torch_device(device: "torch.device") -> bool:
+    """学習前の簡易動作確認。Metal 障害時は False。"""
+    if not _TORCH_OK or device.type == "cpu":
+        return True
+    try:
+        conv = nn.Conv2d(3, 4, kernel_size=1).to(device)  # type: ignore[union-attr]
+        x = torch.zeros(2, 3, 16, 16, device=device)  # type: ignore[union-attr]
+        y = conv(x)
+        return math.isfinite(float(y.sum().item()))
+    except Exception:
+        return False
+
+
+def resolve_training_device(log: Optional[Callable[[str], None]] = None) -> "torch.device":
+    """学習用デバイス。Intel Mac は CPU、MPS はプローブ失敗時 CPU にフォールバック。"""
+    if not _TORCH_OK:
+        return torch.device("cpu")  # type: ignore[union-attr]
+    dev = pick_torch_device()
+    if platform.machine() != "arm64" and dev.type != "cpu":
+        if log:
+            log(
+                f"警告: {describe_torch_device(dev)} は Intel Mac では使えません。"
+                " CPU で学習します。"
+            )
+        dev = torch.device("cpu")
+    elif dev.type == "mps" and not _probe_torch_device(dev):
+        if log:
+            log("警告: MPS の動作確認に失敗したため CPU で学習します。")
+        dev = torch.device("cpu")
+    return dev
+
+
 def describe_torch_device(device: Optional["torch.device"] = None) -> str:
     if not _TORCH_OK:
         return "PyTorch 未インストール"
@@ -76,7 +135,9 @@ def describe_torch_device(device: Optional["torch.device"] = None) -> str:
         name = torch.cuda.get_device_name(idx)
         return f"cuda ({name})"
     if dev.type == "mps":
-        return "mps (Apple GPU)"
+        return "mps (Apple Silicon GPU)"
+    if platform.machine() != "arm64":
+        return "cpu (Intel Mac: PyTorch は CPU 学習)"
     return "cpu"
 
 
@@ -250,7 +311,7 @@ class SceneCnnClassifier:
         if len(train_ds) == 0:
             raise RuntimeError("train 画像を読み込めませんでした。")
 
-        self.device = pick_torch_device()
+        self.device = resolve_training_device(_log)
         use_cuda = self.device.type == "cuda"
         if use_cuda:
             batch_size = max(batch_size, 32)
@@ -279,7 +340,7 @@ class SceneCnnClassifier:
         n_train = max(len(train_ds), 1)
         n_classes = len(self.classes)
         class_weights = [
-            n_train / (n_classes * max(label_counts.get(i, 0), 1))
+            min(n_train / (n_classes * max(label_counts.get(i, 0), 1)), 12.0)
             for i in range(n_classes)
         ]
         weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
@@ -295,11 +356,16 @@ class SceneCnnClassifier:
 
         _log(f"CNN 学習: クラス={self.classes}")
         _log(f"  train={len(train_ds)} val={len(val_ds)} device={describe_torch_device(self.device)}")
-        if self.device.type == "cpu" and torch.cuda.is_available() is False:
-            _log(
-                "  注意: CPU で学習中です。GPU を使うには CUDA 版 PyTorch が必要です。"
-                " pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124"
-            )
+        if self.device.type == "cpu":
+            if platform.machine() != "arm64":
+                _log(
+                    "  注意: Intel Mac では CPU 学習です（AMD GPU の MPS は未対応・Metal エラー回避）。"
+                )
+            elif torch.cuda.is_available() is False:
+                _log(
+                    "  注意: CPU で学習中です。GPU を使うには CUDA 版 PyTorch が必要です。"
+                    " pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124"
+                )
 
         best_acc = 0.0
         best_epoch = 0
@@ -315,7 +381,13 @@ class SceneCnnClassifier:
                 loss = criterion(net(xb), yb)
                 loss.backward()
                 opt.step()
-                running += float(loss.item())
+                loss_val = float(loss.item())
+                if not math.isfinite(loss_val):
+                    raise RuntimeError(
+                        f"学習 loss が異常です (device={self.device})。"
+                        " アプリを再起動し、Intel Mac では CPU 表示になることを確認してください。"
+                    )
+                running += loss_val
 
             val_acc = 0.0
             if val_loader is not None:
@@ -330,6 +402,11 @@ class SceneCnnClassifier:
                         correct += int((pred == yb).sum().item())
                         total += int(yb.size(0))
                 val_acc = (correct / total) if total > 0 else 0.0
+                if not math.isfinite(val_acc) or val_acc > 1.0:
+                    raise RuntimeError(
+                        f"検証精度が異常です (val_acc={val_acc}, device={self.device})。"
+                        " 学習を中止しました。アプリを再起動して CPU で再実行してください。"
+                    )
                 if val_acc > best_acc + 1e-6:
                     best_acc = val_acc
                     best_epoch = epoch
@@ -343,13 +420,13 @@ class SceneCnnClassifier:
                 if val_loader is not None and epoch == best_epoch:
                     mark = " *best*"
                 _log(
-                    f"  epoch {epoch}/{epochs} loss={running / max(len(train_loader), 1):.4f} "
+                    f"  epoch {epoch:02d}/{epochs:02d} loss={running / max(len(train_loader), 1):.4f} "
                     f"val_acc={val_acc:.3f}{mark}"
                 )
 
             if val_loader is not None and stale_epochs >= early_stop_patience and best_state is not None:
                 _log(
-                    f"  early stop: epoch {epoch}（best val={best_acc:.3f} @ epoch {best_epoch}）"
+                    f"  early stop: epoch {epoch:02d}（best val={best_acc:.3f} @ epoch {best_epoch:02d}）"
                 )
                 break
 
@@ -360,9 +437,12 @@ class SceneCnnClassifier:
         per_class_val = self.evaluate_val(images_root) if val_loader else {}
         fever_total = per_class_val.get("fever", (0, 0))[1]
         fever_ok = per_class_val.get("fever", (0, 0))[0]
-        _log(
-            f"CNN 学習完了: 保存する重み=epoch {best_epoch or '-'} val精度={self.val_accuracy:.3f}"
-        )
+        if best_epoch:
+            _log(
+                f"CNN 学習完了: 保存する重み=epoch {best_epoch:02d} val精度={self.val_accuracy:.3f}"
+            )
+        else:
+            _log(f"CNN 学習完了: 保存する重み=epoch - val精度={self.val_accuracy:.3f}")
         weak = [
             f"{cls}:{ok}/{total}"
             for cls, (ok, total) in sorted(per_class_val.items())

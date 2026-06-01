@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import os
 import platform
@@ -52,6 +54,7 @@ from app.services.scene_model import (
     feature_matches_none_exemplars,
     image_to_feature,
 )
+from app.services.scene_dataset_dedup import deduplicate_scene_dataset
 from app.services.trainer import SimpleTrainer
 from app.services.tsum_registry import TsumRegistry
 from app.services.skill_classifier import (
@@ -63,12 +66,17 @@ from app.services.skill_classifier import (
     skill_category_label,
 )
 from app.services.use_tsum_classifier import UseTsumClassifier
+from app.services.coin_gain_reader import (
+    consensus_coin_gain,
+    opencv_available,
+    read_coin_gain,
+)
 from app.services.file_video import FileVideoSource, is_file_video_available
 
 # 解析テスト: item〜result を「シーンに入った瞬間」で確認モーダルする対象にできる（none 除く）
 _ANALYSIS_SCENE_CONFIRM_LABELS = tuple(c for c in SimpleTrainer.CLASSES if c != "none")
 # 初回起動時に確認モーダルを ON にするシーン
-_SCENE_CONFIRM_DEFAULT_ON = frozenset({"ready", "go", "fever", "timeup", "bonus", "result"})
+_SCENE_CONFIRM_DEFAULT_ON = frozenset({"ready", "go", "fever", "timeup", "bonus", "coin", "result"})
 # IN_GAME: 弱い fever は連続2サンプル（1サンプルだけの誤検知を出さない）
 _FEVER_WEAK_STREAK_REQUIRED = 2
 # go 画面を逃したとき、プレイ画面(none)が続いたら IN_GAME に入る（短すぎると go 未検知になる）
@@ -100,14 +108,18 @@ _CNN_FEVER_STRONG_SCORE_MAX = 0.38
 _CNN_FEVER_DETECT_MAX = 0.34
 _CNN_FEVER_RANKED_TOP = 8
 _SESSION_FEVER_NONE_VETO_MAX = 30
-# IN_GAME 確定: top1=timeup かつ score がこれ未満（val 23/23、max≈0.33）
-_CNN_TIMEUP_DETECT_MAX = 0.34
+# IN_GAME 確定: top1=timeup かつ score がこれ未満（低いほど自信。誤検知抑制のためやや厳しめ）
+_CNN_TIMEUP_DETECT_MAX = 0.30
 _SESSION_TIMEUP_NONE_VETO_MAX = 30
 _TIMEUP_REJECT_COOLDOWN_SAMPLES = 24
 # WAIT_BONUS 確定: top1=bonus かつ score がこれ未満（val 16/16、max≈0.508）
 _CNN_BONUS_DETECT_MAX = 0.52
 _SESSION_BONUS_NONE_VETO_MAX = 30
 _BONUS_REJECT_COOLDOWN_SAMPLES = 24
+# WAIT_COIN 確定: top1=coin かつ score がこれ未満（学習枚数が少ないときはやや緩め）
+_CNN_COIN_DETECT_MAX = 0.55
+_SESSION_COIN_NONE_VETO_MAX = 30
+_COIN_REJECT_COOLDOWN_SAMPLES = 24
 # WAIT_RESULT 確定: top1=result かつ score がこれ未満（val 26/26、max≈0.0125）
 _CNN_RESULT_DETECT_MAX = 0.10
 _SESSION_RESULT_NONE_VETO_MAX = 30
@@ -131,6 +143,7 @@ _TIMEUP_RAW_STREAK_REQUIRED = 5
 _TIMEUP_RAW_STREAK_REQUIRED_CNN = 2
 _CNN_TIMEUP_SCORE_MAX = 0.58
 _CNN_BONUS_SCORE_MAX = 0.58
+_CNN_COIN_SCORE_MAX = 0.58
 _CNN_RESULT_SCORE_MAX = 0.58
 _TIMEUP_STOP_CONFIRM_REQUIRED = 2
 
@@ -460,6 +473,9 @@ class MainWindow(QMainWindow):
         self._analysis_bonus_none_veto: list[list[float]] = []
         self._bonus_veto_frame_indices: set[int] = set()
         self._bonus_reject_cooldown = 0
+        self._analysis_coin_none_veto: list[list[float]] = []
+        self._coin_veto_frame_indices: set[int] = set()
+        self._coin_reject_cooldown = 0
         self._analysis_result_none_veto: list[list[float]] = []
         self._result_veto_frame_indices: set[int] = set()
         self._result_reject_cooldown = 0
@@ -507,8 +523,12 @@ class MainWindow(QMainWindow):
             ("5>4", "five_to_four"),
             ("Combo", "combo"),
             ("UseTsum", "use_tsum"),
+            ("獲得コイン", "coin_gain"),
         ]
         self.crop_target_display = {key: display for display, key in self.crop_targets}
+        self._coin_gain_best: Optional[int] = None
+        self._coin_gain_reads: list[tuple[int, float]] = []
+        self._coin_gain_last_debug = ""
         self.trainer = SimpleTrainer(
             images_root=self.project_root / "app/assets/images",
             model_root=self.project_root / "app/models/main_model",
@@ -1037,8 +1057,6 @@ class MainWindow(QMainWindow):
     def _timeup_blocked_by_session_veto(
         self, frame_image, scene_feature=None, ranked: list | None = None
     ) -> bool:
-        if ranked and self._timeup_cnn_top1_detected(ranked):
-            return False
         if not self._analysis_timeup_none_veto:
             return False
         feat = scene_feature
@@ -1121,8 +1139,131 @@ class MainWindow(QMainWindow):
             feat, self._analysis_bonus_none_veto, _NONE_VETO_SESSION_MAX
         )
 
+    def _reset_coin_gain_capture(self) -> None:
+        self._coin_gain_best = None
+        self._coin_gain_reads = []
+        self._coin_gain_last_debug = ""
+        self._refresh_coin_gain_label()
+
+    def _refresh_coin_gain_label(self) -> None:
+        label = getattr(self, "counter_coin_gain_label", None)
+        if label is None or not _is_alive_qobject(label):
+            return
+        if self._coin_gain_best is not None:
+            label.setText(f"獲得コイン: {self._coin_gain_best:,}")
+        else:
+            label.setText("獲得コイン: --")
+
+    def _crop_frame_roi(self, frame_image, key: str) -> Optional[QImage]:
+        rect = self.crop_positions_for_analysis.get(key)
+        if not isinstance(rect, list) or len(rect) != 4:
+            return None
+        try:
+            nx, ny, nw, nh = (
+                float(rect[0]),
+                float(rect[1]),
+                float(rect[2]),
+                float(rect[3]),
+            )
+        except Exception:
+            return None
+        cropped = UseTsumClassifier._crop_by_normalized_rect(frame_image, (nx, ny, nw, nh))
+        if cropped.isNull():
+            return None
+        return cropped
+
+    def _update_coin_gain_capture(self, frame_image) -> None:
+        if frame_image is None or frame_image.isNull():
+            return
+        if not opencv_available():
+            self._coin_gain_last_debug = "opencv未導入"
+            self._refresh_coin_gain_label()
+            return
+        roi = self._crop_frame_roi(frame_image, "coin_gain")
+        if roi is None:
+            self._coin_gain_last_debug = "範囲未設定"
+            self._refresh_coin_gain_label()
+            return
+        value, err, dbg = read_coin_gain(roi)
+        self._coin_gain_last_debug = dbg
+        if value is not None:
+            self._coin_gain_reads.append((value, err))
+            picked = consensus_coin_gain(self._coin_gain_reads)
+            if picked is not None:
+                self._coin_gain_best = picked
+        self._refresh_coin_gain_label()
+
     def _confirm_bonus_detection(self) -> None:
+        self.flow_phase = "WAIT_COIN"
+        self._reset_coin_gain_capture()
+        if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
+            self.counter_analysis_state_label
+        ):
+            self.counter_analysis_state_label.setText(
+                f"解析状態: G{self.flow_game_index} {self.flow_phase}"
+            )
+
+    @staticmethod
+    def _coin_score_from_ranked(ranked: list) -> float | None:
+        for cls, score in ranked:
+            if cls == "coin":
+                return float(score)
+        return None
+
+    def _coin_cnn_top1_detected(self, ranked: list) -> bool:
+        return bool(ranked) and ranked[0][0] == "coin" and ranked[0][1] < _CNN_COIN_DETECT_MAX
+
+    def _append_session_coin_none_veto(self, frame_image) -> None:
+        if frame_image is None or frame_image.isNull():
+            return
+        feat = image_to_feature(frame_image)
+        if not feat:
+            return
+        self._analysis_coin_none_veto.insert(0, feat)
+        del self._analysis_coin_none_veto[_SESSION_COIN_NONE_VETO_MAX:]
+
+    def _coin_frame_vetoed(self, frame_index: int) -> bool:
+        return int(frame_index) in self._coin_veto_frame_indices
+
+    def _coin_blocked_by_session_veto(
+        self, frame_image, scene_feature=None, ranked: list | None = None
+    ) -> bool:
+        if ranked and self._coin_cnn_top1_detected(ranked):
+            return False
+        if not self._analysis_coin_none_veto:
+            return False
+        feat = scene_feature
+        if not feat and frame_image is not None and not frame_image.isNull():
+            feat = image_to_feature(frame_image)
+        if not feat:
+            return False
+        return feature_matches_none_exemplars(
+            feat, self._analysis_coin_none_veto, _NONE_VETO_SESSION_MAX
+        )
+
+    def _confirm_coin_detection(self) -> None:
         self.flow_phase = "WAIT_RESULT"
+        if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
+            self.counter_analysis_state_label
+        ):
+            self.counter_analysis_state_label.setText(
+                f"解析状態: G{self.flow_game_index} {self.flow_phase}"
+            )
+
+    def _record_coin_none_rejection(self, frame_image, frame_index: int) -> None:
+        self._coin_reject_cooldown = _COIN_REJECT_COOLDOWN_SAMPLES
+        self._append_session_coin_none_veto(frame_image)
+        self._coin_veto_frame_indices.add(int(frame_index))
+        self._analysis_confirm_edge_key = ""
+
+    def _reject_coin_detection(self, frame_image=None, frame_index: int = -1) -> None:
+        self.flow_phase = "WAIT_COIN"
+        self._coin_reject_cooldown = _COIN_REJECT_COOLDOWN_SAMPLES
+        if frame_index >= 0:
+            self._coin_veto_frame_indices.add(int(frame_index))
+        if frame_image is not None and not frame_image.isNull():
+            self._append_session_coin_none_veto(frame_image)
+        self._analysis_confirm_edge_key = ""
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
             self.counter_analysis_state_label
         ):
@@ -1206,6 +1347,7 @@ class MainWindow(QMainWindow):
         self._item_scan_targets = set()
         self._item_scene_active = False
         self._item_use_tsum_pending = "-"
+        self._reset_coin_gain_capture()
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
             self.counter_analysis_state_label
         ):
@@ -1714,7 +1856,7 @@ class MainWindow(QMainWindow):
             if doc is not None and hasattr(doc, "setMaximumBlockCount"):
                 doc.setMaximumBlockCount(12000)
             self.counter_frame = QFrame()
-            self.counter_frame.setFixedHeight(72)
+            self.counter_frame.setFixedHeight(88)
             self.counter_frame.setStyleSheet("border: none; background: transparent;")
             counter_layout = QVBoxLayout(self.counter_frame)
             counter_layout.setContentsMargins(0, 0, 0, 0)
@@ -1723,12 +1865,14 @@ class MainWindow(QMainWindow):
             self.counter_use_item_label = QLabel("使用アイテム: --")
             self.counter_fever_count_label = QLabel("fever回数: 0")
             self.counter_skill_count_label = QLabel("スキル回数: 0")
+            self.counter_coin_gain_label = QLabel("獲得コイン: --")
             self.counter_analysis_state_label = QLabel("解析状態: 停止")
             self.counter_progress_label = QLabel("進行: --")
             counter_layout.addWidget(self.counter_use_tsum_label)
             counter_layout.addWidget(self.counter_use_item_label)
             counter_layout.addWidget(self.counter_fever_count_label)
             counter_layout.addWidget(self.counter_skill_count_label)
+            counter_layout.addWidget(self.counter_coin_gain_label)
             counter_layout.addWidget(self.counter_analysis_state_label)
             counter_layout.addWidget(self.counter_progress_label)
             self.right_layout.addWidget(self.counter_frame)
@@ -1982,6 +2126,22 @@ class MainWindow(QMainWindow):
             data_check_button = QPushButton("データ確認")
             data_check_button.clicked.connect(self._on_train_data_check_clicked)
             train_page_layout.addWidget(data_check_button)
+
+            dedup_preview_button = QPushButton("重複確認")
+            dedup_preview_button.setToolTip(
+                "train/val 全体でバイト完全一致の重複を検出します（削除はしません）。"
+            )
+            dedup_preview_button.clicked.connect(self._on_train_dedup_preview_clicked)
+            train_page_layout.addWidget(dedup_preview_button)
+
+            dedup_button = QPushButton("重複削除")
+            dedup_button.setToolTip(
+                "train/val の完全同一画像を1枚にまとめます。"
+                "残す優先: ファイル名とクラス一致 → train → 先に保存した枚。"
+            )
+            dedup_button.clicked.connect(self._on_train_dedup_clicked)
+            self.train_dedup_button = dedup_button
+            train_page_layout.addWidget(dedup_button)
 
             train_start_button = QPushButton("学習開始")
             train_start_button.clicked.connect(self._on_train_start_clicked)
@@ -2727,6 +2887,8 @@ class MainWindow(QMainWindow):
         if raw_scene == "timeup" and flow_phase == "IN_GAME":
             return raw_scene
         if raw_scene == "bonus" and flow_phase == "WAIT_BONUS":
+            return raw_scene
+        if raw_scene == "coin" and flow_phase == "WAIT_COIN":
             return raw_scene
         if raw_scene == "result" and flow_phase == "WAIT_RESULT":
             return raw_scene
@@ -3599,6 +3761,13 @@ class MainWindow(QMainWindow):
                 target="bonus",
                 cnn_max_score=_CNN_BONUS_SCORE_MAX,
             )
+            coin_hit_pre = self._scene_likely_class(
+                raw_scene,
+                ranked,
+                use_cnn=use_scene_cnn,
+                target="coin",
+                cnn_max_score=_CNN_COIN_SCORE_MAX,
+            )
             result_hit_pre = self._scene_likely_class(
                 raw_scene,
                 ranked,
@@ -3679,6 +3848,8 @@ class MainWindow(QMainWindow):
                 )
                 item_debug = "item_lock:ON"
             result.scene_label = scene_label
+            if self.flow_phase == "WAIT_COIN" and frame_image is not None and not frame_image.isNull():
+                self._update_coin_gain_capture(frame_image)
             skill_tsum_dir = (
                 self._resolve_tsum_dir(self.locked_use_tsum) if self.locked_item_fixed else use_tsum_dir
             )
@@ -3780,9 +3951,13 @@ class MainWindow(QMainWindow):
                 scene_label = "none"
             elif scene_label == "timeup" and self._timeup_frame_vetoed(result.frame_index):
                 scene_label = "none"
-            elif scene_label == "bonus" and self.flow_phase != "WAIT_RESULT":
+            elif scene_label == "bonus" and self.flow_phase not in ("WAIT_COIN", "WAIT_RESULT"):
                 scene_label = "none"
             elif scene_label == "bonus" and self._bonus_frame_vetoed(result.frame_index):
+                scene_label = "none"
+            elif scene_label == "coin" and self.flow_phase not in ("WAIT_COIN", "WAIT_RESULT"):
+                scene_label = "none"
+            elif scene_label == "coin" and self._coin_frame_vetoed(result.frame_index):
                 scene_label = "none"
             elif scene_label == "result" and self.flow_phase != "WAIT_ITEM":
                 scene_label = "none"
@@ -3853,6 +4028,23 @@ class MainWindow(QMainWindow):
                     )
             if (
                 use_scene_cnn
+                and self.flow_phase == "WAIT_COIN"
+                and ranked
+                and hasattr(self, "log_view")
+                and _is_alive_qobject(self.log_view)
+                and hasattr(self, "detail_log_check")
+                and self.detail_log_check.isChecked()
+            ):
+                cs = self._coin_score_from_ranked(ranked)
+                top = ranked[0][0] if ranked else "-"
+                if top == "coin" or (cs is not None and cs < 0.58):
+                    det = self._coin_cnn_top1_detected(ranked)
+                    self.log_view.append(
+                        f"  coin_cnn: top1={top} score={cs:.3f} "
+                        f"detect={'YES' if det else 'NO'} (閾値<{_CNN_COIN_DETECT_MAX})"
+                    )
+            if (
+                use_scene_cnn
                 and self.flow_phase == "WAIT_RESULT"
                 and ranked
                 and hasattr(self, "log_view")
@@ -3913,6 +4105,9 @@ class MainWindow(QMainWindow):
         self._analysis_bonus_none_veto = []
         self._bonus_veto_frame_indices = set()
         self._bonus_reject_cooldown = 0
+        self._analysis_coin_none_veto = []
+        self._coin_veto_frame_indices = set()
+        self._coin_reject_cooldown = 0
         self._analysis_result_none_veto = []
         self._result_veto_frame_indices = set()
         self._result_reject_cooldown = 0
@@ -3936,6 +4131,7 @@ class MainWindow(QMainWindow):
         self._item_scan_targets = set()
         self._item_scene_active = False
         self._item_use_tsum_pending = "-"
+        self._reset_coin_gain_capture()
         self._skill_count = 0
         self._skill_episode_active = False
         self._skill_off_streak = 0
@@ -3990,7 +4186,7 @@ class MainWindow(QMainWindow):
         frame_image=None,
     ) -> str:
         """Apply game-order constraints:
-        item -> ready -> go -> fever/timeup -> bonus -> result -> next game.
+        item -> ready -> go -> fever/timeup -> bonus -> coin -> result -> next game.
         """
         phase = self.flow_phase
         now_ms = max(0, int(position_ms))
@@ -4009,6 +4205,9 @@ class MainWindow(QMainWindow):
         )
         bonus_hit = self._scene_likely_class(
             raw_scene, ranked, use_cnn=use_scene_cnn, target="bonus", cnn_max_score=_CNN_BONUS_SCORE_MAX
+        )
+        coin_hit = self._scene_likely_class(
+            raw_scene, ranked, use_cnn=use_scene_cnn, target="coin", cnn_max_score=_CNN_COIN_SCORE_MAX
         )
         result_hit = self._scene_likely_class(
             raw_scene, ranked, use_cnn=use_scene_cnn, target="result", cnn_max_score=_CNN_RESULT_SCORE_MAX
@@ -4056,6 +4255,11 @@ class MainWindow(QMainWindow):
             ) if fever_simple else self._fever_reject_cooldown <= 0
             loose_ok = self._in_game_fever_warmup <= 0 and gates_ok
             fever_latched = False
+            cnn_timeup_candidate = (
+                fever_simple
+                and self._timeup_cnn_top1_detected(ranked)
+                and self._timeup_reject_cooldown <= 0
+            )
             if fever_simple:
                 if self._fever_cnn_top1_detected(ranked) and gates_ok:
                     self._fever_episode_latched = True
@@ -4068,20 +4272,21 @@ class MainWindow(QMainWindow):
                     self._fever_clear_streak += 1
                     if self._fever_clear_streak >= _FEVER_LATCH_RELEASE_STREAK:
                         self._reset_fever_latch()
-            if (
-                fever_simple
-                and self._timeup_cnn_top1_detected(ranked)
-                and self._timeup_reject_cooldown <= 0
-                and not (
-                    (frame_index >= 0 and self._timeup_frame_vetoed(frame_index))
-                    or self._timeup_blocked_by_session_veto(
-                        frame_image, scene_feature, ranked=ranked
-                    )
+            if cnn_timeup_candidate and not (
+                (frame_index >= 0 and self._timeup_frame_vetoed(frame_index))
+                or self._timeup_blocked_by_session_veto(
+                    frame_image, scene_feature, ranked=ranked
                 )
             ):
-                scene = "timeup"
-                if not self._analysis_scene_confirm_enabled("timeup"):
-                    self._confirm_timeup_detection()
+                self.timeup_confirm_count += 1
+                if self.timeup_confirm_count >= _TIMEUP_RAW_STREAK_REQUIRED_CNN:
+                    scene = "timeup"
+                    if not self._analysis_scene_confirm_enabled("timeup"):
+                        self._confirm_timeup_detection()
+                    else:
+                        self.timeup_confirm_count = 0
+                else:
+                    scene = "none"
             elif not fever_simple and timeup_signal and not fever_hit and not fever_latched:
                 self.timeup_confirm_count += 1
                 if self.timeup_confirm_count >= timeup_streak_required:
@@ -4127,7 +4332,10 @@ class MainWindow(QMainWindow):
                     self._fever_raw_streak = 0
                     self._fever_none_gap_used = 0
                 if raw_scene in ("go", "item", "ready") or (
-                    raw_scene in ("bonus", "result") and not bonus_hit and not result_hit
+                    raw_scene in ("bonus", "coin", "result")
+                    and not bonus_hit
+                    and not coin_hit
+                    and not result_hit
                 ):
                     self._fever_raw_streak = 0
                     self._fever_none_gap_used = 0
@@ -4137,7 +4345,7 @@ class MainWindow(QMainWindow):
                     if not self._fever_episode_latched:
                         self._fever_raw_streak = 0
                         self._fever_none_gap_used = 0
-                if not timeup_signal:
+                if not timeup_signal and not cnn_timeup_candidate:
                     self.timeup_confirm_count = 0
             self._last_raw_scene_in_game = fever_signal if fever_signal == "fever" else raw_scene
         elif phase == "WAIT_BONUS":
@@ -4162,6 +4370,25 @@ class MainWindow(QMainWindow):
                 scene = "bonus"
                 if not self._analysis_scene_confirm_enabled("bonus"):
                     self._confirm_bonus_detection()
+        elif phase == "WAIT_COIN":
+            coin_detected = False
+            if use_scene_cnn:
+                coin_detected = (
+                    self._coin_cnn_top1_detected(ranked)
+                    and self._coin_reject_cooldown <= 0
+                    and not (
+                        (frame_index >= 0 and self._coin_frame_vetoed(frame_index))
+                        or self._coin_blocked_by_session_veto(
+                            frame_image, scene_feature, ranked=ranked
+                        )
+                    )
+                )
+            elif raw_scene == "coin" or coin_hit:
+                coin_detected = True
+            if coin_detected:
+                scene = "coin"
+                if not self._analysis_scene_confirm_enabled("coin"):
+                    self._confirm_coin_detection()
         elif phase == "WAIT_RESULT":
             self._reset_fever_latch()
             if self._result_reject_cooldown > 0:
@@ -4379,6 +4606,9 @@ class MainWindow(QMainWindow):
         if confirm_label == "bonus" and frame_index >= 0:
             if self._bonus_frame_vetoed(frame_index):
                 return
+        if confirm_label == "coin" and frame_index >= 0:
+            if self._coin_frame_vetoed(frame_index):
+                return
         if confirm_label == "result" and frame_index >= 0:
             if self._result_frame_vetoed(frame_index):
                 return
@@ -4396,6 +4626,8 @@ class MainWindow(QMainWindow):
             edge_key = f"timeup:{frame_index}"
         elif confirm_label == "bonus" and frame_index >= 0:
             edge_key = f"bonus:{frame_index}"
+        elif confirm_label == "coin" and frame_index >= 0:
+            edge_key = f"coin:{frame_index}"
         elif confirm_label == "result" and frame_index >= 0:
             edge_key = f"result:{frame_index}"
         else:
@@ -4427,6 +4659,8 @@ class MainWindow(QMainWindow):
                     self._confirm_timeup_detection()
                 elif confirm_label == "bonus" and flow_scene == "bonus":
                     self._confirm_bonus_detection()
+                elif confirm_label == "coin" and flow_scene == "coin":
+                    self._confirm_coin_detection()
                 elif confirm_label == "result" and flow_scene == "result":
                     self._confirm_result_detection()
             else:
@@ -4438,6 +4672,8 @@ class MainWindow(QMainWindow):
                         self._record_timeup_none_rejection(frame_image, frame_index)
                     if choice == "none" and confirm_label == "bonus":
                         self._record_bonus_none_rejection(frame_image, frame_index)
+                    if choice == "none" and confirm_label == "coin":
+                        self._record_coin_none_rejection(frame_image, frame_index)
                     if choice == "none" and confirm_label == "result":
                         self._record_result_none_rejection(frame_image, frame_index)
                     save_ok, msg = self._save_frame_to_scene_class(frame_image, choice)
@@ -4471,6 +4707,13 @@ class MainWindow(QMainWindow):
                                         "bonus 誤検知として train/none に保存しました。"
                                         "学習タブで「学習開始」→「モデル保存」で反映してください。"
                                     )
+                        if choice == "none" and confirm_label == "coin":
+                            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                                if self.video_analyzer.scene_classifier.uses_cnn():
+                                    self.log_view.append(
+                                        "coin 誤検知として train/none に保存しました。"
+                                        "学習タブで「学習開始」→「モデル保存」で反映してください。"
+                                    )
                         if choice == "none" and confirm_label == "result":
                             if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
                                 if self.video_analyzer.scene_classifier.uses_cnn():
@@ -4498,6 +4741,11 @@ class MainWindow(QMainWindow):
                             self._confirm_bonus_detection()
                         elif flow_scene == "bonus":
                             self._reject_bonus_detection(frame_image, frame_index)
+                    elif confirm_label == "coin":
+                        if choice == "coin":
+                            self._confirm_coin_detection()
+                        elif flow_scene == "coin":
+                            self._reject_coin_detection(frame_image, frame_index)
                     elif confirm_label == "result":
                         if choice == "result":
                             self._confirm_result_detection()
@@ -4513,6 +4761,8 @@ class MainWindow(QMainWindow):
                     self._reject_timeup_detection(frame_image, frame_index)
                 elif confirm_label == "bonus" and flow_scene == "bonus":
                     self._reject_bonus_detection(frame_image, frame_index)
+                elif confirm_label == "coin" and flow_scene == "coin":
+                    self._reject_coin_detection(frame_image, frame_index)
                 elif confirm_label == "result" and flow_scene == "result":
                     self._reject_result_detection(frame_image, frame_index)
         finally:
@@ -4573,6 +4823,9 @@ class MainWindow(QMainWindow):
                 f"item={result.item_skill_label} used_items={log_used_items} "
                 f"selected={selected_text} use_tsum={log_use_tsum}"
             )
+        elif result.scene_label == "coin" and self._coin_gain_best is not None:
+            short_suffix = f" coin_gain={self._coin_gain_best}"
+            detail_suffix = short_suffix
         else:
             short_suffix = ""
             detail_suffix = ""
@@ -4604,7 +4857,7 @@ class MainWindow(QMainWindow):
         orange.setForeground(QColor("#B45309"))
         cursor.setCharFormat(mono)
         cursor.insertText(prefix)
-        if scene_label in {"ready", "go"}:
+        if scene_label in {"ready", "go", "coin"}:
             cursor.setCharFormat(orange)
             cursor.insertText(scene_label)
             cursor.setCharFormat(mono)
@@ -4694,6 +4947,8 @@ class MainWindow(QMainWindow):
         }
         for target, rect in positions.items():
             if not isinstance(rect, list) or len(rect) != 4:
+                continue
+            if target in {"use_tsum", "skill", "coin_gain"}:
                 continue
             try:
                 nx, ny, nw, nh = float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])
@@ -4847,6 +5102,76 @@ class MainWindow(QMainWindow):
         self._train_log(f"データ確認: train={summary.train_total}, val={summary.val_total}")
         self._train_log(f"train内訳: {summary.per_class_train}")
         self._train_log(f"val内訳: {summary.per_class_val}")
+
+    def _scene_images_root(self) -> Path:
+        return self.project_root / "app/assets/images"
+
+    def _run_scene_dedup(self, *, dry_run: bool) -> None:
+        if self.train_busy:
+            self._train_log("学習・保存処理中です。完了後に実行してください。")
+            return
+        images_root = self._scene_images_root()
+        label = "重複確認" if dry_run else "重複削除"
+        self.train_busy = True
+        self._set_train_ui_state(status_text=f"状態: {label}中...")
+        self._train_log(f"{label}を開始します（train/val 全体）…")
+
+        def work() -> None:
+            q = self.train_message_queue
+
+            def emit(msg: str) -> None:
+                q.put(msg)
+
+            try:
+                report = deduplicate_scene_dataset(
+                    images_root,
+                    dry_run=dry_run,
+                    log=emit,
+                )
+                for line in report.summary_lines():
+                    emit(line)
+                if dry_run and report.removed_paths:
+                    emit(
+                        f"削除対象 {len(report.removed_paths)}枚。"
+                        "実行するには「重複削除」を押してください。"
+                    )
+                elif not dry_run and report.files_removed:
+                    emit("重複削除が完了しました。必要なら「学習開始」で再学習してください。")
+                q.put("__DEDUP_DONE__")
+            except Exception as exc:
+                q.put(f"__DEDUP_ERROR__:{exc}")
+
+        self.train_poll_timer.start()
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_train_dedup_preview_clicked(self) -> None:
+        self._run_scene_dedup(dry_run=True)
+
+    def _on_train_dedup_clicked(self) -> None:
+        preview = deduplicate_scene_dataset(self._scene_images_root(), dry_run=True)
+        if not preview.removed_paths:
+            self._train_log("重複削除: 削除対象の完全同一画像はありません。")
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("重複削除")
+        box.setText(
+            f"完全同一の画像が {preview.duplicate_groups} グループ"
+            f"（{len(preview.removed_paths)} 枚）あります。削除しますか？"
+        )
+        box.setInformativeText(
+            "train/val 全体で1枚にまとめます。\n"
+            "残す優先: ファイル名とクラス一致 → train → 先に保存した枚。\n"
+            "クラスが違う重複はファイル名が合う方を残します。"
+        )
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            self._train_log("重複削除をキャンセルしました。")
+            return
+        self._run_scene_dedup(dry_run=False)
 
     def _on_train_start_clicked(self) -> None:
         if self.train_busy:
@@ -5015,6 +5340,18 @@ class MainWindow(QMainWindow):
                 self._set_train_ui_state(status_text="状態: 保存失敗")
                 self._reset_train_progress_bar()
                 continue
+            if msg == "__DEDUP_DONE__":
+                self.train_busy = False
+                self.train_poll_timer.stop()
+                self._set_train_ui_state(status_text="状態: 待機中")
+                continue
+            if msg.startswith("__DEDUP_ERROR__:"):
+                self.train_busy = False
+                self.train_poll_timer.stop()
+                err = msg.split(":", 1)[1] if ":" in msg else msg
+                self._train_log(f"重複処理エラー: {err}")
+                self._set_train_ui_state(status_text="状態: 重複処理失敗")
+                continue
             if msg == "__TRAIN_DONE__":
                 self.train_busy = False
                 self.train_poll_timer.stop()
@@ -5047,6 +5384,8 @@ class MainWindow(QMainWindow):
             self.train_save_button.setEnabled(not self.train_busy)
         if hasattr(self, "train_stop_button"):
             self.train_stop_button.setEnabled(self.train_busy)
+        if hasattr(self, "train_dedup_button"):
+            self.train_dedup_button.setEnabled(not self.train_busy)
         if hasattr(self, "train_status_label"):
             if status_text is not None:
                 self.train_status_label.setText(status_text)
