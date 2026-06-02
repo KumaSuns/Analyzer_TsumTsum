@@ -37,6 +37,9 @@ class SceneClassifier:
         if self.cnn.load(cnn_path):
             self.backend = "cnn"
             self.loaded = True
+            # none veto / timeup 抑制用に centroid も読む（推論は CNN のまま）
+            if model_path.exists():
+                self.centroid.load(model_path)
             return True
         if self.centroid.load(model_path):
             self.backend = "centroid"

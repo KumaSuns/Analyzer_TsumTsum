@@ -110,6 +110,8 @@ _CNN_FEVER_RANKED_TOP = 8
 _SESSION_FEVER_NONE_VETO_MAX = 30
 # IN_GAME 確定: top1=timeup かつ score がこれ未満（低いほど自信。誤検知抑制のためやや厳しめ）
 _CNN_TIMEUP_DETECT_MAX = 0.30
+# top1=timeup でも none がこの差以内なら timeup 候補を出さない
+_CNN_TIMEUP_NONE_MARGIN = 0.03
 _SESSION_TIMEUP_NONE_VETO_MAX = 30
 _TIMEUP_REJECT_COOLDOWN_SAMPLES = 24
 # WAIT_BONUS 確定: top1=bonus かつ score がこれ未満（val 16/16、max≈0.508）
@@ -667,7 +669,7 @@ class MainWindow(QMainWindow):
         footer_layout = QHBoxLayout(footer)
         footer_layout.setContentsMargins(0, 0, 16, 0)
         version_label = QLabel(
-            f"Version_00_00_01  {self.os_name}  {self.compute_status}",
+            f"Version_001_2026_06_02  {self.os_name}  {self.compute_status}",
             footer,
         )
         version_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -1042,6 +1044,31 @@ class MainWindow(QMainWindow):
     def _timeup_cnn_top1_detected(self, ranked: list) -> bool:
         return bool(ranked) and ranked[0][0] == "timeup" and ranked[0][1] < _CNN_TIMEUP_DETECT_MAX
 
+    @staticmethod
+    def _timeup_cnn_ambiguous_with_none(ranked: list) -> bool:
+        """CNN で timeup 1 位でも none が僅差なら timeup 確定しない。"""
+        if not ranked:
+            return False
+        if ranked[0][0] == "none":
+            return True
+        timeup_score: float | None = None
+        none_score: float | None = None
+        for cls, score in ranked:
+            if cls == "timeup":
+                timeup_score = float(score) if timeup_score is None else min(timeup_score, float(score))
+            elif cls == "none":
+                none_score = float(score) if none_score is None else min(none_score, float(score))
+        if timeup_score is None:
+            return False
+        if none_score is None:
+            return False
+        if ranked[0][0] != "timeup":
+            return False
+        # score が十分小さい（強い timeup）ときは僅差判定で潰さない。
+        if timeup_score <= 0.12:
+            return False
+        return none_score <= timeup_score + _CNN_TIMEUP_NONE_MARGIN
+
     def _append_session_timeup_none_veto(self, frame_image) -> None:
         if frame_image is None or frame_image.isNull():
             return
@@ -1057,15 +1084,25 @@ class MainWindow(QMainWindow):
     def _timeup_blocked_by_session_veto(
         self, frame_image, scene_feature=None, ranked: list | None = None
     ) -> bool:
-        if not self._analysis_timeup_none_veto:
+        timeup_score = self._timeup_score_from_ranked(ranked or [])
+        # 強い timeup 候補は veto しない（本物まで潰れるのを防ぐ）。
+        if timeup_score is not None and timeup_score <= 0.12:
             return False
+        if ranked and self.video_analyzer.scene_classifier.uses_cnn():
+            if self._timeup_cnn_ambiguous_with_none(ranked):
+                return True
         feat = scene_feature
         if not feat and frame_image is not None and not frame_image.isNull():
             feat = image_to_feature(frame_image)
         if not feat:
             return False
-        return feature_matches_none_exemplars(
+        if self._analysis_timeup_none_veto and feature_matches_none_exemplars(
             feat, self._analysis_timeup_none_veto, _NONE_VETO_SESSION_MAX
+        ):
+            return True
+        centroid = self.video_analyzer.scene_classifier.model
+        return bool(centroid.none_veto_exemplars) and centroid.none_veto_blocks_timeup(
+            feat, timeup_score=timeup_score
         )
 
     def _confirm_timeup_detection(self) -> None:
@@ -1212,6 +1249,30 @@ class MainWindow(QMainWindow):
 
     def _coin_cnn_top1_detected(self, ranked: list) -> bool:
         return bool(ranked) and ranked[0][0] == "coin" and ranked[0][1] < _CNN_COIN_DETECT_MAX
+
+    def _coin_scene_detected(
+        self,
+        *,
+        raw_scene: str,
+        coin_hit: bool,
+        use_scene_cnn: bool,
+        ranked: list,
+        frame_index: int,
+        scene_feature,
+        frame_image,
+    ) -> bool:
+        if use_scene_cnn:
+            return (
+                self._coin_cnn_top1_detected(ranked)
+                and self._coin_reject_cooldown <= 0
+                and not (
+                    (frame_index >= 0 and self._coin_frame_vetoed(frame_index))
+                    or self._coin_blocked_by_session_veto(
+                        frame_image, scene_feature, ranked=ranked
+                    )
+                )
+            )
+        return raw_scene == "coin" or coin_hit
 
     def _append_session_coin_none_veto(self, frame_image) -> None:
         if frame_image is None or frame_image.isNull():
@@ -1384,8 +1445,11 @@ class MainWindow(QMainWindow):
         if choice not in SimpleTrainer.CLASSES:
             return
         if choice == "none" and frame_image is not None:
-            if not self.video_analyzer.scene_classifier.uses_cnn():
-                self._append_none_veto_from_frame(frame_image)
+            self._append_none_veto_from_frame(frame_image)
+            images_root = self.project_root / "app/assets/images"
+            self.video_analyzer.scene_classifier.centroid.rebuild_none_veto_exemplars(
+                images_root
+            )
             self._fever_reject_cooldown = _FEVER_REJECT_COOLDOWN_SAMPLES
         if self.video_analyzer.scene_classifier.uses_cnn():
             self._trainer_scene_dirty = True
@@ -2888,7 +2952,7 @@ class MainWindow(QMainWindow):
             return raw_scene
         if raw_scene == "bonus" and flow_phase == "WAIT_BONUS":
             return raw_scene
-        if raw_scene == "coin" and flow_phase == "WAIT_COIN":
+        if raw_scene == "coin" and flow_phase in ("WAIT_BONUS", "WAIT_COIN"):
             return raw_scene
         if raw_scene == "result" and flow_phase == "WAIT_RESULT":
             return raw_scene
@@ -3955,7 +4019,11 @@ class MainWindow(QMainWindow):
                 scene_label = "none"
             elif scene_label == "bonus" and self._bonus_frame_vetoed(result.frame_index):
                 scene_label = "none"
-            elif scene_label == "coin" and self.flow_phase not in ("WAIT_COIN", "WAIT_RESULT"):
+            elif scene_label == "coin" and self.flow_phase not in (
+                "WAIT_BONUS",
+                "WAIT_COIN",
+                "WAIT_RESULT",
+            ):
                 scene_label = "none"
             elif scene_label == "coin" and self._coin_frame_vetoed(result.frame_index):
                 scene_label = "none"
@@ -4186,7 +4254,8 @@ class MainWindow(QMainWindow):
         frame_image=None,
     ) -> str:
         """Apply game-order constraints:
-        item -> ready -> go -> fever/timeup -> bonus -> coin -> result -> next game.
+        item -> ready -> go -> fever/timeup -> bonus? -> coin -> result -> next game.
+        (bonus は省略されることがある)
         """
         phase = self.flow_phase
         now_ms = max(0, int(position_ms))
@@ -4370,21 +4439,30 @@ class MainWindow(QMainWindow):
                 scene = "bonus"
                 if not self._analysis_scene_confirm_enabled("bonus"):
                     self._confirm_bonus_detection()
+            elif self._coin_scene_detected(
+                raw_scene=raw_scene,
+                coin_hit=coin_hit,
+                use_scene_cnn=use_scene_cnn,
+                ranked=ranked,
+                frame_index=frame_index,
+                scene_feature=scene_feature,
+                frame_image=frame_image,
+            ):
+                # bonus 無し: timeup 後に coin が来たら WAIT_COIN へ
+                self._confirm_bonus_detection()
+                scene = "coin"
+                if not self._analysis_scene_confirm_enabled("coin"):
+                    self._confirm_coin_detection()
         elif phase == "WAIT_COIN":
-            coin_detected = False
-            if use_scene_cnn:
-                coin_detected = (
-                    self._coin_cnn_top1_detected(ranked)
-                    and self._coin_reject_cooldown <= 0
-                    and not (
-                        (frame_index >= 0 and self._coin_frame_vetoed(frame_index))
-                        or self._coin_blocked_by_session_veto(
-                            frame_image, scene_feature, ranked=ranked
-                        )
-                    )
-                )
-            elif raw_scene == "coin" or coin_hit:
-                coin_detected = True
+            coin_detected = self._coin_scene_detected(
+                raw_scene=raw_scene,
+                coin_hit=coin_hit,
+                use_scene_cnn=use_scene_cnn,
+                ranked=ranked,
+                frame_index=frame_index,
+                scene_feature=scene_feature,
+                frame_image=frame_image,
+            )
             if coin_detected:
                 scene = "coin"
                 if not self._analysis_scene_confirm_enabled("coin"):

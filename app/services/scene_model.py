@@ -319,7 +319,6 @@ _NONE_VETO_MARGIN = 0.005
 _NONE_VETO_ABSOLUTE_MAX = 0.012
 # 解析中にユーザーが fever 誤検知で none 保存したフレームのみ（ほぼ同一）
 _NONE_VETO_SESSION_MAX = 0.007
-
 DEFAULT_FEVER_CALIB: Dict[str, float] = {
     "top1_lead": 0.003,
     "none_go_gap": 0.015,
@@ -668,6 +667,25 @@ class SceneCentroidModel:
         if self.centroids and "fever" in self.centroids:
             df = l1_distance(feat, self.centroids["fever"])
             return best_none + 0.002 < df
+        return best_none <= _NONE_VETO_ABSOLUTE_MAX
+
+    def none_veto_blocks_timeup(
+        self,
+        feat: List[float],
+        *,
+        timeup_score: Optional[float] = None,
+    ) -> bool:
+        """保存済み train/none に近いフレームは timeup 扱いにしない（CNN でも有効）。"""
+        if not feat or not self.none_veto_exemplars:
+            return False
+        if timeup_score is not None and timeup_score <= 0.12:
+            # CNN が強く timeup を示す場合は抑制しない。
+            return False
+        best_none = min(l1_distance(feat, ex) for ex in self.none_veto_exemplars)
+        if self.centroids and "timeup" in self.centroids:
+            dt = l1_distance(feat, self.centroids["timeup"])
+            margin = 0.002 if (timeup_score is None or timeup_score >= 0.22) else 0.006
+            return best_none + margin < dt
         return best_none <= _NONE_VETO_ABSOLUTE_MAX
 
     def exemplar_blocks_fever(self, feat: List[float]) -> bool:
