@@ -71,6 +71,7 @@ from app.services.coin_gain_reader import (
     opencv_available,
     read_coin_gain,
 )
+from app.services.remaining_time_reader import read_remaining_seconds
 from app.services.file_video import FileVideoSource, is_file_video_available
 
 # 解析テスト: item〜result を「シーンに入った瞬間」で確認モーダルする対象にできる（none 除く）
@@ -524,6 +525,7 @@ class MainWindow(QMainWindow):
             ("Bomb", "bomb"),
             ("5>4", "five_to_four"),
             ("Combo", "combo"),
+            ("残り時間", "remaining_time"),
             ("UseTsum", "use_tsum"),
             ("獲得コイン", "coin_gain"),
         ]
@@ -1192,7 +1194,13 @@ class MainWindow(QMainWindow):
             label.setText("獲得コイン: --")
 
     def _crop_frame_roi(self, frame_image, key: str) -> Optional[QImage]:
-        rect = self.crop_positions_for_analysis.get(key)
+        positions = self.crop_positions_for_analysis or self._load_crop_positions()
+        return self._crop_frame_roi_from_positions(frame_image, positions, key)
+
+    def _crop_frame_roi_from_positions(
+        self, frame_image, positions: dict, key: str
+    ) -> Optional[QImage]:
+        rect = positions.get(key) if isinstance(positions, dict) else None
         if not isinstance(rect, list) or len(rect) != 4:
             return None
         try:
@@ -2159,12 +2167,37 @@ class MainWindow(QMainWindow):
                         "QPushButton:pressed { background: #DCDCDC; }"
                         "QPushButton:disabled { color: #9A9A9A; background: #F2F2F2; border-color: #CCC; }"
                     )
-                    labels = ["仮1", "解析", "仮3", "仮4"] if feature_id == 1 else ["仮1", "仮2", "仮3", "仮4"]
-                    for label in labels:
+                    if feature_id == 1:
+                        row_buttons = [
+                            ("時間スキップ", "timer_skip"),
+                            ("解析", "analyze"),
+                            ("仮3", None),
+                            ("仮4", None),
+                        ]
+                    else:
+                        row_buttons = [
+                            ("時間スキップ", "timer_skip"),
+                            ("仮2", None),
+                            ("仮3", None),
+                            ("仮4", None),
+                        ]
+                    for label, action in row_buttons:
                         button = QPushButton(label, section)
                         button.setStyleSheet(analyze_row_button_style)
-                        button.setFixedSize(88 if label == "解析" else 64, 24)
                         if label == "解析":
+                            button.setFixedSize(88, 24)
+                        elif action == "timer_skip":
+                            button.setFixedSize(80, 24)
+                        else:
+                            button.setFixedSize(64, 24)
+                        if action == "timer_skip":
+                            button.setToolTip(
+                                "現在フレームの残り時間（最大3桁）を読み取り、"
+                                "動画内で同じ残り時間のフレームへジャンプします。"
+                                "トリミング「残り時間」を IN_GAME の秒数表示（最大3桁）に合わせてください。"
+                            )
+                            button.clicked.connect(self._on_temp1_timer_skip_clicked)
+                        elif action == "analyze":
                             self.analyze_button = button
                             self.analyze_button.setText("解析開始")
                             button.clicked.connect(self._on_analyze_clicked)
@@ -2727,6 +2760,138 @@ class MainWindow(QMainWindow):
             self._cv_seek_and_show(target)
         else:
             self.player.setPosition(target)
+
+    def _read_frame_at_ms(self, ms: int) -> Optional[QImage]:
+        if getattr(self, "use_opencv_for_video", False):
+            if self.cv_source is None or not self.cv_source.is_open:
+                return None
+            cap = self.media_duration_ms
+            pos = max(0, min(ms, cap) if cap > 0 else max(0, ms))
+            self.cv_source.seek_ms(pos)
+            img = self.cv_source.read_qimage()
+            if img is not None and not img.isNull():
+                return img
+            return None
+        if self._is_player_playing():
+            self.player.pause()
+            self._refresh_play_button_text()
+        self.player.setPosition(max(0, ms))
+        for _ in range(10):
+            QApplication.processEvents()
+        img = self.current_video_frame_image
+        if img is not None and not img.isNull():
+            return img
+        return None
+
+    def _on_temp1_timer_skip_clicked(self) -> None:
+        """残り時間を読み取り、動画内の同じ表示秒へジャンプする。"""
+        if self._is_player_playing():
+            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                self.log_view.append("スキップ: 一時停止してから実行してください。")
+            return
+        if not opencv_available():
+            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                self.log_view.append("スキップ: opencv-python が必要です。")
+            return
+        if self.media_duration_ms <= 0 and not getattr(self, "use_opencv_for_video", False):
+            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                self.log_view.append("スキップ: 動画を開いてください。")
+            return
+        if getattr(self, "use_opencv_for_video", False):
+            if self.cv_source is None or not self.cv_source.is_open:
+                if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                    self.log_view.append("スキップ: 動画を開いてください。")
+                return
+
+        frame = self.current_video_frame_image
+        if frame is None or frame.isNull():
+            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                self.log_view.append("スキップ: 表示中のフレームがありません。")
+            return
+
+        positions = self.crop_positions_for_analysis or self._load_crop_positions()
+        roi = None
+        crop_key = ""
+        for key in ("remaining_time", "time"):
+            roi = self._crop_frame_roi_from_positions(frame, positions, key)
+            if roi is not None and not roi.isNull():
+                crop_key = key
+                break
+        if roi is None:
+            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                self.log_view.append(
+                    "スキップ: トリミング「残り時間」が未設定です。"
+                    " 動画ツールで IN_GAME のタイマー表示に合わせて保存してください。"
+                )
+            return
+
+        target_sec, dbg = read_remaining_seconds(roi)
+        if target_sec is None:
+            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                self.log_view.append(f"スキップ: 残り時間を読み取れませんでした ({dbg})")
+            return
+        if "n=1" in dbg and target_sec <= 9:
+            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                self.log_view.append(
+                    f"スキップ: 残り{target_sec}秒は信頼度が低いため中止しました（{dbg}）。"
+                    " 動画ツールで「残り時間」を秒数（最大3桁）がすべて入るよう合わせ直してください。"
+                )
+            return
+
+        start_ms = self._playback_position_ms()
+        fps = max(float(self.estimated_fps or 30.0), 1.0)
+        step_ms = max(200, int(1000.0 / fps))
+        found_ms: Optional[int] = None
+
+        prog = QProgressDialog("残り時間のフレームを検索中…", "キャンセル", 0, 0, self)
+        prog.setWindowTitle("時間スキップ")
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+
+        ms = start_ms
+        while ms >= 0:
+            if prog.wasCanceled():
+                break
+            prog.setLabelText(f"検索中… {ms/1000:.1f}s / 残り{target_sec}秒")
+            QApplication.processEvents()
+            img = self._read_frame_at_ms(ms)
+            if img is not None and not img.isNull():
+                probe = self._crop_frame_roi_from_positions(img, positions, crop_key)
+                if probe is not None:
+                    sec, _ = read_remaining_seconds(probe)
+                    if sec == target_sec:
+                        found_ms = ms
+                        break
+            ms -= step_ms
+            prog.setValue(prog.value() + 1)
+
+        prog.close()
+
+        if found_ms is None:
+            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                self.log_view.append(
+                    f"スキップ: 残り{target_sec}秒のフレームが見つかりませんでした（{dbg}）。"
+                    " トリミング位置を確認してください。"
+                )
+            if getattr(self, "use_opencv_for_video", False):
+                self._cv_seek_and_show(start_ms)
+            else:
+                self.player.setPosition(start_ms)
+            return
+
+        if getattr(self, "use_opencv_for_video", False):
+            self._cv_seek_and_show(found_ms)
+        else:
+            self.player.setPosition(found_ms)
+            for _ in range(6):
+                QApplication.processEvents()
+
+        if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+            self.log_view.append(
+                f"スキップ: 残り{target_sec}秒のフレームへジャンプ "
+                f"({found_ms/1000:.2f}s, {crop_key}, {dbg})"
+            )
 
     def _set_playback_rate(self, rate: float) -> None:
         self._cv_playback_rate = max(rate, 0.05)
@@ -5026,7 +5191,7 @@ class MainWindow(QMainWindow):
         for target, rect in positions.items():
             if not isinstance(rect, list) or len(rect) != 4:
                 continue
-            if target in {"use_tsum", "skill", "coin_gain"}:
+            if target in {"use_tsum", "skill", "coin_gain", "remaining_time"}:
                 continue
             try:
                 nx, ny, nw, nh = float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])
