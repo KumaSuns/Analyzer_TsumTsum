@@ -20,3 +20,4 @@ app/models/**/*.pth
 !app/assets/images/.gitkeep
 !app/assets/videos/.gitkeep
 !app/models/.gitkeep
+!app/models/main_model/crop_positions.json

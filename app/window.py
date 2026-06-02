@@ -102,6 +102,8 @@ _CNN_GO_MARGIN_MAX = 0.45
 _WAIT_READY_GRACE_SAMPLES = 60
 # item 選択画面の crop キー（use_tsum は使用アイテムに含めない）
 _ITEM_SELECT_KEYS = ("score", "coin", "exp", "time", "bomb", "five_to_four", "combo")
+# 時間スキップは item 行の time ではなく、専用トリミングのみ使用（未保存なら実行不可）
+_REQUIRED_TIMER_SKIP_CROP_KEY = "remaining_time"
 # CNN: fever 候補（score = 1 - softmax、小さいほど fever らしい）
 _CNN_FEVER_SCORE_MAX = 0.62
 _CNN_FEVER_STRONG_SCORE_MAX = 0.38
@@ -1197,9 +1199,22 @@ class MainWindow(QMainWindow):
         positions = self.crop_positions_for_analysis or self._load_crop_positions()
         return self._crop_frame_roi_from_positions(frame_image, positions, key)
 
+    @staticmethod
+    def _crop_rect_defined(positions: dict, key: str) -> bool:
+        rect = positions.get(key) if isinstance(positions, dict) else None
+        if not isinstance(rect, list) or len(rect) != 4:
+            return False
+        try:
+            _nx, _ny, nw, nh = (float(rect[i]) for i in range(4))
+            return nw > 0 and nh > 0
+        except (TypeError, ValueError):
+            return False
+
     def _crop_frame_roi_from_positions(
         self, frame_image, positions: dict, key: str
     ) -> Optional[QImage]:
+        if not self._crop_rect_defined(positions, key):
+            return None
         rect = positions.get(key) if isinstance(positions, dict) else None
         if not isinstance(rect, list) or len(rect) != 4:
             return None
@@ -2194,7 +2209,8 @@ class MainWindow(QMainWindow):
                             button.setToolTip(
                                 "現在フレームの残り時間（最大3桁）を読み取り、"
                                 "動画内で同じ残り時間のフレームへジャンプします。"
-                                "トリミング「残り時間」を IN_GAME の秒数表示（最大3桁）に合わせてください。"
+                                "事前に動画ツールで「残り時間」トリミングを保存してください（必須）。"
+                                "item 行の time とは別です。"
                             )
                             button.clicked.connect(self._on_temp1_timer_skip_clicked)
                         elif action == "analyze":
@@ -2810,18 +2826,21 @@ class MainWindow(QMainWindow):
             return
 
         positions = self.crop_positions_for_analysis or self._load_crop_positions()
-        roi = None
-        crop_key = ""
-        for key in ("remaining_time", "time"):
-            roi = self._crop_frame_roi_from_positions(frame, positions, key)
-            if roi is not None and not roi.isNull():
-                crop_key = key
-                break
-        if roi is None:
+        crop_key = _REQUIRED_TIMER_SKIP_CROP_KEY
+        if not self._crop_rect_defined(positions, crop_key):
             if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
                 self.log_view.append(
-                    "スキップ: トリミング「残り時間」が未設定です。"
-                    " 動画ツールで IN_GAME のタイマー表示に合わせて保存してください。"
+                    "スキップ: トリミング「残り時間」の保存が必須です。"
+                    " 動画ツールで IN_GAME の秒数表示（最大3桁）に合わせて保存してください。"
+                    "（item の time ではありません）"
+                )
+            return
+        roi = self._crop_frame_roi_from_positions(frame, positions, crop_key)
+        if roi is None or roi.isNull():
+            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                self.log_view.append(
+                    "スキップ: トリミング「残り時間」から画像を切り出せませんでした。"
+                    " 範囲を保存し直してください。"
                 )
             return
 
@@ -3560,6 +3579,7 @@ class MainWindow(QMainWindow):
         path = self.project_root / "app/models/main_model/crop_positions.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.crop_positions_for_analysis = dict(data)
         self._train_log(f"トリミング保存: {','.join(selected_keys)} -> {self.pending_crop_rect}")
 
     def _on_save_target_images_clicked(self) -> None:

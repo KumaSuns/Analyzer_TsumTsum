@@ -258,7 +258,7 @@ def read_remaining_seconds(roi: QImage) -> Tuple[Optional[int], str]:
         return None, f"roi小 {gray.shape[1]}x{gray.shape[0]}"
     if not _roi_has_timer_signal(gray):
         return None, (
-            "タイマーが写っていません（トリミング位置を左上の秒数表示に合わせてください）"
+            "タイマーが写っていません（動画ツールで「残り時間」トリミングを保存・調整してください）"
         )
 
     bgr = qimage_to_bgr(roi)
