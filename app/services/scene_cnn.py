@@ -6,6 +6,7 @@ import math
 import os
 import pickle
 import platform
+import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -16,7 +17,7 @@ from app.services.scene_model import SCENE_CLASSES, iter_scene_dataset_images
 try:
     import torch
     import torch.nn as nn
-    from torch.utils.data import DataLoader, Dataset
+    from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
     _TORCH_OK = True
 except ImportError:
@@ -36,6 +37,11 @@ def torch_available() -> bool:
     return _TORCH_OK
 
 
+def _is_intel_mac() -> bool:
+    """Intel Mac では MPS/AMD GPU が Metal エラーになるため CPU 固定対象。"""
+    return sys.platform == "darwin" and platform.machine() != "arm64"
+
+
 def _env_forced_torch_device() -> Optional[str]:
     """ANALYZER_TORCH_DEVICE=cpu|cuda|mps で明示指定（未設定なら自動）。"""
     name = os.environ.get("ANALYZER_TORCH_DEVICE", "").strip().lower()
@@ -46,7 +52,7 @@ def _env_forced_torch_device() -> Optional[str]:
 
 def _mps_usable() -> bool:
     """MPS は Apple Silicon 向け。Intel Mac + AMD では Metal エラーになるため使わない。"""
-    if platform.machine() != "arm64":
+    if not (sys.platform == "darwin" and platform.machine() == "arm64"):
         return False
     return bool(
         hasattr(torch.backends, "mps") and torch.backends.mps.is_available()  # type: ignore[union-attr]
@@ -112,7 +118,7 @@ def resolve_training_device(log: Optional[Callable[[str], None]] = None) -> "tor
     if not _TORCH_OK:
         return torch.device("cpu")  # type: ignore[union-attr]
     dev = pick_torch_device()
-    if platform.machine() != "arm64" and dev.type != "cpu":
+    if _is_intel_mac() and dev.type != "cpu":
         if log:
             log(
                 f"警告: {describe_torch_device(dev)} は Intel Mac では使えません。"
@@ -136,8 +142,8 @@ def describe_torch_device(device: Optional["torch.device"] = None) -> str:
         return f"cuda ({name})"
     if dev.type == "mps":
         return "mps (Apple Silicon GPU)"
-    if platform.machine() != "arm64":
-        return "cpu (Intel Mac: PyTorch は CPU 学習)"
+    if _is_intel_mac():
+        return "cpu (Intel Mac: MPS 非対応のため CPU)"
     return "cpu"
 
 
@@ -321,9 +327,6 @@ class SceneCnnClassifier:
         if use_cuda:
             loader_kw["pin_memory"] = True
 
-        train_loader = DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True, **loader_kw
-        )
         val_loader = (
             DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kw)
             if len(val_ds) > 0
@@ -346,13 +349,35 @@ class SceneCnnClassifier:
         weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
         criterion = nn.CrossEntropyLoss(weight=weight_tensor)
         imbalanced = max(class_weights) / max(min(class_weights), 1e-6)
+        none_idx = self.class_to_idx.get("none")
+        none_n = label_counts.get(none_idx, 0) if none_idx is not None else 0
         if imbalanced > 3.0:
-            none_idx = self.class_to_idx.get("none")
-            none_n = label_counts.get(none_idx, 0) if none_idx is not None else 0
             _log(
                 f"  クラス不均衡: 最大/最小 weight={imbalanced:.1f} "
                 f"(none={none_n}枚など、少数クラスに重み付け)"
             )
+        ready_idx = self.class_to_idx.get("ready")
+        go_idx = self.class_to_idx.get("go")
+        ready_n = label_counts.get(ready_idx, 0) if ready_idx is not None else 0
+        go_n = label_counts.get(go_idx, 0) if go_idx is not None else 0
+        if none_n > 0 and (ready_n + go_n) > 0 and none_n > (ready_n + go_n) * 4:
+            _log(
+                f"  注意: train/none={none_n} に対し ready={ready_n} go={go_n}。"
+                " 誤検知修正の none が多いと ready/go の実動画精度が val より落ちやすいです。"
+            )
+
+        # loss の class weight だけではバッチ内比率は偏るため、学習時は均等サンプリングする。
+        sample_weights = [
+            1.0 / max(label_counts[label], 1) for _, label in train_ds.samples
+        ]
+        train_sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(train_ds.samples),
+            replacement=True,
+        )
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, sampler=train_sampler, **loader_kw
+        )
 
         _log(f"CNN 学習: クラス={self.classes}")
         _log(f"  train={len(train_ds)} val={len(val_ds)} device={describe_torch_device(self.device)}")

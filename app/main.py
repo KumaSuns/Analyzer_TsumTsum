@@ -53,8 +53,13 @@ def _detect_compute_device() -> str:
 
 def main() -> int:
     # Intel Mac の AMD GPU では PyTorch MPS が Metal エラーになるため CPU 固定
-    if platform.machine() != "arm64":
-        os.environ.setdefault("ANALYZER_TORCH_DEVICE", "cpu")
+    try:
+        from app.services.scene_cnn import _is_intel_mac
+
+        if _is_intel_mac():
+            os.environ.setdefault("ANALYZER_TORCH_DEVICE", "cpu")
+    except Exception:
+        pass
 
     app = QApplication(sys.argv)
     os_info = platform.platform()

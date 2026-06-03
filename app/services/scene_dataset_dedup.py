@@ -51,10 +51,19 @@ def _filename_matches_class(path: Path, cls: str) -> bool:
     return stem.startswith(f"scene_{cls.lower()}_") or stem == f"scene_{cls.lower()}"
 
 
+def _dedup_class_priority(cls: str) -> int:
+    """重複解消時のクラス優先度（小さいほど残す）。none は誤保存が多いので最下位。"""
+    if cls not in SCENE_CLASSES:
+        return 99
+    if cls == "none":
+        return len(SCENE_CLASSES)
+    return SCENE_CLASSES.index(cls)
+
+
 def _keep_sort_key(path: Path) -> Tuple:
     """昇順で先頭を残す（残すファイルほどキーが小さい）。"""
     split, cls = _split_and_class(path)
-    cls_prio = SCENE_CLASSES.index(cls) if cls in SCENE_CLASSES else 99
+    cls_prio = _dedup_class_priority(cls)
     try:
         mtime = path.stat().st_mtime
     except OSError:
@@ -89,7 +98,7 @@ def deduplicate_scene_dataset(
     残す優先順位:
     1. ファイル名が scene_<クラス>_… とフォルダのクラスが一致
     2. train（val より優先。val リーク防止）
-    3. SCENE_CLASSES の並びが早いクラス
+    3. none 以外の SCENE_CLASSES 順（none は誤保存が多いので最下位）
     4. 保存が古い方（先に取ったフレーム）
     """
     report = DedupReport()
