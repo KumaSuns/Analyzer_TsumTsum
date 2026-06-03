@@ -54,6 +54,11 @@ from app.services.scene_model import (
     feature_matches_none_exemplars,
     image_to_feature,
 )
+from app.services.scene_dataset_advice import (
+    analyze_scene_dataset,
+    format_advice_report_text,
+    summarize_skill_activation_images,
+)
 from app.services.scene_dataset_dedup import deduplicate_scene_dataset
 from app.services.trainer import SimpleTrainer
 from app.services.tsum_registry import TsumRegistry
@@ -2254,6 +2259,31 @@ class MainWindow(QMainWindow):
             data_check_button.clicked.connect(self._on_train_data_check_clicked)
             train_page_layout.addWidget(data_check_button)
 
+            self.train_shortage_button = QPushButton("不足画像を確認")
+            self.train_shortage_button.setToolTip(
+                "各シーンクラスの train/val 枚数を見て、"
+                "足りない画像の種類と追加目安を表示します。"
+            )
+            self.train_shortage_button.clicked.connect(self._on_train_shortage_check_clicked)
+            train_page_layout.addWidget(self.train_shortage_button)
+
+            self.train_data_advice_status = QLabel("データ状況: 未確認")
+            self.train_data_advice_status.setWordWrap(True)
+            self.train_data_advice_status.setStyleSheet("color: #333; font-size: 11px;")
+            train_page_layout.addWidget(self.train_data_advice_status)
+
+            train_page_layout.addWidget(QLabel("データ状況（不足案内）※下の枠に表示"))
+            self.train_data_advice_view = QTextEdit()
+            self.train_data_advice_view.setReadOnly(True)
+            self.train_data_advice_view.setMinimumHeight(200)
+            self.train_data_advice_view.setPlaceholderText(
+                "ボタンを押すと、この枠と右の学習ログに結果が出ます。"
+            )
+            self.train_data_advice_view.setStyleSheet(
+                "QTextEdit { font-size: 11px; color: #222; background: #FAFAFA; }"
+            )
+            train_page_layout.addWidget(self.train_data_advice_view, 1)
+
             dedup_preview_button = QPushButton("重複確認")
             dedup_preview_button.setToolTip(
                 "train/val 全体でバイト完全一致の重複を検出します（削除はしません）。"
@@ -2336,6 +2366,7 @@ class MainWindow(QMainWindow):
 
             self.center_layout.addWidget(train_page, 1)
             self._set_train_ui_state()
+            self._refresh_train_dataset_advice()
 
             self.right_layout.addWidget(QLabel("学習ログ"))
             self.log_view.append("学習ページを表示しました。")
@@ -5675,11 +5706,101 @@ class MainWindow(QMainWindow):
         if hasattr(self, "log_view"):
             self.log_view.append(message)
 
+    def _train_model_meta_path(self) -> Path:
+        version = "version_1"
+        if hasattr(self, "analysis_model_version_combo") and _is_alive_qobject(
+            self.analysis_model_version_combo
+        ):
+            version = self.analysis_model_version_combo.currentText() or version
+        return self.project_root / "app/models/main_model" / version / "model_meta.json"
+
+    def _on_train_shortage_check_clicked(self) -> None:
+        ok, summary, report = self._refresh_train_dataset_advice(log_result=True)
+        if not ok:
+            self._train_log(
+                "不足画像を確認: 学習タブの表示が無効です。"
+                " いったん別タブへ移動してから「学習」を開き直してください。"
+            )
+            return
+        n_warn = len([s for s in report.shortages if s.cls != "_balance"])
+        n_balance = len([s for s in report.shortages if s.cls == "_balance"])
+        self._train_log(
+            f"不足画像を確認: 完了 train={summary.train_total} val={summary.val_total}"
+            f" 注意クラス={n_warn}"
+            + (f" 偏り警告={n_balance}" if n_balance else "")
+        )
+        for line in report.lines:
+            if line.startswith("【") or line.startswith(" ・") or line.startswith("※"):
+                self._train_log(line)
+
+    def _refresh_train_dataset_advice(
+        self, *, log_result: bool = False
+    ) -> tuple[bool, object, object]:
+        """データ状況パネルを更新。 (成功, summary, report) を返す。"""
+        empty_summary = None
+        empty_report = None
+        if not hasattr(self, "train_data_advice_view") or not _is_alive_qobject(
+            self.train_data_advice_view
+        ):
+            return False, empty_summary, empty_report
+        summary = self.trainer.summarize_dataset()
+        report = analyze_scene_dataset(summary, model_meta_path=self._train_model_meta_path())
+        text = format_advice_report_text(report)
+        skill_root = self.project_root / "app/assets/images/skills"
+        skill_total, skill_low = summarize_skill_activation_images(skill_root)
+        if skill_total > 0 or skill_low:
+            text += "\n\n--- スキル発動画像 ---\n"
+            text += f"合計 {skill_total} 枚\n"
+            if skill_low:
+                text += "追加推奨:\n" + "\n".join(f" ・{line}" for line in skill_low[:12])
+                if len(skill_low) > 12:
+                    text += f"\n  …他 {len(skill_low) - 12} 件"
+            else:
+                text += "各ツム 10 枚以上あります。"
+        scanned = datetime.now().strftime("%H:%M:%S")
+        header = f"[更新 {scanned}]\n"
+        self.train_data_advice_view.setPlainText(header + text)
+        cursor = self.train_data_advice_view.textCursor()
+        cursor.movePosition(cursor.MoveOperation.Start)
+        self.train_data_advice_view.setTextCursor(cursor)
+        if report.has_critical:
+            self.train_data_advice_view.setStyleSheet(
+                "QTextEdit { font-size: 11px; color: #222; background: #FFEBEE; }"
+            )
+            level = "要対応"
+        elif report.shortages:
+            self.train_data_advice_view.setStyleSheet(
+                "QTextEdit { font-size: 11px; color: #222; background: #FFF8E1; }"
+            )
+            level = "追加推奨あり"
+        else:
+            self.train_data_advice_view.setStyleSheet(
+                "QTextEdit { font-size: 11px; color: #222; background: #E8F5E9; }"
+            )
+            level = "良好"
+        n_warn = len([s for s in report.shortages if s.cls != "_balance"])
+        if hasattr(self, "train_data_advice_status") and _is_alive_qobject(
+            self.train_data_advice_status
+        ):
+            self.train_data_advice_status.setText(
+                f"データ状況: {level}（{scanned} 更新）"
+                f" train={summary.train_total} val={summary.val_total}"
+                f" 注意={n_warn}クラス → 下の枠を確認"
+            )
+        if log_result:
+            self._train_log(f"データ状況パネルを更新しました（{scanned}）。")
+        return True, summary, report
+
     def _on_train_data_check_clicked(self) -> None:
         summary = self.trainer.summarize_dataset()
         self._train_log(f"データ確認: train={summary.train_total}, val={summary.val_total}")
         self._train_log(f"train内訳: {summary.per_class_train}")
         self._train_log(f"val内訳: {summary.per_class_val}")
+        self._refresh_train_dataset_advice()
+        report = analyze_scene_dataset(summary, model_meta_path=self._train_model_meta_path())
+        for line in report.lines:
+            if line.startswith("【") or line.startswith(" ・"):
+                self._train_log(line)
 
     def _scene_images_root(self) -> Path:
         return self.project_root / "app/assets/images"
@@ -5909,6 +6030,7 @@ class MainWindow(QMainWindow):
                 self._train_log(f"モデル保存が完了しました。所要時間: {elapsed}s")
                 self._set_train_ui_state(status_text=f"状態: モデル保存完了 ({elapsed}s)")
                 self._flash_train_save_complete()
+                self._refresh_train_dataset_advice()
                 continue
             if msg.startswith("__SAVE_ERROR__:"):
                 self.train_busy = False
@@ -5922,6 +6044,7 @@ class MainWindow(QMainWindow):
                 self.train_busy = False
                 self.train_poll_timer.stop()
                 self._set_train_ui_state(status_text="状態: 待機中")
+                self._refresh_train_dataset_advice()
                 continue
             if msg.startswith("__DEDUP_ERROR__:"):
                 self.train_busy = False
@@ -5952,6 +6075,7 @@ class MainWindow(QMainWindow):
                     )
                 self._set_train_ui_state(status_text=f"状態: 学習完了 ({elapsed}s)")
                 self._reset_train_progress_bar()
+                self._refresh_train_dataset_advice()
                 continue
             self._train_log(msg)
 
