@@ -84,12 +84,12 @@ from app.services.file_video import FileVideoSource, is_file_video_available
 _ANALYSIS_SCENE_CONFIRM_LABELS = tuple(c for c in SimpleTrainer.CLASSES if c != "none")
 # 初回起動時に確認モーダルを ON にするシーン
 _SCENE_CONFIRM_DEFAULT_ON = frozenset({"ready", "go", "fever", "timeup", "bonus", "coin", "result"})
+# いまは timeup 精度改善に集中するため解析中の fever 検知を止める（True で復帰）
+_ANALYSIS_FEVER_ENABLED = False
 # IN_GAME: 弱い fever は連続2サンプル（1サンプルだけの誤検知を出さない）
 _FEVER_WEAK_STREAK_REQUIRED = 2
 # go 画面を逃したとき、プレイ画面(none)が続いたら IN_GAME に入る（短すぎると go 未検知になる）
 _FEVER_INGAME_ENTRY_NONE_STREAK = 12
-# ready/go フェーズでは毎フレーム判定
-_PREGAME_SAMPLE_EVERY_MAX = 1
 # CNN: 2位以内で go のスコアがこれ未満なら go 候補（score = 1 - softmax）
 _CNN_GO_SCORE_MAX = 0.42
 # ready/go フェーズ専用（やや緩め: score=1-softmax、0.90 未満なら候補）
@@ -110,16 +110,22 @@ _PREGAME_HIT_NONE_GAP = 3
 _CNN_GO_MARGIN_MAX = 0.45
 # item 確定後の ready 探索（猶予は streak 用。WAIT_GO へ進むのは CNN ready のみ）
 _WAIT_READY_GRACE_SAMPLES = 60
+# ready/go: train/none 参照・セッション veto・いいえ後抑制は使わない（CNN 判定をそのまま使う）
+_PREGAME_READY_SUPPRESSION_ENABLED = False
 _SESSION_READY_NONE_VETO_MAX = 30
-_READY_REJECT_COOLDOWN_SAMPLES = 45
-# CNN: top1=ready でも none の score がこれ以内なら ready 扱いにしない（学習後も残る僅差誤検知用）
-_CNN_READY_NONE_MARGIN = 0.18
-# いいえで誤検知登録後は、明確な ready だけ再モーダル（score = 1 - softmax）
-_READY_STRONG_AFTER_REJECT_MAX = 0.28
+_CNN_READY_NONE_MARGIN = 0.08
+_READY_STRONG_AFTER_REJECT_MAX = 0.42
 # item 選択画面の crop キー（use_tsum は使用アイテムに含めない）
 _ITEM_SELECT_KEYS = ("score", "coin", "exp", "time", "bomb", "five_to_four", "combo")
 # 時間スキップ専用（解析フロー・シーン判定では使わない）
 _REQUIRED_TIMER_SKIP_CROP_KEY = "remaining_time"
+# 動画ツール下段ボタン action（解析トグル）
+_ANALYSIS_BUTTON_ACTION = "analyze"
+_TIME_EFFICIENCY_BUTTON_ACTION = "時間効率"
+# 時間効率: go 確定位置から動画をこの分だけ進めて timeup 付近へ（解析は継続）
+_TIME_EFFICIENCY_GO_SKIP_DELAY_MS = 60_000
+# 1 game = item 確定〜result 確定。ready/go/timeup/coin/result は各 game に 1 回のみ
+_ANALYSIS_TOGGLE_ACTIONS = frozenset({_ANALYSIS_BUTTON_ACTION, _TIME_EFFICIENCY_BUTTON_ACTION})
 # CNN: fever 候補（score = 1 - softmax、小さいほど fever らしい）
 _CNN_FEVER_SCORE_MAX = 0.62
 _CNN_FEVER_STRONG_SCORE_MAX = 0.38
@@ -160,9 +166,6 @@ _FEVER_NONE_GAP_ALLOW = 1
 _FEVER_REJECT_COOLDOWN_SAMPLES = 24
 # 同じフィーバー中に fever 回数を二重カウントしない間隔（表示用）
 _FEVER_COUNT_GAP_MS = 12_000
-# IN_GAME で timeup 候補が続いた回数で確定
-_TIMEUP_RAW_STREAK_REQUIRED = 5
-_TIMEUP_RAW_STREAK_REQUIRED_CNN = 2
 _CNN_TIMEUP_SCORE_MAX = 0.58
 _CNN_BONUS_SCORE_MAX = 0.58
 _CNN_COIN_SCORE_MAX = 0.58
@@ -284,6 +287,13 @@ def _item_select_keys_from(targets: list[str]) -> list[str]:
     """アイテム選択画面の7種（Score〜Combo）。use_tsum は除外。"""
     picked = {k for k in targets if k in _ITEM_SELECT_KEYS}
     return [k for k in _ITEM_SELECT_KEYS if k in picked]
+
+
+def _format_duration_min_sec(elapsed_sec: float) -> str:
+    """経過秒を 02分05秒 形式にする。"""
+    total = max(0, int(round(elapsed_sec)))
+    minutes, seconds = divmod(total, 60)
+    return f"{minutes:02d}分{seconds:02d}秒"
 
 
 class AspectFitVideoContainer(QWidget):
@@ -473,6 +483,8 @@ class MainWindow(QMainWindow):
             images_root=self.project_root / "app/assets/images",
         )
         self.analysis_running = False
+        self._analysis_profile = _ANALYSIS_BUTTON_ACTION
+        self._analysis_toggle_buttons = []
         self.analysis_warmup_until_ms = 0
         self.analysis_frame_seq = 0
         self._analysis_log_scroll_counter = 0
@@ -485,7 +497,6 @@ class MainWindow(QMainWindow):
         self._video_frame_size: Optional[tuple[int, int]] = None
         self.flow_phase = "WAIT_ITEM"
         self.flow_game_index = 1
-        self.timeup_confirm_count = 0
         self._fever_raw_streak = 0
         self._fever_none_gap_used = 0
         self._fever_reject_cooldown = 0
@@ -523,7 +534,6 @@ class MainWindow(QMainWindow):
         self.locked_item_targets: list[str] = []
         self.locked_use_tsum = "-"
         self.locked_item_fixed = False
-        self._pregame_sample_saved: Optional[int] = None
         self._ingame_sample_saved: Optional[int] = None
         self._pregame_ready_streak = 0
         self._pregame_go_streak = 0
@@ -533,8 +543,16 @@ class MainWindow(QMainWindow):
         self._pregame_go_pending = False
         self._pregame_ready_latched = False
         self._pregame_go_latched = False
+        self._game_active = False
         self._ready_confirmed_this_game = False
         self._go_confirmed_this_game = False
+        self._timeup_confirmed_this_game = False
+        self._coin_confirmed_this_game = False
+        self._coin_flow_latched = False
+        self._result_confirmed_this_game = False
+        self._go_clock_anchor_ms: Optional[int] = None
+        self._go_to_timeup_sec: Optional[float] = None
+        self._go_to_result_sec: Optional[float] = None
         self._ready_suppressed_this_game = False
         self._wait_ready_grace = 0
         self._item_scan_targets: set[str] = set()
@@ -597,6 +615,11 @@ class MainWindow(QMainWindow):
         self._cv_playback_rate = 1.0
         self.cv_play_timer = QTimer(self)
         self.cv_play_timer.timeout.connect(self._cv_timer_tick)
+        self._time_efficiency_skip_timer = QTimer(self)
+        self._time_efficiency_skip_timer.setSingleShot(True)
+        self._time_efficiency_skip_timer.timeout.connect(
+            self._on_time_efficiency_go_skip_timeout
+        )
         self._setup_menu()
         self._setup_status_bar()
         self._setup_central_widget()
@@ -700,7 +723,7 @@ class MainWindow(QMainWindow):
         footer_layout = QHBoxLayout(footer)
         footer_layout.setContentsMargins(0, 0, 16, 0)
         version_label = QLabel(
-            f"Version_001_2026_06_04  {self.os_name}  {self.compute_status}",
+            f"Version_002_2026_06_04  {self.os_name}  {self.compute_status}",
             footer,
         )
         version_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -1139,9 +1162,127 @@ class MainWindow(QMainWindow):
             feat, timeup_score=timeup_score
         )
 
-    def _confirm_timeup_detection(self) -> None:
-        self.flow_phase = "WAIT_BONUS"
-        self.timeup_confirm_count = 0
+    def _reset_per_game_scene_flags(self) -> None:
+        self._ready_confirmed_this_game = False
+        self._go_confirmed_this_game = False
+        self._timeup_confirmed_this_game = False
+        self._coin_confirmed_this_game = False
+        self._coin_flow_latched = False
+        self._result_confirmed_this_game = False
+        self._ready_suppressed_this_game = False
+        self._pregame_ready_pending = False
+        self._pregame_go_pending = False
+        self._pregame_ready_streak = 0
+        self._pregame_go_streak = 0
+        self._pregame_ready_none_gap = 0
+        self._pregame_go_none_gap = 0
+        self._pregame_ready_latched = False
+        self._pregame_go_latched = False
+        self._wait_ready_grace = 0
+        self._analysis_confirm_edge_key = ""
+        self._clear_analysis_confirm_edge_prefix("coin")
+        self._go_clock_anchor_ms = None
+        self._go_to_timeup_sec = None
+        self._go_to_result_sec = None
+        self._refresh_round_timing_label()
+
+    def _refresh_round_timing_label(self) -> None:
+        label = getattr(self, "counter_round_timing_label", None)
+        if label is None or not _is_alive_qobject(label):
+            return
+        if self._go_clock_anchor_ms is None:
+            label.setText("go→timeup -- / go→result --")
+            return
+        tu = (
+            _format_duration_min_sec(self._go_to_timeup_sec)
+            if self._go_to_timeup_sec is not None
+            else "--"
+        )
+        rs = (
+            _format_duration_min_sec(self._go_to_result_sec)
+            if self._go_to_result_sec is not None
+            else "--"
+        )
+        label.setText(f"go→timeup {tu} / go→result {rs}")
+
+    def _elapsed_sec_since_go(self, position_ms: int) -> Optional[float]:
+        if self._go_clock_anchor_ms is None:
+            return None
+        delta_ms = max(0, int(position_ms)) - int(self._go_clock_anchor_ms)
+        return delta_ms / 1000.0
+
+    def _start_go_round_clock(self, position_ms: int) -> None:
+        self._go_clock_anchor_ms = max(0, int(position_ms))
+        self._go_to_timeup_sec = None
+        self._go_to_result_sec = None
+        self._refresh_round_timing_label()
+        if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+            self.log_view.append(
+                f"G{self.flow_game_index} ラウンド計測開始: go "
+                f"{_format_duration_min_sec(self._go_clock_anchor_ms / 1000.0)}"
+            )
+
+    def _log_go_elapsed(self, event: str, position_ms: int, elapsed_sec: float) -> None:
+        if not hasattr(self, "log_view") or not _is_alive_qobject(self.log_view):
+            return
+        anchor_s = self._go_clock_anchor_ms / 1000.0 if self._go_clock_anchor_ms is not None else 0.0
+        pos_s = max(0, int(position_ms)) / 1000.0
+        self.log_view.append(
+            f"G{self.flow_game_index} go→{event}: {_format_duration_min_sec(elapsed_sec)} "
+            f"(go {_format_duration_min_sec(anchor_s)} → {event} {_format_duration_min_sec(pos_s)})"
+        )
+
+    def _begin_new_game_from_item(self) -> None:
+        self._reset_per_game_scene_flags()
+        self._game_active = True
+        self._clear_time_efficiency_go_skip_state()
+
+    def _scene_once_confirmed_this_game(self, scene_key: str) -> bool:
+        if scene_key == "ready":
+            return self._ready_confirmed_this_game
+        if scene_key == "go":
+            return self._go_confirmed_this_game
+        if scene_key == "timeup":
+            return self._timeup_confirmed_this_game
+        if scene_key == "coin":
+            return self._coin_confirmed_this_game
+        if scene_key == "result":
+            return self._result_confirmed_this_game
+        return False
+
+    def _can_detect_scene_once_per_game(self, scene_key: str, flow_phase: str) -> bool:
+        if scene_key in ("ready", "go", "timeup", "coin", "result") and not self._game_active:
+            return False
+        if self._scene_once_confirmed_this_game(scene_key):
+            return False
+        if scene_key == "ready":
+            return flow_phase in ("WAIT_READY", "WAIT_GO")
+        if scene_key == "go":
+            return flow_phase == "WAIT_GO" and self._ready_confirmed_this_game
+        if scene_key == "timeup":
+            return flow_phase == "IN_GAME"
+        if scene_key == "coin":
+            if self._coin_confirmed_this_game or self._coin_flow_latched:
+                return False
+            return flow_phase in ("WAIT_BONUS", "WAIT_COIN")
+        if scene_key == "result":
+            return flow_phase == "WAIT_RESULT"
+        return True
+
+    def _confirm_timeup_detection(self, position_ms: int = 0) -> None:
+        if self._timeup_confirmed_this_game:
+            return
+        self._timeup_confirmed_this_game = True
+        elapsed = self._elapsed_sec_since_go(position_ms)
+        if elapsed is not None:
+            self._go_to_timeup_sec = elapsed
+            self._log_go_elapsed("timeup", position_ms, elapsed)
+            self._refresh_round_timing_label()
+        if self._analysis_bonus_enabled():
+            self.flow_phase = "WAIT_BONUS"
+        else:
+            self.flow_phase = "WAIT_COIN"
+            self._reset_coin_gain_capture()
         self._reset_fever_latch()
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
             self.counter_analysis_state_label
@@ -1158,7 +1299,6 @@ class MainWindow(QMainWindow):
 
     def _reject_timeup_detection(self, frame_image=None, frame_index: int = -1) -> None:
         self.flow_phase = "IN_GAME"
-        self.timeup_confirm_count = 0
         self._timeup_reject_cooldown = _TIMEUP_REJECT_COOLDOWN_SAMPLES
         if frame_index >= 0:
             self._timeup_veto_frame_indices.add(int(frame_index))
@@ -1283,6 +1423,19 @@ class MainWindow(QMainWindow):
                 self._coin_gain_best = picked
         self._refresh_coin_gain_label()
 
+    def _log_coin_gain_capture(self, note: str = "") -> None:
+        if not hasattr(self, "log_view") or not _is_alive_qobject(self.log_view):
+            return
+        suffix = f" ({note})" if note else ""
+        if self._coin_gain_best is not None:
+            self.log_view.append(
+                f"獲得コイン: {self._coin_gain_best:,}{suffix} [{self._coin_gain_last_debug}]"
+            )
+        else:
+            self.log_view.append(
+                f"獲得コイン: 読み取れませんでした ({self._coin_gain_last_debug}){suffix}"
+            )
+
     def _confirm_bonus_detection(self) -> None:
         self.flow_phase = "WAIT_COIN"
         self._reset_coin_gain_capture()
@@ -1355,7 +1508,13 @@ class MainWindow(QMainWindow):
             feat, self._analysis_coin_none_veto, _NONE_VETO_SESSION_MAX
         )
 
-    def _confirm_coin_detection(self) -> None:
+    def _confirm_coin_detection(self, frame_image=None) -> None:
+        if self._coin_confirmed_this_game:
+            return
+        if frame_image is not None and not frame_image.isNull():
+            self._update_coin_gain_capture(frame_image)
+        self._coin_confirmed_this_game = True
+        self._log_coin_gain_capture("coin確定")
         self.flow_phase = "WAIT_RESULT"
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
             self.counter_analysis_state_label
@@ -1371,6 +1530,7 @@ class MainWindow(QMainWindow):
         self._clear_analysis_confirm_edge_prefix("coin")
 
     def _reject_coin_detection(self, frame_image=None, frame_index: int = -1) -> None:
+        self._coin_flow_latched = False
         self.flow_phase = "WAIT_COIN"
         self._coin_reject_cooldown = _COIN_REJECT_COOLDOWN_SAMPLES
         if frame_index >= 0:
@@ -1446,24 +1606,12 @@ class MainWindow(QMainWindow):
 
     def _advance_after_result_confirmed(self) -> None:
         self.flow_game_index += 1
+        self._game_active = False
         self.flow_phase = "WAIT_ITEM"
-        self.timeup_confirm_count = 0
         self.locked_item_targets = []
         self.locked_use_tsum = "-"
         self.locked_item_fixed = False
-        self._ready_confirmed_this_game = False
-        self._go_confirmed_this_game = False
-        self._ready_suppressed_this_game = False
-        self._pregame_ready_pending = False
-        self._pregame_go_pending = False
-        self._pregame_ready_streak = 0
-        self._pregame_go_streak = 0
-        self._pregame_ready_none_gap = 0
-        self._pregame_go_none_gap = 0
-        self._pregame_ready_latched = False
-        self._pregame_go_latched = False
-        self._wait_ready_grace = 0
-        self._analysis_confirm_edge_key = ""
+        self._reset_per_game_scene_flags()
         self._item_scan_targets = set()
         self._item_scene_active = False
         self._item_use_tsum_pending = "-"
@@ -1475,7 +1623,15 @@ class MainWindow(QMainWindow):
                 f"解析状態: G{self.flow_game_index} {self.flow_phase}"
             )
 
-    def _confirm_result_detection(self) -> None:
+    def _confirm_result_detection(self, position_ms: int = 0) -> None:
+        if self._result_confirmed_this_game:
+            return
+        elapsed = self._elapsed_sec_since_go(position_ms)
+        if elapsed is not None:
+            self._go_to_result_sec = elapsed
+            self._log_go_elapsed("result", position_ms, elapsed)
+            self._refresh_round_timing_label()
+        self._result_confirmed_this_game = True
         self._advance_after_result_confirmed()
 
     def _record_result_none_rejection(self, frame_image, frame_index: int) -> None:
@@ -1503,7 +1659,7 @@ class MainWindow(QMainWindow):
         """解析中の修正保存後、モデルを更新（CNN は学習タブで保存が必要）。"""
         if choice not in SimpleTrainer.CLASSES:
             return
-        if choice == "none" and frame_image is not None:
+        if choice == "none" and frame_image is not None and _PREGAME_READY_SUPPRESSION_ENABLED:
             self._append_none_veto_from_frame(frame_image)
             images_root = self.project_root / "app/assets/images"
             n_none = self.video_analyzer.scene_classifier.centroid.rebuild_none_veto_exemplars(
@@ -1519,7 +1675,7 @@ class MainWindow(QMainWindow):
             if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
                 self.log_view.append(
                     f"修正画像を保存しました（{choice}）。"
-                    "解析では train/none を参照して ready 誤検知を抑制します。"
+                    " 学習タブで学習→保存すると反映されます。"
                 )
             return
         if self._scene_refit_busy:
@@ -1579,6 +1735,8 @@ class MainWindow(QMainWindow):
             "counter_use_item_label",
             "counter_fever_count_label",
             "counter_skill_count_label",
+            "counter_coin_gain_label",
+            "counter_round_timing_label",
             "counter_analysis_state_label",
             "counter_progress_label",
         ):
@@ -1718,6 +1876,10 @@ class MainWindow(QMainWindow):
             for scene_key in _ANALYSIS_SCENE_CONFIRM_LABELS:
                 cb = QCheckBox(scene_key)
                 cb.setChecked(scene_key in _SCENE_CONFIRM_DEFAULT_ON)
+                if scene_key == "fever" and not _ANALYSIS_FEVER_ENABLED:
+                    cb.setChecked(False)
+                    cb.setEnabled(False)
+                    cb.setToolTip("現在 fever 検知は停止中（timeup 作業中）")
                 self.analysis_scene_confirm_checks[scene_key] = cb
                 confirm_layout.addWidget(cb)
             self.left_layout.addWidget(confirm_wrap)
@@ -1983,7 +2145,7 @@ class MainWindow(QMainWindow):
             if doc is not None and hasattr(doc, "setMaximumBlockCount"):
                 doc.setMaximumBlockCount(12000)
             self.counter_frame = QFrame()
-            self.counter_frame.setFixedHeight(88)
+            self.counter_frame.setFixedHeight(102)
             self.counter_frame.setStyleSheet("border: none; background: transparent;")
             counter_layout = QVBoxLayout(self.counter_frame)
             counter_layout.setContentsMargins(0, 0, 0, 0)
@@ -1993,6 +2155,7 @@ class MainWindow(QMainWindow):
             self.counter_fever_count_label = QLabel("fever回数: 0")
             self.counter_skill_count_label = QLabel("スキル回数: 0")
             self.counter_coin_gain_label = QLabel("獲得コイン: --")
+            self.counter_round_timing_label = QLabel("go→timeup -- / go→result --")
             self.counter_analysis_state_label = QLabel("解析状態: 停止")
             self.counter_progress_label = QLabel("進行: --")
             counter_layout.addWidget(self.counter_use_tsum_label)
@@ -2000,11 +2163,13 @@ class MainWindow(QMainWindow):
             counter_layout.addWidget(self.counter_fever_count_label)
             counter_layout.addWidget(self.counter_skill_count_label)
             counter_layout.addWidget(self.counter_coin_gain_label)
+            counter_layout.addWidget(self.counter_round_timing_label)
             counter_layout.addWidget(self.counter_analysis_state_label)
             counter_layout.addWidget(self.counter_progress_label)
             self.right_layout.addWidget(self.counter_frame)
             self.right_layout.addWidget(self.log_view, 1)
         if feature_id in (1, 2):
+            self._analysis_toggle_buttons = []
             self.player = QMediaPlayer(self)
             self.audio_output = QAudioOutput(self)
             self.player.setAudioOutput(self.audio_output)
@@ -2225,22 +2390,24 @@ class MainWindow(QMainWindow):
                     if feature_id == 1:
                         row_buttons = [
                             ("時間スキップ", "timer_skip"),
-                            ("解析", "analyze"),
-                            ("仮3", None),
+                            ("解析", _ANALYSIS_BUTTON_ACTION),
+                            ("時間効率", _TIME_EFFICIENCY_BUTTON_ACTION),
                             ("仮4", None),
                         ]
                     else:
                         row_buttons = [
                             ("時間スキップ", "timer_skip"),
                             ("仮2", None),
-                            ("仮3", None),
+                            ("時間効率", _TIME_EFFICIENCY_BUTTON_ACTION),
                             ("仮4", None),
                         ]
                     for label, action in row_buttons:
                         button = QPushButton(label, section)
                         button.setStyleSheet(analyze_row_button_style)
-                        if label == "解析":
+                        if action == _ANALYSIS_BUTTON_ACTION:
                             button.setFixedSize(88, 24)
+                        elif action == _TIME_EFFICIENCY_BUTTON_ACTION:
+                            button.setFixedSize(80, 24)
                         elif action == "timer_skip":
                             button.setFixedSize(80, 24)
                         else:
@@ -2253,10 +2420,20 @@ class MainWindow(QMainWindow):
                                 "item 行の time とは別です。"
                             )
                             button.clicked.connect(self._on_temp1_timer_skip_clicked)
-                        elif action == "analyze":
-                            self.analyze_button = button
-                            self.analyze_button.setText("解析開始")
-                            button.clicked.connect(self._on_analyze_clicked)
+                        elif action in _ANALYSIS_TOGGLE_ACTIONS:
+                            if action == _ANALYSIS_BUTTON_ACTION:
+                                self.analyze_button = button
+                            tip = "シーン解析を開始/停止します（解析ボタンと同じ）。"
+                            if action == _TIME_EFFICIENCY_BUTTON_ACTION:
+                                tip += (
+                                    " fever/bonus は検知しません。"
+                                    " go 確定位置から動画60秒先へ自動ジャンプします。"
+                                )
+                            button.setToolTip(tip)
+                            self._register_analysis_toggle_button(button, action)
+                            button.clicked.connect(
+                                lambda _checked=False, a=action: self._on_analyze_clicked(a)
+                            )
                         section_layout.addWidget(button)
                 bottom_layout.addWidget(section, 1)
 
@@ -2596,12 +2773,6 @@ class MainWindow(QMainWindow):
         self.cv_play_timer.setInterval(max(int(1000.0 / (fps * rate)), 1))
 
     def _analysis_sample_step(self) -> int:
-        if self._pregame_sample_saved is not None or self.flow_phase in (
-            "WAIT_ITEM",
-            "WAIT_READY",
-            "WAIT_GO",
-        ):
-            return 1
         step = max(1, self.video_analyzer.sample_every_frames)
         if self._analysis_light_mode():
             step *= 2
@@ -2720,8 +2891,7 @@ class MainWindow(QMainWindow):
             self.analysis_frame_seq = 0
             if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(self.counter_analysis_state_label):
                 self.counter_analysis_state_label.setText("解析状態: 完了")
-            if hasattr(self, "analyze_button") and _is_alive_qobject(self.analyze_button):
-                self.analyze_button.setText("解析開始")
+            self._sync_analysis_control_buttons(running=False)
             if hasattr(self, "log_view"):
                 self.log_view.append("解析完了: 動画終端に到達しました。")
         self._update_step_buttons_enabled()
@@ -2796,8 +2966,7 @@ class MainWindow(QMainWindow):
         self._reset_analysis_flow()
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(self.counter_analysis_state_label):
             self.counter_analysis_state_label.setText("解析状態: 停止")
-        if hasattr(self, "analyze_button") and _is_alive_qobject(self.analyze_button):
-            self.analyze_button.setText("解析開始")
+        self._sync_analysis_control_buttons(running=False)
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         if self.crop_playback_lock:
@@ -2820,8 +2989,7 @@ class MainWindow(QMainWindow):
                 self.analysis_frame_seq = 0
                 if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(self.counter_analysis_state_label):
                     self.counter_analysis_state_label.setText("解析状態: 停止")
-                if hasattr(self, "analyze_button") and _is_alive_qobject(self.analyze_button):
-                    self.analyze_button.setText("解析開始")
+                self._sync_analysis_control_buttons(running=False)
 
     def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
         if status != QMediaPlayer.MediaStatus.EndOfMedia:
@@ -2873,80 +3041,85 @@ class MainWindow(QMainWindow):
             return img
         return None
 
-    def _on_temp1_timer_skip_clicked(self) -> None:
+    def _append_timer_skip_log(self, message: str) -> None:
+        if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+            self.log_view.append(message)
+
+    def _run_timer_skip(
+        self,
+        *,
+        require_paused: bool = True,
+        show_progress: bool = True,
+        log_prefix: str = "",
+    ) -> bool:
         """残り時間を読み取り、動画内の同じ表示秒へジャンプする。"""
-        if self._is_player_playing():
-            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                self.log_view.append("スキップ: 一時停止してから実行してください。")
-            return
+        prefix = f"{log_prefix}: " if log_prefix else ""
+        if require_paused and self._is_player_playing():
+            self._append_timer_skip_log(f"{prefix}スキップ: 一時停止してから実行してください。")
+            return False
         if not opencv_available():
-            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                self.log_view.append("スキップ: opencv-python が必要です。")
-            return
+            self._append_timer_skip_log(f"{prefix}スキップ: opencv-python が必要です。")
+            return False
         if self.media_duration_ms <= 0 and not getattr(self, "use_opencv_for_video", False):
-            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                self.log_view.append("スキップ: 動画を開いてください。")
-            return
+            self._append_timer_skip_log(f"{prefix}スキップ: 動画を開いてください。")
+            return False
         if getattr(self, "use_opencv_for_video", False):
             if self.cv_source is None or not self.cv_source.is_open:
-                if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                    self.log_view.append("スキップ: 動画を開いてください。")
-                return
+                self._append_timer_skip_log(f"{prefix}スキップ: 動画を開いてください。")
+                return False
 
         frame = self.current_video_frame_image
         if frame is None or frame.isNull():
-            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                self.log_view.append("スキップ: 表示中のフレームがありません。")
-            return
+            self._append_timer_skip_log(f"{prefix}スキップ: 表示中のフレームがありません。")
+            return False
 
         positions = self.crop_positions_for_analysis or self._load_crop_positions()
         crop_key = _REQUIRED_TIMER_SKIP_CROP_KEY
         if not self._crop_rect_defined(positions, crop_key):
-            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                self.log_view.append(
-                    "スキップ: トリミング「残り時間」の保存が必須です。"
-                    " 動画ツールで IN_GAME の秒数表示（最大3桁）に合わせて保存してください。"
-                    "（item の time ではありません）"
-                )
-            return
+            self._append_timer_skip_log(
+                f"{prefix}スキップ: トリミング「残り時間」の保存が必須です。"
+                " 動画ツールで IN_GAME の秒数表示（最大3桁）に合わせて保存してください。"
+                "（item の time ではありません）"
+            )
+            return False
         roi = self._crop_frame_roi_from_positions(frame, positions, crop_key)
         if roi is None or roi.isNull():
-            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                self.log_view.append(
-                    "スキップ: トリミング「残り時間」から画像を切り出せませんでした。"
-                    " 範囲を保存し直してください。"
-                )
-            return
+            self._append_timer_skip_log(
+                f"{prefix}スキップ: トリミング「残り時間」から画像を切り出せませんでした。"
+                " 範囲を保存し直してください。"
+            )
+            return False
 
         target_sec, dbg = read_remaining_seconds(roi)
         if target_sec is None:
-            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                self.log_view.append(f"スキップ: 残り時間を読み取れませんでした ({dbg})")
-            return
+            self._append_timer_skip_log(f"{prefix}スキップ: 残り時間を読み取れませんでした ({dbg})")
+            return False
         if "n=1" in dbg and target_sec <= 9:
-            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                self.log_view.append(
-                    f"スキップ: 残り{target_sec}秒は信頼度が低いため中止しました（{dbg}）。"
-                    " 動画ツールで「残り時間」を秒数（最大3桁）がすべて入るよう合わせ直してください。"
-                )
-            return
+            self._append_timer_skip_log(
+                f"{prefix}スキップ: 残り{target_sec}秒は信頼度が低いため中止しました（{dbg}）。"
+                " 動画ツールで「残り時間」を秒数（最大3桁）がすべて入るよう合わせ直してください。"
+            )
+            return False
 
         start_ms = self._playback_position_ms()
         fps = max(float(self.estimated_fps or 30.0), 1.0)
         step_ms = max(200, int(1000.0 / fps))
         found_ms: Optional[int] = None
 
-        prog = QProgressDialog("残り時間のフレームを検索中…", "キャンセル", 0, 0, self)
-        prog.setWindowTitle("時間スキップ")
-        prog.setWindowModality(Qt.WindowModality.WindowModal)
-        prog.setMinimumDuration(0)
-        prog.setValue(0)
+        prog = None
+        if show_progress:
+            prog = QProgressDialog("残り時間のフレームを検索中…", "キャンセル", 0, 0, self)
+            prog.setWindowTitle("時間スキップ")
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            prog.setMinimumDuration(0)
+            prog.setValue(0)
 
         ms = start_ms
         while ms >= 0:
-            if prog.wasCanceled():
+            if prog is not None and prog.wasCanceled():
                 break
-            prog.setLabelText(f"検索中… {ms/1000:.1f}s / 残り{target_sec}秒")
+            if prog is not None:
+                prog.setLabelText(f"検索中… {ms/1000:.1f}s / 残り{target_sec}秒")
             QApplication.processEvents()
             img = self._read_frame_at_ms(ms)
             if img is not None and not img.isNull():
@@ -2957,21 +3130,22 @@ class MainWindow(QMainWindow):
                         found_ms = ms
                         break
             ms -= step_ms
-            prog.setValue(prog.value() + 1)
+            if prog is not None:
+                prog.setValue(prog.value() + 1)
 
-        prog.close()
+        if prog is not None:
+            prog.close()
 
         if found_ms is None:
-            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                self.log_view.append(
-                    f"スキップ: 残り{target_sec}秒のフレームが見つかりませんでした（{dbg}）。"
-                    " トリミング位置を確認してください。"
-                )
+            self._append_timer_skip_log(
+                f"{prefix}スキップ: 残り{target_sec}秒のフレームが見つかりませんでした（{dbg}）。"
+                " トリミング位置を確認してください。"
+            )
             if getattr(self, "use_opencv_for_video", False):
                 self._cv_seek_and_show(start_ms)
             else:
                 self.player.setPosition(start_ms)
-            return
+            return False
 
         if getattr(self, "use_opencv_for_video", False):
             self._cv_seek_and_show(found_ms)
@@ -2980,11 +3154,98 @@ class MainWindow(QMainWindow):
             for _ in range(6):
                 QApplication.processEvents()
 
-        if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-            self.log_view.append(
-                f"スキップ: 残り{target_sec}秒のフレームへジャンプ "
-                f"({found_ms/1000:.2f}s, {crop_key}, {dbg})"
+        self._append_timer_skip_log(
+            f"{prefix}スキップ: 残り{target_sec}秒のフレームへジャンプ "
+            f"({found_ms/1000:.2f}s, {crop_key}, {dbg})"
+        )
+        return True
+
+    def _on_temp1_timer_skip_clicked(self) -> None:
+        self._run_timer_skip()
+
+    def _clear_time_efficiency_go_skip_state(self) -> None:
+        self._time_efficiency_go_skip_pending = False
+        self._time_efficiency_go_skip_done = False
+        self._time_efficiency_go_skip_anchor_ms = 0
+        timer = getattr(self, "_time_efficiency_skip_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+
+    def _arm_time_efficiency_go_skip_timer(self, position_ms: int) -> None:
+        self._clear_time_efficiency_go_skip_state()
+        self._time_efficiency_go_skip_anchor_ms = max(0, int(position_ms))
+        self._time_efficiency_go_skip_pending = True
+        target_ms = self._time_efficiency_go_skip_target_ms()
+        self._time_efficiency_skip_timer.start(_TIME_EFFICIENCY_GO_SKIP_DELAY_MS)
+        self._append_timer_skip_log(
+            f"時間効率: go 確定位置 {self._time_efficiency_go_skip_anchor_ms}ms →"
+            f" 動画 {target_ms}ms へジャンプ予定（+{_TIME_EFFICIENCY_GO_SKIP_DELAY_MS // 1000}秒）"
+        )
+
+    def _time_efficiency_go_skip_target_ms(self) -> int:
+        anchor = max(0, int(getattr(self, "_time_efficiency_go_skip_anchor_ms", 0)))
+        target_ms = anchor + _TIME_EFFICIENCY_GO_SKIP_DELAY_MS
+        if self.media_duration_ms > 0:
+            target_ms = min(target_ms, max(0, self.media_duration_ms - 500))
+        return max(0, target_ms)
+
+    def _perform_time_efficiency_go_skip(self) -> None:
+        if not self.analysis_running:
+            return
+        if self._analysis_profile != _TIME_EFFICIENCY_BUTTON_ACTION:
+            return
+        if self.flow_phase != "IN_GAME":
+            self._append_timer_skip_log(
+                f"時間効率: ジャンプ中止（フェーズ={self.flow_phase}）"
             )
+            return
+        target_ms = self._time_efficiency_go_skip_target_ms()
+        current_ms = self._playback_position_ms()
+        if current_ms >= target_ms - 800:
+            self._append_timer_skip_log(
+                f"時間効率: ジャンプ不要（現在 {current_ms}ms は目標 {target_ms}ms 付近）"
+            )
+            return
+        self._append_timer_skip_log(
+            f"時間効率: go+{_TIME_EFFICIENCY_GO_SKIP_DELAY_MS // 1000}秒へジャンプ"
+            f" ({current_ms/1000:.2f}s → {target_ms/1000:.2f}s)"
+        )
+        if getattr(self, "use_opencv_for_video", False):
+            self._cv_seek_and_show(target_ms)
+        else:
+            self.player.setPosition(target_ms)
+            for _ in range(8):
+                QApplication.processEvents()
+        self.analysis_warmup_until_ms = target_ms + 500
+
+    def _maybe_time_efficiency_go_skip(self, position_ms: int) -> None:
+        if not getattr(self, "_time_efficiency_go_skip_pending", False):
+            return
+        if getattr(self, "_time_efficiency_go_skip_done", False):
+            return
+        if not self.analysis_running:
+            return
+        if self._analysis_profile != _TIME_EFFICIENCY_BUTTON_ACTION:
+            return
+        if self.flow_phase != "IN_GAME":
+            return
+        if position_ms < self._time_efficiency_go_skip_target_ms():
+            return
+        self._time_efficiency_go_skip_done = True
+        self._time_efficiency_go_skip_pending = False
+        timer = getattr(self, "_time_efficiency_skip_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+        self._perform_time_efficiency_go_skip()
+
+    def _on_time_efficiency_go_skip_timeout(self) -> None:
+        if getattr(self, "_time_efficiency_go_skip_done", False):
+            return
+        if not getattr(self, "_time_efficiency_go_skip_pending", False):
+            return
+        self._time_efficiency_go_skip_done = True
+        self._time_efficiency_go_skip_pending = False
+        self._perform_time_efficiency_go_skip()
 
     def _set_playback_rate(self, rate: float) -> None:
         self._cv_playback_rate = max(rate, 0.05)
@@ -2993,9 +3254,32 @@ class MainWindow(QMainWindow):
         elif self._cv_playing:
             self._sync_cv_timer_interval()
 
-    def _on_analyze_clicked(self) -> None:
+    def _register_analysis_toggle_button(self, button: QPushButton, action: str) -> None:
+        self._analysis_toggle_buttons.append((button, action))
+        self._sync_analysis_control_buttons(running=self.analysis_running)
+
+    def _analysis_fever_enabled(self) -> bool:
+        if self._analysis_profile == _TIME_EFFICIENCY_BUTTON_ACTION:
+            return False
+        return _ANALYSIS_FEVER_ENABLED
+
+    def _analysis_bonus_enabled(self) -> bool:
+        return self._analysis_profile != _TIME_EFFICIENCY_BUTTON_ACTION
+
+    def _sync_analysis_control_buttons(self, *, running: bool) -> None:
+        for btn, action in list(getattr(self, "_analysis_toggle_buttons", [])):
+            if not _is_alive_qobject(btn):
+                continue
+            if action == _ANALYSIS_BUTTON_ACTION:
+                btn.setText("解析停止" if running else "解析開始")
+            elif action == _TIME_EFFICIENCY_BUTTON_ACTION:
+                btn.setText("停止" if running else "時間効率")
+
+    def _on_analyze_clicked(self, profile: str = _ANALYSIS_BUTTON_ACTION) -> None:
         if self.analysis_running:
             self.analysis_running = False
+            self._clear_time_efficiency_go_skip_state()
+            self._analysis_profile = _ANALYSIS_BUTTON_ACTION
             self.analysis_warmup_until_ms = 0
             self.analysis_frame_seq = 0
             self._reset_analysis_flow()
@@ -3005,8 +3289,7 @@ class MainWindow(QMainWindow):
                 self.player.pause()
             if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(self.counter_analysis_state_label):
                 self.counter_analysis_state_label.setText("解析状態: 停止")
-            if hasattr(self, "analyze_button") and _is_alive_qobject(self.analyze_button):
-                self.analyze_button.setText("解析開始")
+            self._sync_analysis_control_buttons(running=False)
             if hasattr(self, "log_view"):
                 self.log_view.append("解析停止。")
             return
@@ -3028,8 +3311,12 @@ class MainWindow(QMainWindow):
                 self.trainer.scene_model.fever_calib,
             )
         self.video_analyzer.reset()
+        self._analysis_profile = profile
         images_root = self.project_root / "app/assets/images"
-        if self.video_analyzer.scene_classifier.model is not None:
+        if (
+            _PREGAME_READY_SUPPRESSION_ENABLED
+            and self.video_analyzer.scene_classifier.model is not None
+        ):
             n_none = self.video_analyzer.scene_classifier.model.rebuild_none_veto_exemplars(
                 images_root
             )
@@ -3045,14 +3332,12 @@ class MainWindow(QMainWindow):
         self._analysis_last_logged_scene = ""
         self._analysis_progress_ui_last_ms = 0
         self._reset_analysis_flow()
-        self._boost_analysis_sampling_for_pregame()
         self._last_fever_blocked_log = None
         self._ingame_entered_logged = False
         self._log_analysis_model_diagnostics()
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(self.counter_analysis_state_label):
             self.counter_analysis_state_label.setText("解析状態: 実行中")
-        if hasattr(self, "analyze_button") and _is_alive_qobject(self.analyze_button):
-            self.analyze_button.setText("解析停止")
+        self._sync_analysis_control_buttons(running=True)
         if hasattr(self, "start_from_zero_check") and self.start_from_zero_check.isChecked():
             if getattr(self, "use_opencv_for_video", False):
                 self._cv_seek_and_show(0)
@@ -3071,16 +3356,23 @@ class MainWindow(QMainWindow):
             if hasattr(self, "counter_use_item_label"):
                 self.counter_use_item_label.setText("使用アイテム: --")
             light = self._analysis_light_mode()
-            pregame_note = (
-                " item〜go は毎フレーム判定"
-                if self._pregame_sample_saved is not None
-                else ""
-            )
             self.log_view.append(
                 f"解析開始: {self.video_analyzer.sample_every_frames}フレームごとに判定します。"
                 f" 軽量={'ON' if light else 'OFF'} model={self.video_analyzer.active_model_version}"
-                f"{pregame_note}"
             )
+            self.log_view.append(
+                "1game: item→result / ready・go・timeup・coin・result は各1回"
+            )
+            if self._analysis_profile == _TIME_EFFICIENCY_BUTTON_ACTION:
+                self.log_view.append("時間効率モード: fever/bonus 検知 OFF（timeup 優先）")
+                self.log_view.append(
+                    f"時間効率: go 確定位置から動画 +{_TIME_EFFICIENCY_GO_SKIP_DELAY_MS // 1000}秒へ"
+                    " 自動ジャンプ（解析継続）"
+                )
+            elif not self._analysis_fever_enabled():
+                self.log_view.append(
+                    "fever検知: OFF（timeup 精度改善作業中。復帰は _ANALYSIS_FEVER_ENABLED）"
+                )
             self.log_view.append(
                 f"scene_model: {self.video_analyzer.scene_model_path}"
             )
@@ -3190,8 +3482,8 @@ class MainWindow(QMainWindow):
         self._fever_confirm_streak = 0
         self._fever_clear_streak = 0
 
-    @staticmethod
     def _scene_for_confirm_dialog(
+        self,
         scene_label: str,
         raw_scene: str,
         *,
@@ -3211,31 +3503,45 @@ class MainWindow(QMainWindow):
                 return "none"
             if scene_label == "go" and go_locked:
                 return "none"
+            if scene_label == "timeup" and self._timeup_confirmed_this_game:
+                return "none"
+            if scene_label == "result" and self._result_confirmed_this_game:
+                return "none"
+            if scene_label == "coin" and self._coin_confirmed_this_game:
+                return "none"
+            if scene_label == "fever" and not self._analysis_fever_enabled():
+                return "none"
+            if scene_label == "bonus" and not self._analysis_bonus_enabled():
+                return "none"
             return scene_label
         # 生ラベルはフェーズに応じて制限（WAIT_ITEM中の bonus/raw などを防ぐ）
         if raw_scene == "item" and flow_phase == "WAIT_ITEM":
             return raw_scene
-        if not ready_locked:
-            if raw_scene == "ready" and flow_phase in ("WAIT_ITEM", "WAIT_READY"):
+        if not ready_locked and self._can_detect_scene_once_per_game("ready", flow_phase):
+            if raw_scene == "ready" and flow_phase in ("WAIT_READY", "WAIT_GO"):
                 return raw_scene
-            if flow_phase in ("WAIT_ITEM", "WAIT_READY") and ready_hit:
+            if flow_phase == "WAIT_READY" and ready_hit:
                 return "ready"
-        if not go_locked:
+        if not go_locked and self._can_detect_scene_once_per_game("go", flow_phase):
             if raw_scene == "go" and flow_phase == "WAIT_GO" and ready_confirmed:
                 return raw_scene
             if flow_phase == "WAIT_GO" and ready_confirmed and go_hit:
                 return "go"
-        if raw_scene == "fever" and flow_phase == "IN_GAME":
+        if raw_scene == "fever" and flow_phase == "IN_GAME" and self._analysis_fever_enabled():
             return raw_scene
-        if raw_scene == "timeup" and flow_phase == "IN_GAME":
+        if self._can_detect_scene_once_per_game("timeup", flow_phase) and raw_scene == "timeup":
             return raw_scene
-        if raw_scene == "bonus" and flow_phase == "WAIT_BONUS":
+        if raw_scene == "bonus" and flow_phase == "WAIT_BONUS" and self._analysis_bonus_enabled():
             return raw_scene
-        if raw_scene == "coin" and flow_phase in ("WAIT_BONUS", "WAIT_COIN"):
+        if self._can_detect_scene_once_per_game("coin", flow_phase) and raw_scene == "coin":
             return raw_scene
-        if raw_scene == "result" and flow_phase == "WAIT_RESULT":
+        if self._can_detect_scene_once_per_game("result", flow_phase) and raw_scene == "result":
             return raw_scene
-        if flow_phase == "IN_GAME" and (fever_hit or raw_scene == "fever"):
+        if (
+            flow_phase == "IN_GAME"
+            and self._analysis_fever_enabled()
+            and (fever_hit or raw_scene == "fever")
+        ):
             return "fever"
         return scene_label
 
@@ -3289,7 +3595,13 @@ class MainWindow(QMainWindow):
         self._reset_fever_latch()
         use_cnn = self.video_analyzer.scene_classifier.uses_cnn()
         self._in_game_fever_warmup = (
-            _FEVER_IN_GAME_WARMUP_SAMPLES_CNN if use_cnn else _FEVER_IN_GAME_WARMUP_SAMPLES
+            0
+            if not self._analysis_fever_enabled()
+            else (
+                _FEVER_IN_GAME_WARMUP_SAMPLES_CNN
+                if use_cnn
+                else _FEVER_IN_GAME_WARMUP_SAMPLES
+            )
         )
         self._ingame_entered_logged = True
         self._ingame_go_grace = _INGAME_GO_GRACE_SAMPLES
@@ -3297,21 +3609,10 @@ class MainWindow(QMainWindow):
         if use_cnn:
             self._boost_analysis_sampling_for_ingame()
 
-    def _boost_analysis_sampling_for_pregame(self) -> None:
-        if self._pregame_sample_saved is not None:
-            return
-        self._pregame_sample_saved = self.video_analyzer.sample_every_frames
-        self.video_analyzer.sample_every_frames = max(
-            1, min(_PREGAME_SAMPLE_EVERY_MAX, self._pregame_sample_saved)
-        )
-
     def _restore_analysis_sampling(self) -> None:
         if self._ingame_sample_saved is not None:
             self.video_analyzer.sample_every_frames = self._ingame_sample_saved
             self._ingame_sample_saved = None
-        if self._pregame_sample_saved is not None:
-            self.video_analyzer.sample_every_frames = self._pregame_sample_saved
-            self._pregame_sample_saved = None
 
     def _boost_analysis_sampling_for_ingame(self) -> None:
         if self._ingame_sample_saved is not None:
@@ -3417,14 +3718,6 @@ class MainWindow(QMainWindow):
         frame_image=None,
         scene_feature=None,
     ) -> str:
-        if (
-            target == "ready"
-            and use_cnn
-            and self._ready_blocked_by_session_veto(
-                frame_image, scene_feature, ranked=ranked
-            )
-        ):
-            return "none"
         if use_cnn:
             return self._pregame_cnn_hit_strength(raw_scene, ranked, target=target)
         if raw_scene == target:
@@ -3453,6 +3746,10 @@ class MainWindow(QMainWindow):
         return streak
 
     def _analysis_scene_confirm_enabled(self, scene_key: str) -> bool:
+        if scene_key == "fever" and not self._analysis_fever_enabled():
+            return False
+        if scene_key == "bonus" and not self._analysis_bonus_enabled():
+            return False
         checks = getattr(self, "analysis_scene_confirm_checks", None)
         if not isinstance(checks, dict):
             return False
@@ -3467,7 +3764,10 @@ class MainWindow(QMainWindow):
                 f"解析状態: G{self.flow_game_index} {self.flow_phase}"
             )
 
-    def _confirm_pregame_ready(self) -> None:
+    def _confirm_pregame_ready(self, position_ms: int = 0, frame_index: int = -1) -> None:
+        if self._ready_confirmed_this_game:
+            return
+        self._log_pregame_scene_detect("ready", position_ms, frame_index, " 確定")
         self.flow_phase = "WAIT_GO"
         self._ready_confirmed_this_game = True
         self._ready_suppressed_this_game = False
@@ -3480,7 +3780,6 @@ class MainWindow(QMainWindow):
         self._pregame_go_streak = 0
         self._pregame_go_none_gap = 0
         self._ingame_entry_none_streak = 0
-        self._boost_analysis_sampling_for_pregame()
         self._refresh_flow_phase_label()
         if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
             self.log_view.append("フロー: WAIT_READY → WAIT_GO")
@@ -3499,17 +3798,24 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _ready_cnn_none_ranked_blocks(ranked: list | None) -> bool:
-        if not ranked or ranked[0][0] != "ready":
+        if not _PREGAME_READY_SUPPRESSION_ENABLED or not ranked or ranked[0][0] != "ready":
+            return False
+        ready_sc = float(ranked[0][1])
+        # top1=ready かつスコアが十分低い（自信あり）なら none 僅差では止めない
+        if ready_sc < _CNN_READY_DETECT_MAX:
             return False
         if len(ranked) >= 2 and ranked[1][0] == "none":
-            return True
-        ready_sc = float(ranked[0][1])
+            none_sc = float(ranked[1][1])
+            if none_sc <= ready_sc + _CNN_READY_NONE_MARGIN:
+                return True
         none_sc = next((float(s) for c, s in ranked if c == "none"), None)
         if none_sc is not None and none_sc <= ready_sc + _CNN_READY_NONE_MARGIN:
             return True
         return False
 
     def _ready_is_strong_cnn(self, ranked: list | None) -> bool:
+        if not _PREGAME_READY_SUPPRESSION_ENABLED:
+            return True
         if not ranked or ranked[0][0] != "ready":
             return False
         return float(ranked[0][1]) < _READY_STRONG_AFTER_REJECT_MAX
@@ -3523,18 +3829,19 @@ class MainWindow(QMainWindow):
         *,
         use_scene_cnn: bool,
     ) -> str:
-        """CNN が ready でも train/none・僅差ならフロー上は none 扱い（学習反映後も誤モーダル防止）。"""
-        if not use_scene_cnn or raw_scene != "ready":
-            return raw_scene
-        if self._ready_blocked_by_session_veto(
-            frame_image, scene_feature, ranked=ranked
-        ):
-            return "none"
         return raw_scene
 
     def _ready_blocked_by_session_veto(
         self, frame_image, scene_feature=None, ranked: list | None = None
     ) -> bool:
+        if not _PREGAME_READY_SUPPRESSION_ENABLED:
+            return False
+        if (
+            ranked
+            and ranked[0][0] == "ready"
+            and float(ranked[0][1]) < _CNN_READY_DETECT_MAX
+        ):
+            return False
         if self._ready_cnn_none_ranked_blocks(ranked):
             return True
         feat = scene_feature
@@ -3564,12 +3871,13 @@ class MainWindow(QMainWindow):
         return False
 
     def _record_ready_rejection(self, frame_image=None, frame_index: int = -1) -> None:
-        if frame_index >= 0:
-            self._ready_veto_frame_indices.add(int(frame_index))
-        if frame_image is not None and not frame_image.isNull():
-            self._append_session_ready_none_veto(frame_image)
-        self._ready_suppressed_this_game = True
-        self._pregame_ready_reject_cooldown = _READY_REJECT_COOLDOWN_SAMPLES
+        if _PREGAME_READY_SUPPRESSION_ENABLED:
+            if frame_index >= 0:
+                self._ready_veto_frame_indices.add(int(frame_index))
+            if frame_image is not None and not frame_image.isNull():
+                self._append_session_ready_none_veto(frame_image)
+            self._ready_suppressed_this_game = True
+            self._pregame_ready_reject_cooldown = 45
 
     def _reject_pregame_ready(self, frame_image=None, frame_index: int = -1) -> None:
         self._record_ready_rejection(frame_image, frame_index)
@@ -3584,10 +3892,12 @@ class MainWindow(QMainWindow):
             self._analysis_last_logged_scene = "none"
         self._refresh_flow_phase_label()
 
-    def _confirm_pregame_go(self) -> None:
-        if not self._ready_confirmed_this_game:
+    def _confirm_pregame_go(self, position_ms: int = 0, frame_index: int = -1) -> None:
+        if not self._ready_confirmed_this_game or self._go_confirmed_this_game:
             return
+        self._log_pregame_scene_detect("go", position_ms, frame_index, " 確定")
         self._go_confirmed_this_game = True
+        self._start_go_round_clock(position_ms)
         self._pregame_go_pending = False
         self._pregame_go_latched = False
         self._pregame_go_streak = 0
@@ -3597,6 +3907,11 @@ class MainWindow(QMainWindow):
         self._refresh_flow_phase_label()
         if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
             self.log_view.append("フロー: WAIT_GO → IN_GAME")
+        if (
+            self.analysis_running
+            and self._analysis_profile == _TIME_EFFICIENCY_BUTTON_ACTION
+        ):
+            self._arm_time_efficiency_go_skip_timer(position_ms)
 
     def _reject_pregame_go(self) -> None:
         self._clear_analysis_confirm_edge_prefix("go")
@@ -4129,6 +4444,7 @@ class MainWindow(QMainWindow):
     def _run_analysis_step(self, position_ms: int, frame_image) -> None:
         if position_ms < self.analysis_warmup_until_ms:
             return
+        self._maybe_time_efficiency_go_skip(position_ms)
         # crop_positions は解析開始時に読み込み済み（毎フレームの disk I/O を避ける）
         selected_tsum = "auto"
         if hasattr(self, "item_tsum_combo") and _is_alive_qobject(self.item_tsum_combo):
@@ -4164,7 +4480,11 @@ class MainWindow(QMainWindow):
             elif not use_scene_cnn and scene_feature and len(scene_feature) > 0:
                 ranked = scene_model.ranked_from_feature(scene_feature)
             fever_top1 = False
-            if use_scene_cnn:
+            if not self._analysis_fever_enabled():
+                fever_hit = False
+                fever_strong_hit = False
+                fever_raw = raw_scene
+            elif use_scene_cnn:
                 fever_top1 = bool(ranked) and ranked[0][0] == "fever"
                 fever_detected = self._fever_cnn_top1_detected(ranked)
                 fever_hit = fever_detected
@@ -4239,12 +4559,6 @@ class MainWindow(QMainWindow):
                     target="ready",
                     margin_max=_CNN_READY_MARGIN_MAX,
                 )
-                if (
-                    self._ready_suppressed_this_game
-                    and use_scene_cnn
-                    and not self._ready_is_strong_cnn(ranked)
-                ):
-                    ready_hit_pre = False
             timeup_hit_pre = self._scene_likely_class(
                 raw_scene,
                 ranked,
@@ -4348,7 +4662,12 @@ class MainWindow(QMainWindow):
                 )
                 item_debug = "item_lock:ON"
             result.scene_label = scene_label
-            if self.flow_phase == "WAIT_COIN" and frame_image is not None and not frame_image.isNull():
+            if (
+                not self._coin_confirmed_this_game
+                and frame_image is not None
+                and not frame_image.isNull()
+                and scene_label == "coin"
+            ):
                 self._update_coin_gain_capture(frame_image)
             skill_tsum_dir = (
                 self._resolve_tsum_dir(self.locked_use_tsum) if self.locked_item_fixed else use_tsum_dir
@@ -4410,13 +4729,6 @@ class MainWindow(QMainWindow):
                 )
             ):
                 confirm_label = scene_label
-            if confirm_label == "ready" and (
-                (result.frame_index >= 0 and self._ready_frame_vetoed(result.frame_index))
-                or self._ready_blocked_by_session_veto(
-                    frame_image, scene_feature, ranked=ranked
-                )
-            ):
-                confirm_label = scene_label if scene_label != "ready" else "none"
             if confirm_label == "timeup" and (
                 self._timeup_frame_vetoed(result.frame_index)
                 or self._timeup_blocked_by_session_veto(
@@ -4448,11 +4760,23 @@ class MainWindow(QMainWindow):
             )
             if scene_label == "ready" and self._ready_confirmed_this_game:
                 scene_label = "none"
-            elif scene_label == "ready" and self.flow_phase not in ("WAIT_ITEM", "WAIT_READY"):
+            elif scene_label == "ready" and self.flow_phase not in ("WAIT_READY", "WAIT_GO"):
                 scene_label = "none"
             elif scene_label == "go" and self._go_confirmed_this_game:
                 scene_label = "none"
             elif scene_label == "go" and self.flow_phase not in ("WAIT_GO", "IN_GAME"):
+                scene_label = "none"
+            elif scene_label == "timeup" and self._timeup_confirmed_this_game:
+                scene_label = "none"
+            elif scene_label == "timeup" and self.flow_phase != "IN_GAME":
+                scene_label = "none"
+            elif scene_label == "result" and self._result_confirmed_this_game:
+                scene_label = "none"
+            elif scene_label == "result" and self.flow_phase != "WAIT_RESULT":
+                scene_label = "none"
+            elif scene_label == "coin" and self._coin_confirmed_this_game:
+                scene_label = "none"
+            elif scene_label == "coin" and self.flow_phase not in ("WAIT_BONUS", "WAIT_COIN"):
                 scene_label = "none"
             elif scene_label == "fever" and self._fever_frame_vetoed(result.frame_index):
                 scene_label = "none"
@@ -4461,8 +4785,6 @@ class MainWindow(QMainWindow):
                 and scene_label != "fever"
             ):
                 self._clear_analysis_confirm_edge_prefix("fever")
-            elif scene_label == "timeup" and self.flow_phase not in ("IN_GAME", "WAIT_BONUS"):
-                scene_label = "none"
             elif scene_label == "timeup" and self._timeup_frame_vetoed(result.frame_index):
                 scene_label = "none"
             elif scene_label == "bonus" and self.flow_phase not in (
@@ -4472,12 +4794,6 @@ class MainWindow(QMainWindow):
             ):
                 scene_label = "none"
             elif scene_label == "bonus" and self._bonus_frame_vetoed(result.frame_index):
-                scene_label = "none"
-            elif scene_label == "coin" and self.flow_phase not in (
-                "WAIT_BONUS",
-                "WAIT_COIN",
-                "WAIT_RESULT",
-            ):
                 scene_label = "none"
             elif scene_label == "coin" and self._coin_frame_vetoed(result.frame_index):
                 scene_label = "none"
@@ -4555,7 +4871,6 @@ class MainWindow(QMainWindow):
                     ambiguous = self._timeup_cnn_ambiguous_with_none(ranked)
                     self.log_view.append(
                         f"  timeup_veto: blocked={blocked} ambiguous_none={ambiguous} "
-                        f"streak={self.timeup_confirm_count}/{_TIMEUP_RAW_STREAK_REQUIRED_CNN} "
                         f"cooldown={self._timeup_reject_cooldown}"
                     )
             if (
@@ -4578,6 +4893,8 @@ class MainWindow(QMainWindow):
             if (
                 use_scene_cnn
                 and self.flow_phase == "WAIT_COIN"
+                and not self._coin_confirmed_this_game
+                and not self._coin_flow_latched
                 and ranked
                 and hasattr(self, "log_view")
                 and _is_alive_qobject(self.log_view)
@@ -4653,8 +4970,7 @@ class MainWindow(QMainWindow):
                     self.player.pause()
                 if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(self.counter_analysis_state_label):
                     self.counter_analysis_state_label.setText("解析状態: 完了(timeup)")
-                if hasattr(self, "analyze_button") and _is_alive_qobject(self.analyze_button):
-                    self.analyze_button.setText("解析開始")
+                self._sync_analysis_control_buttons(running=False)
                 if hasattr(self, "log_view"):
                     self.log_view.append("解析完了: timeupを検知したため停止しました。")
                 break
@@ -4662,9 +4978,9 @@ class MainWindow(QMainWindow):
                 self._timeup_stop_seen = 0
 
     def _reset_analysis_flow(self) -> None:
+        self._clear_time_efficiency_go_skip_state()
         self.flow_phase = "WAIT_ITEM"
         self.flow_game_index = 1
-        self.timeup_confirm_count = 0
         self._fever_raw_streak = 0
         self._fever_none_gap_used = 0
         self._fever_reject_cooldown = 0
@@ -4703,10 +5019,8 @@ class MainWindow(QMainWindow):
         self._pregame_go_pending = False
         self._pregame_ready_latched = False
         self._pregame_go_latched = False
-        self._ready_confirmed_this_game = False
-        self._go_confirmed_this_game = False
-        self._ready_suppressed_this_game = False
-        self._wait_ready_grace = 0
+        self._game_active = False
+        self._reset_per_game_scene_flags()
         self._item_scan_targets = set()
         self._item_scene_active = False
         self._item_use_tsum_pending = "-"
@@ -4819,9 +5133,6 @@ class MainWindow(QMainWindow):
             raw_scene, ranked, use_cnn=use_scene_cnn, target="result", cnn_max_score=_CNN_RESULT_SCORE_MAX
         )
         timeup_signal = raw_scene == "timeup" or timeup_hit
-        timeup_streak_required = (
-            _TIMEUP_RAW_STREAK_REQUIRED_CNN if fever_simple else _TIMEUP_RAW_STREAK_REQUIRED
-        )
         if phase == "WAIT_ITEM":
             if raw_scene == "item":
                 scene = "item"
@@ -4831,54 +5142,28 @@ class MainWindow(QMainWindow):
                 self._item_scene_active and raw_scene in ("ready", "go")
             )
             if advance_pregame:
+                self._begin_new_game_from_item()
                 self.flow_phase = "WAIT_READY"
                 self._wait_ready_grace = _WAIT_READY_GRACE_SAMPLES
-                self._boost_analysis_sampling_for_pregame()
                 phase = "WAIT_READY"
                 if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
                     self.log_view.append(
-                        f"フロー: WAIT_ITEM → WAIT_READY (raw={raw_scene})"
+                        f"フロー: G{self.flow_game_index} WAIT_ITEM → WAIT_READY (raw={raw_scene})"
                     )
 
-        if phase == "WAIT_READY" and not self._ready_confirmed_this_game:
-            if self._pregame_ready_reject_cooldown > 0:
-                self._pregame_ready_reject_cooldown -= 1
-            if self._ready_frame_vetoed(frame_index):
-                ready_hit_frame = False
-                ready_strength = "none"
-            elif self._ready_blocked_by_session_veto(
-                frame_image, scene_feature, ranked=ranked
-            ):
-                ready_hit_frame = False
-                ready_strength = "none"
-                self._pregame_ready_latched = False
-                self._pregame_ready_pending = False
-            else:
-                if self._wait_ready_grace > 0:
-                    self._wait_ready_grace -= 1
-                ready_strength = self._pregame_hit_strength(
-                    raw_scene,
-                    ranked,
-                    use_cnn=use_scene_cnn,
-                    target="ready",
-                    margin_max=_CNN_READY_MARGIN_MAX,
-                    frame_image=frame_image,
-                    scene_feature=scene_feature,
-                )
-                ready_hit_frame = ready_strength != "none"
-            if self._pregame_ready_reject_cooldown > 0 and ready_hit_frame:
-                ready_hit_frame = False
-                ready_strength = "none"
-            if (
-                self._ready_suppressed_this_game
-                and use_scene_cnn
-                and not self._ready_is_strong_cnn(ranked)
-            ):
-                ready_hit_frame = False
-                ready_strength = "none"
-            elif self._ready_suppressed_this_game and ready_strength != "strong":
-                ready_hit_frame = False
-                ready_strength = "none"
+        if phase == "WAIT_READY" and self._can_detect_scene_once_per_game("ready", phase):
+            if self._wait_ready_grace > 0:
+                self._wait_ready_grace -= 1
+            ready_strength = self._pregame_hit_strength(
+                raw_scene,
+                ranked,
+                use_cnn=use_scene_cnn,
+                target="ready",
+                margin_max=_CNN_READY_MARGIN_MAX,
+                frame_image=frame_image,
+                scene_feature=scene_feature,
+            )
+            ready_hit_frame = ready_strength != "none"
             if ready_hit_frame:
                 self._pregame_ready_pending = True
             self._pregame_ready_streak = self._bump_pregame_streak(
@@ -4907,24 +5192,19 @@ class MainWindow(QMainWindow):
                 scene = "ready"
                 self._pregame_ready_latched = True
                 if not self._analysis_scene_confirm_enabled("ready"):
-                    self._confirm_pregame_ready()
-                elif newly_latched and hasattr(self, "log_view") and _is_alive_qobject(
-                    self.log_view
-                ):
-                    self.log_view.append(
-                        f"  ready候補: strength={ready_strength} streak={self._pregame_ready_streak}"
-                        " → 確認モーダルで「はい」を押すと go へ進みます"
+                    self._confirm_pregame_ready(position_ms, frame_index)
+                elif newly_latched:
+                    self._log_pregame_scene_detect(
+                        "ready",
+                        position_ms,
+                        frame_index,
+                        f" strength={ready_strength} streak={self._pregame_ready_streak}"
+                        " → 確認モーダルで「はい」を押すと go へ進みます",
                     )
-            elif (
-                self._pregame_ready_latched
-                and not self._ready_confirmed_this_game
-                and not self._ready_blocked_by_session_veto(
-                    frame_image, scene_feature, ranked=ranked
-                )
-            ):
+            elif self._pregame_ready_latched and not self._ready_confirmed_this_game:
                 scene = "ready"
         elif phase == "WAIT_GO":
-            if not self._ready_confirmed_this_game:
+            if self._can_detect_scene_once_per_game("ready", phase):
                 late_ready = self._pregame_hit_strength(
                     raw_scene,
                     ranked,
@@ -4946,8 +5226,8 @@ class MainWindow(QMainWindow):
                 if self._pregame_ready_pending and self._pregame_ready_streak >= 1:
                     scene = "ready"
                     if not self._analysis_scene_confirm_enabled("ready"):
-                        self._confirm_pregame_ready()
-            if not self._go_confirmed_this_game:
+                        self._confirm_pregame_ready(position_ms, frame_index)
+            if self._can_detect_scene_once_per_game("go", phase):
                 go_strength = self._pregame_hit_strength(
                     raw_scene,
                     ranked,
@@ -4984,13 +5264,14 @@ class MainWindow(QMainWindow):
                     scene = "go"
                     self._pregame_go_latched = True
                     if not self._analysis_scene_confirm_enabled("go"):
-                        self._confirm_pregame_go()
-                    elif newly_latched and hasattr(self, "log_view") and _is_alive_qobject(
-                        self.log_view
-                    ):
-                        self.log_view.append(
-                            f"  go候補: strength={go_strength} streak={self._pregame_go_streak}"
-                            " → 確認モーダルで「はい」を押すと IN_GAME へ"
+                        self._confirm_pregame_go(position_ms, frame_index)
+                    elif newly_latched:
+                        self._log_pregame_scene_detect(
+                            "go",
+                            position_ms,
+                            frame_index,
+                            f" strength={go_strength} streak={self._pregame_go_streak}"
+                            " → 確認モーダルで「はい」を押すと IN_GAME へ",
                         )
                     self._ingame_entry_none_streak = 0
                 elif (
@@ -5010,15 +5291,16 @@ class MainWindow(QMainWindow):
                     self._ingame_entry_none_streak = min(self._ingame_entry_none_streak + 1, 30)
                     if self._ingame_entry_none_streak >= _FEVER_INGAME_ENTRY_NONE_STREAK:
                         if not self._analysis_scene_confirm_enabled("go"):
-                            self._confirm_pregame_go()
+                            self._confirm_pregame_go(position_ms, frame_index)
                         elif not self._pregame_go_latched:
                             scene = "go"
                             self._pregame_go_latched = True
-                            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                                self.log_view.append(
-                                    "  go未検知: ready 確定後に go 画面が取りこぼされた可能性"
-                                    " → 確認モーダルで「はい」を押すと IN_GAME へ"
-                                )
+                            self._log_pregame_scene_detect(
+                                "go",
+                                position_ms,
+                                frame_index,
+                                " go未検知救済 → 確認モーダルで「はい」を押すと IN_GAME へ",
+                            )
                 else:
                     self._ingame_entry_none_streak = 0
         elif phase == "IN_GAME":
@@ -5028,21 +5310,25 @@ class MainWindow(QMainWindow):
                 self._fever_reject_cooldown -= 1
             if self._timeup_reject_cooldown > 0:
                 self._timeup_reject_cooldown -= 1
-            if self._in_game_fever_warmup > 0:
+            if self._analysis_fever_enabled() and self._in_game_fever_warmup > 0:
                 self._in_game_fever_warmup -= 1
-            gates_ok = self._fever_cnn_gates_ok(
-                ranked or [],
-                fever_strong_hit=fever_strong_hit,
-                fever_top1=fever_top1,
-            ) if fever_simple else self._fever_reject_cooldown <= 0
-            loose_ok = self._in_game_fever_warmup <= 0 and gates_ok
+            gates_ok = (
+                self._fever_cnn_gates_ok(
+                    ranked or [],
+                    fever_strong_hit=fever_strong_hit,
+                    fever_top1=fever_top1,
+                )
+                if fever_simple
+                else self._fever_reject_cooldown <= 0
+            )
+            loose_ok = self._analysis_fever_enabled() and self._in_game_fever_warmup <= 0 and gates_ok
             fever_latched = False
             cnn_timeup_candidate = (
                 fever_simple
                 and self._timeup_cnn_top1_detected(ranked)
                 and self._timeup_reject_cooldown <= 0
             )
-            if fever_simple:
+            if fever_simple and self._analysis_fever_enabled():
                 fever_latched = self._update_cnn_fever_latch(
                     fever_hit=self._fever_cnn_top1_detected(ranked),
                     fever_strong_hit=self._fever_cnn_top1_detected(ranked),
@@ -5058,45 +5344,48 @@ class MainWindow(QMainWindow):
             )
             ):
                 scene = "go"
-                self.timeup_confirm_count = 0
-            elif cnn_timeup_candidate and not (
-                (frame_index >= 0 and self._timeup_frame_vetoed(frame_index))
-                or self._timeup_blocked_by_session_veto(
-                    frame_image, scene_feature, ranked=ranked
+            elif (
+                self._can_detect_scene_once_per_game("timeup", phase)
+                and cnn_timeup_candidate
+                and not (
+                    (frame_index >= 0 and self._timeup_frame_vetoed(frame_index))
+                    or self._timeup_blocked_by_session_veto(
+                        frame_image, scene_feature, ranked=ranked
+                    )
                 )
             ):
-                self.timeup_confirm_count += 1
-                if self.timeup_confirm_count >= _TIMEUP_RAW_STREAK_REQUIRED_CNN:
-                    scene = "timeup"
-                    if not self._analysis_scene_confirm_enabled("timeup"):
-                        self._confirm_timeup_detection()
-                    else:
-                        self.timeup_confirm_count = 0
-                else:
-                    scene = "none"
-            elif not fever_simple and timeup_signal and not fever_hit and not fever_latched:
-                self.timeup_confirm_count += 1
-                if self.timeup_confirm_count >= timeup_streak_required:
-                    scene = "timeup"
-                    if not self._analysis_scene_confirm_enabled("timeup"):
-                        self._confirm_timeup_detection()
-                    else:
-                        self.timeup_confirm_count = 0
-                else:
-                    scene = "none"
-            elif fever_latched and self._in_game_fever_warmup <= 0 and self._ingame_fever_allowed(
-                frame_image,
-                scene_feature,
-                ranked=ranked,
-                fever_strong_hit=fever_strong_hit,
-                fever_top1=fever_top1,
-                frame_index=frame_index,
+                scene = "timeup"
+                if not self._analysis_scene_confirm_enabled("timeup"):
+                    self._confirm_timeup_detection(position_ms)
+            elif (
+                self._can_detect_scene_once_per_game("timeup", phase)
+                and not fever_simple
+                and timeup_signal
+                and not fever_hit
+                and not fever_latched
+            ):
+                scene = "timeup"
+                if not self._analysis_scene_confirm_enabled("timeup"):
+                    self._confirm_timeup_detection(position_ms)
+            elif (
+                self._analysis_fever_enabled()
+                and fever_latched
+                and self._in_game_fever_warmup <= 0
+                and self._ingame_fever_allowed(
+                    frame_image,
+                    scene_feature,
+                    ranked=ranked,
+                    fever_strong_hit=fever_strong_hit,
+                    fever_top1=fever_top1,
+                    frame_index=frame_index,
+                )
             ):
                 scene = "fever"
                 self._fever_raw_streak = _FEVER_WEAK_STREAK_REQUIRED
                 self._fever_none_gap_used = 0
             elif (
-                not fever_simple
+                self._analysis_fever_enabled()
+                and not fever_simple
                 and (fever_strong_hit or fever_top1)
                 and gates_ok
                 and self._ingame_fever_allowed(
@@ -5111,7 +5400,7 @@ class MainWindow(QMainWindow):
                 scene = "fever"
                 self._fever_raw_streak = _FEVER_WEAK_STREAK_REQUIRED
                 self._fever_none_gap_used = 0
-            elif not fever_simple and fever_hit and loose_ok:
+            elif self._analysis_fever_enabled() and not fever_simple and fever_hit and loose_ok:
                 self._fever_raw_streak = min(self._fever_raw_streak + 1, 30)
                 if (
                     self._fever_raw_streak >= _FEVER_WEAK_STREAK_REQUIRED
@@ -5127,7 +5416,8 @@ class MainWindow(QMainWindow):
                     scene = "fever"
                     self._fever_none_gap_used = 0
             elif (
-                not fever_simple
+                self._analysis_fever_enabled()
+                and not fever_simple
                 and raw_scene == "timeup"
                 and not fever_hit
                 and self._fever_raw_streak >= _FEVER_WEAK_STREAK_REQUIRED - 1
@@ -5143,7 +5433,7 @@ class MainWindow(QMainWindow):
             ):
                 self._fever_raw_streak = _FEVER_WEAK_STREAK_REQUIRED
                 scene = "fever"
-            elif fever_signal == "none" and self._fever_raw_streak > 0:
+            elif self._analysis_fever_enabled() and fever_signal == "none" and self._fever_raw_streak > 0:
                 if self._fever_none_gap_used < _FEVER_NONE_GAP_ALLOW:
                     self._fever_none_gap_used += 1
                     if (
@@ -5179,59 +5469,89 @@ class MainWindow(QMainWindow):
                     if not self._fever_episode_latched:
                         self._fever_raw_streak = 0
                         self._fever_none_gap_used = 0
-                if not timeup_signal and not cnn_timeup_candidate:
-                    self.timeup_confirm_count = 0
             self._last_raw_scene_in_game = fever_signal if fever_signal == "fever" else raw_scene
         elif phase == "WAIT_BONUS":
             self._reset_fever_latch()
-            if self._bonus_reject_cooldown > 0:
-                self._bonus_reject_cooldown -= 1
-            bonus_detected = False
-            if use_scene_cnn:
-                bonus_detected = (
-                    self._bonus_cnn_top1_detected(ranked)
-                    and self._bonus_reject_cooldown <= 0
-                    and not (
-                        (frame_index >= 0 and self._bonus_frame_vetoed(frame_index))
-                        or self._bonus_blocked_by_session_veto(
-                            frame_image, scene_feature, ranked=ranked
+            if not self._analysis_bonus_enabled():
+                if (
+                    self._can_detect_scene_once_per_game("coin", phase)
+                    and self._coin_scene_detected(
+                        raw_scene=raw_scene,
+                        coin_hit=coin_hit,
+                        use_scene_cnn=use_scene_cnn,
+                        ranked=ranked,
+                        frame_index=frame_index,
+                        scene_feature=scene_feature,
+                        frame_image=frame_image,
+                    )
+                ):
+                    self._coin_flow_latched = True
+                    scene = "coin"
+                    if frame_image is not None and not frame_image.isNull():
+                        self._update_coin_gain_capture(frame_image)
+                    if not self._analysis_scene_confirm_enabled("coin"):
+                        self._confirm_coin_detection(frame_image)
+            else:
+                if self._bonus_reject_cooldown > 0:
+                    self._bonus_reject_cooldown -= 1
+                bonus_detected = False
+                if use_scene_cnn:
+                    bonus_detected = (
+                        self._bonus_cnn_top1_detected(ranked)
+                        and self._bonus_reject_cooldown <= 0
+                        and not (
+                            (frame_index >= 0 and self._bonus_frame_vetoed(frame_index))
+                            or self._bonus_blocked_by_session_veto(
+                                frame_image, scene_feature, ranked=ranked
+                            )
                         )
                     )
-                )
-            elif raw_scene == "bonus" or bonus_hit:
-                bonus_detected = True
-            if bonus_detected:
-                scene = "bonus"
-                if not self._analysis_scene_confirm_enabled("bonus"):
+                elif raw_scene == "bonus" or bonus_hit:
+                    bonus_detected = True
+                if bonus_detected:
+                    scene = "bonus"
+                    if not self._analysis_scene_confirm_enabled("bonus"):
+                        self._confirm_bonus_detection()
+                elif (
+                    self._can_detect_scene_once_per_game("coin", phase)
+                    and self._coin_scene_detected(
+                        raw_scene=raw_scene,
+                        coin_hit=coin_hit,
+                        use_scene_cnn=use_scene_cnn,
+                        ranked=ranked,
+                        frame_index=frame_index,
+                        scene_feature=scene_feature,
+                        frame_image=frame_image,
+                    )
+                ):
+                    # bonus 無し: timeup 後に coin が来たら WAIT_COIN へ
                     self._confirm_bonus_detection()
-            elif self._coin_scene_detected(
-                raw_scene=raw_scene,
-                coin_hit=coin_hit,
-                use_scene_cnn=use_scene_cnn,
-                ranked=ranked,
-                frame_index=frame_index,
-                scene_feature=scene_feature,
-                frame_image=frame_image,
-            ):
-                # bonus 無し: timeup 後に coin が来たら WAIT_COIN へ
-                self._confirm_bonus_detection()
-                scene = "coin"
-                if not self._analysis_scene_confirm_enabled("coin"):
-                    self._confirm_coin_detection()
+                    self._coin_flow_latched = True
+                    scene = "coin"
+                    if frame_image is not None and not frame_image.isNull():
+                        self._update_coin_gain_capture(frame_image)
+                    if not self._analysis_scene_confirm_enabled("coin"):
+                        self._confirm_coin_detection(frame_image)
         elif phase == "WAIT_COIN":
-            coin_detected = self._coin_scene_detected(
-                raw_scene=raw_scene,
-                coin_hit=coin_hit,
-                use_scene_cnn=use_scene_cnn,
-                ranked=ranked,
-                frame_index=frame_index,
-                scene_feature=scene_feature,
-                frame_image=frame_image,
+            coin_detected = (
+                self._can_detect_scene_once_per_game("coin", phase)
+                and self._coin_scene_detected(
+                    raw_scene=raw_scene,
+                    coin_hit=coin_hit,
+                    use_scene_cnn=use_scene_cnn,
+                    ranked=ranked,
+                    frame_index=frame_index,
+                    scene_feature=scene_feature,
+                    frame_image=frame_image,
+                )
             )
             if coin_detected:
+                self._coin_flow_latched = True
                 scene = "coin"
+                if frame_image is not None and not frame_image.isNull():
+                    self._update_coin_gain_capture(frame_image)
                 if not self._analysis_scene_confirm_enabled("coin"):
-                    self._confirm_coin_detection()
+                    self._confirm_coin_detection(frame_image)
         elif phase == "WAIT_RESULT":
             self._reset_fever_latch()
             if self._result_reject_cooldown > 0:
@@ -5250,10 +5570,10 @@ class MainWindow(QMainWindow):
                 )
             elif raw_scene == "result" or result_hit:
                 result_detected = True
-            if result_detected:
+            if result_detected and self._can_detect_scene_once_per_game("result", phase):
                 scene = "result"
                 if not self._analysis_scene_confirm_enabled("result"):
-                    self._confirm_result_detection()
+                    self._confirm_result_detection(position_ms)
 
         if hasattr(self, "counter_analysis_state_label"):
             self.counter_analysis_state_label.setText(f"解析状態: G{self.flow_game_index} {self.flow_phase}")
@@ -5450,6 +5770,12 @@ class MainWindow(QMainWindow):
             return
         if confirm_label == "go" and self._go_confirmed_this_game:
             return
+        if confirm_label == "timeup" and self._timeup_confirmed_this_game:
+            return
+        if confirm_label == "result" and self._result_confirmed_this_game:
+            return
+        if confirm_label == "coin" and self._coin_confirmed_this_game:
+            return
         if confirm_label == "fever" and frame_index >= 0:
             if self._fever_frame_vetoed(frame_index):
                 return
@@ -5479,18 +5805,16 @@ class MainWindow(QMainWindow):
             edge_key = f"timeup:{frame_index}"
         elif confirm_label == "bonus" and frame_index >= 0:
             edge_key = f"bonus:{frame_index}"
-        elif confirm_label == "coin" and frame_index >= 0:
-            edge_key = f"coin:{frame_index}"
         elif confirm_label == "result" and frame_index >= 0:
             edge_key = f"result:{frame_index}"
-        elif confirm_label in ("ready", "go"):
+        elif confirm_label in ("ready", "go", "coin"):
             edge_key = f"{confirm_label}:G{int(self.flow_game_index)}"
         else:
             edge_key = f"{confirm_label}:{flow_scene}"
         prev_key = getattr(self, "_analysis_confirm_edge_key", "")
         if edge_key == prev_key:
             return
-        if confirm_label in ("ready", "go"):
+        if confirm_label in ("ready", "go", "coin"):
             self._analysis_confirm_edge_key = edge_key
 
         was_cv = getattr(self, "use_opencv_for_video", False)
@@ -5507,17 +5831,17 @@ class MainWindow(QMainWindow):
                 confirmed_yes = True
                 # フェーズ進行: モーダルで「はい」＝そのシーン確定
                 if confirm_label == "ready":
-                    self._confirm_pregame_ready()
+                    self._confirm_pregame_ready(position_ms, frame_index)
                 elif confirm_label == "go":
-                    self._confirm_pregame_go()
+                    self._confirm_pregame_go(position_ms, frame_index)
                 elif confirm_label == "timeup" and flow_scene == "timeup":
-                    self._confirm_timeup_detection()
+                    self._confirm_timeup_detection(position_ms)
                 elif confirm_label == "bonus" and flow_scene == "bonus":
                     self._confirm_bonus_detection()
                 elif confirm_label == "coin" and flow_scene == "coin":
-                    self._confirm_coin_detection()
+                    self._confirm_coin_detection(frame_image)
                 elif confirm_label == "result" and flow_scene == "result":
-                    self._confirm_result_detection()
+                    self._confirm_result_detection(position_ms)
                 elif confirm_label == "fever":
                     self._register_fever_count(position_ms)
             else:
@@ -5585,25 +5909,26 @@ class MainWindow(QMainWindow):
                                 if self.video_analyzer.scene_classifier.uses_cnn():
                                     self.log_view.append(
                                         "ready 誤検知として train/none に保存しました。"
-                                        "以降の解析では同じ見た目を ready にしません。"
+                                        "学習タブで「学習開始」→「モデル保存」で反映してください。"
                                     )
                                 else:
                                     self.log_view.append(
-                                        "この画面を ready 誤検知として記録しました（同じ見た目はしばらく ready しません）。"
+                                        "ready 誤検知として train/none に保存しました。"
+                                        "学習タブで「学習開始」→「モデル保存」で反映してください。"
                                     )
                     if confirm_label == "ready":
                         if choice == "ready":
-                            self._confirm_pregame_ready()
+                            self._confirm_pregame_ready(position_ms, frame_index)
                         elif flow_scene == "ready":
                             self._reject_pregame_ready(frame_image, frame_index)
                     elif confirm_label == "go":
                         if choice == "go":
-                            self._confirm_pregame_go()
+                            self._confirm_pregame_go(position_ms, frame_index)
                         elif flow_scene == "go":
                             self._reject_pregame_go()
                     elif confirm_label == "timeup":
                         if choice == "timeup":
-                            self._confirm_timeup_detection()
+                            self._confirm_timeup_detection(position_ms)
                         elif flow_scene == "timeup":
                             self._reject_timeup_detection(frame_image, frame_index)
                     elif confirm_label == "bonus":
@@ -5613,12 +5938,12 @@ class MainWindow(QMainWindow):
                             self._reject_bonus_detection(frame_image, frame_index)
                     elif confirm_label == "coin":
                         if choice == "coin":
-                            self._confirm_coin_detection()
+                            self._confirm_coin_detection(frame_image)
                         elif flow_scene == "coin":
                             self._reject_coin_detection(frame_image, frame_index)
                     elif confirm_label == "result":
                         if choice == "result":
-                            self._confirm_result_detection()
+                            self._confirm_result_detection(position_ms)
                         elif flow_scene == "result":
                             self._reject_result_detection(frame_image, frame_index)
                 elif confirm_label == "ready" and flow_scene == "ready":
@@ -5637,7 +5962,7 @@ class MainWindow(QMainWindow):
                     self._reject_result_detection(frame_image, frame_index)
         finally:
             self._analysis_confirm_edge_prev = confirm_label
-            if confirm_label in ("ready", "go"):
+            if confirm_label in ("ready", "go", "coin"):
                 if not confirmed_yes:
                     self._clear_analysis_confirm_edge_prefix(confirm_label)
             else:
@@ -5712,6 +6037,22 @@ class MainWindow(QMainWindow):
         self._append_log_colored_scene(prefix, scene_label, detail_suffix, skill_label)
         if item_debug and result.scene_label == "item":
             self.log_view.append(f"  item_debug: {item_debug}")
+
+    def _log_pregame_scene_detect(
+        self,
+        scene: str,
+        position_ms: int,
+        frame_index: int,
+        note: str,
+    ) -> None:
+        """ready/go 検知（候補・確定）を scene= 行・オレンジで出す（候補だけ別行 plain にはしない）。"""
+        if scene not in ("ready", "go"):
+            return
+        seconds = max(0, int(position_ms)) / 1000.0
+        prefix = f"t={seconds:7.2f}s frame={max(0, int(frame_index)):6d} scene="
+        suffix = f" [{self.flow_phase}]{note}"
+        self._append_log_colored_scene(prefix, scene, suffix)
+        self._analysis_last_logged_scene = scene
 
     def _append_log_colored_scene(
         self, prefix: str, scene_label: str, suffix: str, skill_label: str = ""

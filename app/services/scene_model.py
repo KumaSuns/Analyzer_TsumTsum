@@ -697,6 +697,9 @@ class SceneCentroidModel:
         """保存済み train/none に近いフレームは ready 扱いにしない（CNN でも有効）。"""
         if not feat or not self.none_veto_exemplars:
             return False
+        # CNN がはっきり ready と出しているときは centroid 比較で潰さない
+        if ready_score is not None and ready_score < 0.45:
+            return False
         best_none = min(l1_distance(feat, ex) for ex in self.none_veto_exemplars)
         if self.centroids and "ready" in self.centroids:
             dr = l1_distance(feat, self.centroids["ready"])
