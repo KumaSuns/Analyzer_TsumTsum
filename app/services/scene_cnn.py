@@ -504,6 +504,24 @@ class SceneCnnClassifier:
             return "none"
         return self.predict_rgb(arr)
 
+    def ranked_path(self, path: Path, top_k: int = 8) -> List[Tuple[str, float]]:
+        arr = _load_rgb_array(path)
+        if arr is None:
+            return [("none", 1e9)]
+        return self.ranked_rgb(arr, top_k=top_k)
+
+    def ranked_rgb(self, arr: np.ndarray, top_k: int = 8) -> List[Tuple[str, float]]:
+        if not self.is_loaded():
+            return [("none", 1e9)]
+        arr = _resize_rgb(arr, self.img_size)
+        x = array_to_tensor(arr).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            logits = self.model(x)  # type: ignore[operator]
+            probs = torch.softmax(logits, dim=1)[0]
+        pairs = [(self.classes[i], float(1.0 - probs[i].item())) for i in range(len(self.classes))]
+        pairs.sort(key=lambda t: t[1])
+        return pairs[:top_k]
+
     def predict_rgb(self, arr: np.ndarray) -> str:
         if not self.is_loaded():
             return "none"

@@ -688,6 +688,22 @@ class SceneCentroidModel:
             return best_none + margin < dt
         return best_none <= _NONE_VETO_ABSOLUTE_MAX
 
+    def none_veto_blocks_ready(
+        self,
+        feat: List[float],
+        *,
+        ready_score: Optional[float] = None,
+    ) -> bool:
+        """保存済み train/none に近いフレームは ready 扱いにしない（CNN でも有効）。"""
+        if not feat or not self.none_veto_exemplars:
+            return False
+        best_none = min(l1_distance(feat, ex) for ex in self.none_veto_exemplars)
+        if self.centroids and "ready" in self.centroids:
+            dr = l1_distance(feat, self.centroids["ready"])
+            margin = 0.002 if (ready_score is None or ready_score >= 0.22) else 0.006
+            return best_none + margin < dr
+        return best_none <= _NONE_VETO_ABSOLUTE_MAX
+
     def exemplar_blocks_fever(self, feat: List[float]) -> bool:
         """保存した none 実画像にほぼ同一のフレームだけ fever を止める（誤判定を広げない）。"""
         return self.none_veto_blocks_fever(feat)
