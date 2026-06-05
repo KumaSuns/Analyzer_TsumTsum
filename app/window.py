@@ -59,7 +59,12 @@ from app.services.scene_dataset_advice import (
     format_advice_report_text,
     summarize_skill_activation_images,
 )
-from app.services.scene_dataset_dedup import deduplicate_scene_dataset
+from app.services.scene_dataset_dedup import (
+    SAVE_SKIP_DUPLICATE_PREFIX,
+    deduplicate_scene_dataset,
+    find_duplicate_scene_image,
+    register_saved_scene_image,
+)
 from app.services.scene_dataset_review import SceneDatasetReviewDialog
 from app.services.trainer import SimpleTrainer
 from app.services.tsum_registry import TsumRegistry
@@ -558,6 +563,8 @@ class MainWindow(QMainWindow):
         self._item_scan_targets: set[str] = set()
         self._item_scene_active = False
         self._item_use_tsum_pending = "-"
+        self._item_confirmed_this_game = False
+        self._item_scan_suppressed = False
         self.pending_crop_rect = None
         self.current_video_container: Optional[AspectFitVideoContainer] = None
         self.current_video_frame_image = None
@@ -773,6 +780,14 @@ class MainWindow(QMainWindow):
                 status.setText("クラスを選択してください。")
             return
         ok, msg = self._save_frame_to_scene_class(image, choice)
+        if msg.startswith(SAVE_SKIP_DUPLICATE_PREFIX):
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #555;")
+                status.setText(
+                    f"同一画像のため保存スキップ → {msg[len(SAVE_SKIP_DUPLICATE_PREFIX):]}"
+                )
+                self._train_log(f"画像保存スキップ（同一）: {msg[len(SAVE_SKIP_DUPLICATE_PREFIX):]}")
+            return
         if ok:
             if status is not None and _is_alive_qobject(status):
                 status.setStyleSheet("color: #2E7D32;")
@@ -970,15 +985,53 @@ class MainWindow(QMainWindow):
         """現在位置のフレームを train/val 振り分けで PNG 保存（動画ツールの画像保存と同じ規則）。"""
         if image is None or image.isNull():
             return False, "画像がありません"
+        images_root = self.project_root / "app/assets/images"
+        existing = find_duplicate_scene_image(images_root, image)
+        if existing is not None:
+            try:
+                rel = existing.relative_to(images_root).as_posix()
+            except ValueError:
+                rel = existing.as_posix()
+            return True, f"{SAVE_SKIP_DUPLICATE_PREFIX}{rel}"
         split = self._choose_scene_train_val_split(choice)
-        out_dir = self.project_root / "app/assets/images" / split / choice
+        out_dir = images_root / split / choice
         out_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         frame_index = int((max(self._playback_position_ms(), 0) / 1000.0) * float(self.estimated_fps or 30.0))
         out_path = out_dir / f"scene_{choice}_{timestamp}_f{frame_index}.png"
         if save_training_png(image, out_path):
+            register_saved_scene_image(out_path)
             return True, f"{split}/{choice}/{out_path.name}"
         return False, str(out_path)
+
+    def _scene_class_dataset_count(self, cls: str) -> int:
+        base = self.project_root / "app/assets/images"
+        return self._count_image_files(base / "train" / cls) + self._count_image_files(
+            base / "val" / cls
+        )
+
+    def _maybe_save_scene_class_on_confirm_yes(self, frame_image, scene_key: str) -> None:
+        """確認モーダル「はい」時、当該クラスの train/val 画像が0枚なら1枚保存。"""
+        if scene_key not in SimpleTrainer.CLASSES or scene_key == "none":
+            return
+        if frame_image is None or frame_image.isNull():
+            return
+        if self._scene_class_dataset_count(scene_key) > 0:
+            return
+        save_ok, msg = self._save_frame_to_scene_class(frame_image, scene_key)
+        if not hasattr(self, "log_view") or not _is_alive_qobject(self.log_view):
+            return
+        if msg.startswith(SAVE_SKIP_DUPLICATE_PREFIX):
+            return
+        if save_ok:
+            self.log_view.append(
+                f"初回サンプル保存: {msg}（{scene_key}）。"
+                "学習タブで学習→保存すると反映されます。"
+            )
+            self._train_log(f"確認モーダル初回保存: {msg}")
+            self._refit_scene_model_after_correction(scene_key, frame_image)
+        else:
+            self.log_view.append(f"初回サンプル保存失敗: {msg}")
 
     def _append_none_veto_from_frame(self, frame_image) -> None:
         """修正保存した none 画面を centroid 誤検知リストへ（CNN 解析中は使わない）。"""
@@ -1163,11 +1216,15 @@ class MainWindow(QMainWindow):
         )
 
     def _reset_per_game_scene_flags(self) -> None:
+        self._item_confirmed_this_game = False
         self._ready_confirmed_this_game = False
         self._go_confirmed_this_game = False
         self._timeup_confirmed_this_game = False
         self._coin_confirmed_this_game = False
         self._coin_flow_latched = False
+        self._coin_reject_cooldown = 0
+        self._analysis_coin_none_veto = []
+        self._coin_veto_frame_indices = set()
         self._result_confirmed_this_game = False
         self._ready_suppressed_this_game = False
         self._pregame_ready_pending = False
@@ -1283,6 +1340,7 @@ class MainWindow(QMainWindow):
         else:
             self.flow_phase = "WAIT_COIN"
             self._reset_coin_gain_capture()
+            self._reset_coin_hunt_state()
         self._reset_fever_latch()
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
             self.counter_analysis_state_label
@@ -1355,6 +1413,14 @@ class MainWindow(QMainWindow):
         self._coin_gain_reads = []
         self._coin_gain_last_debug = ""
         self._refresh_coin_gain_label()
+
+    def _reset_coin_hunt_state(self) -> None:
+        """timeup/bonus 後の coin 探索開始時に、誤検知 veto で検知不能になるのを防ぐ。"""
+        self._analysis_coin_none_veto = []
+        self._coin_veto_frame_indices = set()
+        self._coin_reject_cooldown = 0
+        self._coin_flow_latched = False
+        self._clear_analysis_confirm_edge_prefix("coin")
 
     def _refresh_coin_gain_label(self) -> None:
         label = getattr(self, "counter_coin_gain_label", None)
@@ -1439,6 +1505,7 @@ class MainWindow(QMainWindow):
     def _confirm_bonus_detection(self) -> None:
         self.flow_phase = "WAIT_COIN"
         self._reset_coin_gain_capture()
+        self._reset_coin_hunt_state()
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
             self.counter_analysis_state_label
         ):
@@ -1468,9 +1535,12 @@ class MainWindow(QMainWindow):
         frame_image,
     ) -> bool:
         if use_scene_cnn:
+            cooldown_ok = (
+                self.flow_phase == "WAIT_COIN" or self._coin_reject_cooldown <= 0
+            )
             return (
                 self._coin_cnn_top1_detected(ranked)
-                and self._coin_reject_cooldown <= 0
+                and cooldown_ok
                 and not (
                     (frame_index >= 0 and self._coin_frame_vetoed(frame_index))
                     or self._coin_blocked_by_session_veto(
@@ -1495,6 +1565,8 @@ class MainWindow(QMainWindow):
     def _coin_blocked_by_session_veto(
         self, frame_image, scene_feature=None, ranked: list | None = None
     ) -> bool:
+        if self.flow_phase == "WAIT_COIN":
+            return False
         if ranked and self._coin_cnn_top1_detected(ranked):
             return False
         if not self._analysis_coin_none_veto:
@@ -1615,6 +1687,7 @@ class MainWindow(QMainWindow):
         self._item_scan_targets = set()
         self._item_scene_active = False
         self._item_use_tsum_pending = "-"
+        self._item_scan_suppressed = False
         self._reset_coin_gain_capture()
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
             self.counter_analysis_state_label
@@ -1622,6 +1695,7 @@ class MainWindow(QMainWindow):
             self.counter_analysis_state_label.setText(
                 f"解析状態: G{self.flow_game_index} {self.flow_phase}"
             )
+        self._refresh_item_counter_labels()
 
     def _confirm_result_detection(self, position_ms: int = 0) -> None:
         if self._result_confirmed_this_game:
@@ -3516,6 +3590,8 @@ class MainWindow(QMainWindow):
             return scene_label
         # 生ラベルはフェーズに応じて制限（WAIT_ITEM中の bonus/raw などを防ぐ）
         if raw_scene == "item" and flow_phase == "WAIT_ITEM":
+            if self._item_confirmed_this_game or self._item_scan_suppressed:
+                return "none"
             return raw_scene
         if not ready_locked and self._can_detect_scene_once_per_game("ready", flow_phase):
             if raw_scene == "ready" and flow_phase in ("WAIT_READY", "WAIT_GO"):
@@ -3763,6 +3839,36 @@ class MainWindow(QMainWindow):
             self.counter_analysis_state_label.setText(
                 f"解析状態: G{self.flow_game_index} {self.flow_phase}"
             )
+
+    def _confirm_item_detection(self) -> None:
+        if self._item_confirmed_this_game:
+            return
+        self._item_confirmed_this_game = True
+        self.locked_item_targets = _item_select_keys_from(list(self._item_scan_targets))
+        if self._item_use_tsum_pending not in {"-", "unknown", ""}:
+            self.locked_use_tsum = self._item_use_tsum_pending
+        self.locked_item_fixed = True
+        self._item_scene_active = False
+        self._refresh_item_counter_labels()
+        if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+            self.log_view.append(f"G{self.flow_game_index} item 確定")
+
+    def _reject_item_detection(self, frame_image=None, frame_index: int = -1) -> None:
+        self._item_confirmed_this_game = False
+        self._item_scan_suppressed = True
+        self.locked_item_fixed = False
+        self.locked_item_targets = []
+        self.locked_use_tsum = "-"
+        self._item_scan_targets = set()
+        self._item_scene_active = False
+        self._item_use_tsum_pending = "-"
+        if self.flow_phase != "WAIT_ITEM":
+            self.flow_phase = "WAIT_ITEM"
+            self._game_active = False
+            self._reset_per_game_scene_flags()
+        self._clear_analysis_confirm_edge_prefix("item")
+        self._refresh_item_counter_labels()
+        self._refresh_flow_phase_label()
 
     def _confirm_pregame_ready(self, position_ms: int = 0, frame_index: int = -1) -> None:
         if self._ready_confirmed_this_game:
@@ -4595,7 +4701,9 @@ class MainWindow(QMainWindow):
             if self.flow_phase == "WAIT_ITEM":
                 raw_item_scene = result.scene_label == "item"
                 selected_targets, evaluations = [], {}
-                if raw_item_scene:
+                if not raw_item_scene and self._item_scan_suppressed:
+                    self._item_scan_suppressed = False
+                if raw_item_scene and not self._item_scan_suppressed:
                     self._item_scene_active = True
                     selected_targets, evaluations = self._evaluate_targets(
                         frame_image, self.crop_positions_for_analysis
@@ -4610,7 +4718,7 @@ class MainWindow(QMainWindow):
                         use_tsum_detected = selected_tsum
                     if use_tsum_detected not in {"-", "unknown", ""}:
                         self._item_use_tsum_pending = use_tsum_detected
-                elif self._item_scene_active and not raw_item_scene:
+                elif self._item_scene_active and not raw_item_scene and not self._item_scan_suppressed:
                     selected_targets, evaluations = self._evaluate_targets(
                         frame_image, self.crop_positions_for_analysis
                     )
@@ -4619,16 +4727,28 @@ class MainWindow(QMainWindow):
                     self._item_scene_active = True
                 leaving_item_scene = self._item_scene_active and not raw_item_scene
                 if leaving_item_scene:
-                    self.locked_item_targets = _item_select_keys_from(list(self._item_scan_targets))
-                    if self._item_use_tsum_pending not in {"-", "unknown", ""}:
-                        self.locked_use_tsum = self._item_use_tsum_pending
-                    self.locked_item_fixed = True
-                    self._item_scene_active = False
-                    self._refresh_item_counter_labels()
+                    item_lock_ok = (
+                        not self._analysis_scene_confirm_enabled("item")
+                        or self._item_confirmed_this_game
+                    )
+                    if item_lock_ok:
+                        if not self.locked_item_fixed:
+                            self.locked_item_targets = _item_select_keys_from(
+                                list(self._item_scan_targets)
+                            )
+                            if self._item_use_tsum_pending not in {"-", "unknown", ""}:
+                                self.locked_use_tsum = self._item_use_tsum_pending
+                            self.locked_item_fixed = True
+                        self._item_scene_active = False
+                        self._refresh_item_counter_labels()
+                item_phase_completed = leaving_item_scene and (
+                    not self._analysis_scene_confirm_enabled("item")
+                    or self._item_confirmed_this_game
+                )
                 item_detected = bool(self._item_scan_targets) or self.locked_item_fixed
                 scene_label = self._apply_scene_flow(
                     flow_raw,
-                    leaving_item_scene,
+                    item_phase_completed,
                     use_tsum_detected,
                     result.timestamp_ms,
                     ranked=ranked,
@@ -5024,6 +5144,7 @@ class MainWindow(QMainWindow):
         self._item_scan_targets = set()
         self._item_scene_active = False
         self._item_use_tsum_pending = "-"
+        self._item_scan_suppressed = False
         self._reset_coin_gain_capture()
         self._skill_count = 0
         self._skill_episode_active = False
@@ -5136,10 +5257,14 @@ class MainWindow(QMainWindow):
         if phase == "WAIT_ITEM":
             if raw_scene == "item":
                 scene = "item"
-            advance_pregame = item_phase_completed or (
-                self.locked_item_fixed and raw_scene in ("ready", "go")
-            ) or (
-                self._item_scene_active and raw_scene in ("ready", "go")
+            item_confirm_ok = (
+                not self._analysis_scene_confirm_enabled("item")
+                or self._item_confirmed_this_game
+            )
+            advance_pregame = item_confirm_ok and (
+                item_phase_completed
+                or (self.locked_item_fixed and raw_scene in ("ready", "go"))
+                or (self._item_scene_active and raw_scene in ("ready", "go"))
             )
             if advance_pregame:
                 self._begin_new_game_from_item()
@@ -5766,6 +5891,10 @@ class MainWindow(QMainWindow):
             return
         if confirm_label == "go" and not ready_confirmed and not self._ready_confirmed_this_game:
             return
+        if confirm_label == "item" and self._item_confirmed_this_game:
+            return
+        if confirm_label == "item" and self._item_scan_suppressed:
+            return
         if confirm_label == "ready" and self._ready_confirmed_this_game:
             return
         if confirm_label == "go" and self._go_confirmed_this_game:
@@ -5805,16 +5934,20 @@ class MainWindow(QMainWindow):
             edge_key = f"timeup:{frame_index}"
         elif confirm_label == "bonus" and frame_index >= 0:
             edge_key = f"bonus:{frame_index}"
+        elif confirm_label == "coin" and frame_index >= 0:
+            edge_key = f"coin:{frame_index}"
+        elif confirm_label == "item" and frame_index >= 0:
+            edge_key = f"item:{frame_index}"
         elif confirm_label == "result" and frame_index >= 0:
             edge_key = f"result:{frame_index}"
-        elif confirm_label in ("ready", "go", "coin"):
+        elif confirm_label in ("ready", "go"):
             edge_key = f"{confirm_label}:G{int(self.flow_game_index)}"
         else:
             edge_key = f"{confirm_label}:{flow_scene}"
         prev_key = getattr(self, "_analysis_confirm_edge_key", "")
         if edge_key == prev_key:
             return
-        if confirm_label in ("ready", "go", "coin"):
+        if confirm_label in ("ready", "go"):
             self._analysis_confirm_edge_key = edge_key
 
         was_cv = getattr(self, "use_opencv_for_video", False)
@@ -5834,16 +5967,19 @@ class MainWindow(QMainWindow):
                     self._confirm_pregame_ready(position_ms, frame_index)
                 elif confirm_label == "go":
                     self._confirm_pregame_go(position_ms, frame_index)
-                elif confirm_label == "timeup" and flow_scene == "timeup":
+                elif confirm_label == "timeup":
                     self._confirm_timeup_detection(position_ms)
-                elif confirm_label == "bonus" and flow_scene == "bonus":
+                elif confirm_label == "bonus":
                     self._confirm_bonus_detection()
-                elif confirm_label == "coin" and flow_scene == "coin":
+                elif confirm_label == "coin":
                     self._confirm_coin_detection(frame_image)
-                elif confirm_label == "result" and flow_scene == "result":
+                elif confirm_label == "result":
                     self._confirm_result_detection(position_ms)
                 elif confirm_label == "fever":
                     self._register_fever_count(position_ms)
+                elif confirm_label == "item":
+                    self._confirm_item_detection()
+                self._maybe_save_scene_class_on_confirm_yes(frame_image, confirm_label)
             else:
                 choice, ok = self._exec_scene_correction_dialog(frame_image, confirm_label)
                 if ok and choice:
@@ -5860,9 +5996,18 @@ class MainWindow(QMainWindow):
                     if choice == "none" and confirm_label == "ready":
                         self._record_ready_rejection(frame_image, frame_index)
                     save_ok, msg = self._save_frame_to_scene_class(frame_image, choice)
+                    skipped_dup = msg.startswith(SAVE_SKIP_DUPLICATE_PREFIX)
                     if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
-                        self.log_view.append(("修正保存: " if save_ok else "修正保存失敗: ") + msg)
-                    if save_ok:
+                        if skipped_dup:
+                            self.log_view.append(
+                                "修正保存スキップ（同一画像）: "
+                                f"{msg[len(SAVE_SKIP_DUPLICATE_PREFIX):]}"
+                            )
+                        else:
+                            self.log_view.append(
+                                ("修正保存: " if save_ok else "修正保存失敗: ") + msg
+                            )
+                    if save_ok and not skipped_dup:
                         self._train_log(f"解析修正保存: {msg}")
                         self._refit_scene_model_after_correction(choice, frame_image)
                         if choice == "none" and confirm_label == "fever":
@@ -5916,6 +6061,11 @@ class MainWindow(QMainWindow):
                                         "ready 誤検知として train/none に保存しました。"
                                         "学習タブで「学習開始」→「モデル保存」で反映してください。"
                                     )
+                    elif skipped_dup:
+                        self._train_log(
+                            "解析修正保存スキップ（同一画像）: "
+                            f"{msg[len(SAVE_SKIP_DUPLICATE_PREFIX):]}"
+                        )
                     if confirm_label == "ready":
                         if choice == "ready":
                             self._confirm_pregame_ready(position_ms, frame_index)
@@ -5946,6 +6096,11 @@ class MainWindow(QMainWindow):
                             self._confirm_result_detection(position_ms)
                         elif flow_scene == "result":
                             self._reject_result_detection(frame_image, frame_index)
+                    elif confirm_label == "item":
+                        if choice == "item":
+                            self._confirm_item_detection()
+                        else:
+                            self._reject_item_detection(frame_image, frame_index)
                 elif confirm_label == "ready" and flow_scene == "ready":
                     self._reject_pregame_ready(frame_image, frame_index)
                 elif confirm_label == "go" and flow_scene == "go":
@@ -5960,6 +6115,8 @@ class MainWindow(QMainWindow):
                     self._reject_coin_detection(frame_image, frame_index)
                 elif confirm_label == "result" and flow_scene == "result":
                     self._reject_result_detection(frame_image, frame_index)
+                elif confirm_label == "item" and flow_scene == "item":
+                    self._reject_item_detection(frame_image, frame_index)
         finally:
             self._analysis_confirm_edge_prev = confirm_label
             if confirm_label in ("ready", "go", "coin"):
@@ -5997,21 +6154,41 @@ class MainWindow(QMainWindow):
             locked_item_names = [self.crop_target_display.get(k, k) for k in self.locked_item_targets]
             display_used_items = ",".join(locked_item_names)
             display_use_tsum = self.locked_use_tsum
-        elif result.scene_label == "item" and used_items_text != "-":
+        elif (
+            result.scene_label == "item"
+            and not self._item_scan_suppressed
+            and used_items_text != "-"
+        ):
             display_used_items = used_items_text
             display_use_tsum = use_tsum_detected if use_tsum_detected not in {"-", ""} else "-"
         else:
             display_used_items = "-"
-            display_use_tsum = use_tsum_detected if result.scene_label == "item" else "-"
+            display_use_tsum = (
+                use_tsum_detected
+                if result.scene_label == "item" and not self._item_scan_suppressed
+                else "-"
+            )
         if hasattr(self, "counter_use_item_label"):
             self.counter_use_item_label.setText(f"使用アイテム: {display_used_items}")
         if hasattr(self, "counter_use_tsum_label"):
             self.counter_use_tsum_label.setText(f"使用ツム: {display_use_tsum}")
         # Log output is scene-based (avoid noisy fixed values on non-item scenes).
-        log_used_items = used_items_text if result.scene_label == "item" else "-"
-        log_use_tsum = use_tsum_detected if result.scene_label == "item" else "-"
+        log_used_items = (
+            used_items_text
+            if result.scene_label == "item" and not self._item_scan_suppressed
+            else "-"
+        )
+        log_use_tsum = (
+            use_tsum_detected
+            if result.scene_label == "item" and not self._item_scan_suppressed
+            else "-"
+        )
         # item_detect comes from detection flow in _on_player_position_changed.
-        effective_item_detected = item_detected if result.scene_label == "item" else False
+        effective_item_detected = (
+            item_detected
+            if result.scene_label == "item" and not self._item_scan_suppressed
+            else False
+        )
         item_detected_text = "YES" if effective_item_detected else "NO"
         scene_label = result.scene_label
         prefix = f"t={seconds:7.2f}s frame={result.frame_index:6d} scene="
@@ -6108,6 +6285,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "counter_use_item_label") and _is_alive_qobject(self.counter_use_item_label):
             if self.locked_item_fixed and self.locked_item_targets:
                 keys = self.locked_item_targets
+            elif self._item_scan_suppressed:
+                keys = []
             elif self._item_scan_targets:
                 keys = _item_select_keys_from(list(self._item_scan_targets))
             else:
@@ -6119,7 +6298,14 @@ class MainWindow(QMainWindow):
                 text = "--"
             self.counter_use_item_label.setText(f"使用アイテム: {text}")
         if hasattr(self, "counter_use_tsum_label") and _is_alive_qobject(self.counter_use_tsum_label):
-            tsum = self.locked_use_tsum if self.locked_item_fixed else "--"
+            if self.locked_item_fixed:
+                tsum = self.locked_use_tsum
+            elif self._item_scan_suppressed:
+                tsum = "--"
+            elif self._item_use_tsum_pending not in {"-", "unknown", ""}:
+                tsum = self._item_use_tsum_pending
+            else:
+                tsum = "--"
             if tsum in {"-", ""}:
                 tsum = "--"
             self.counter_use_tsum_label.setText(f"使用ツム: {tsum}")

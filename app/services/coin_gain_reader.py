@@ -16,7 +16,8 @@ except ImportError:
     _CV2_OK = False
 
 # 1 桁あたりの平均差がこれ未満なら採用
-_DIGIT_MATCH_MAX_MEAN = 85.0
+_DIGIT_MATCH_MAX_MEAN = 95.0
+_WIDE_SPLIT_MAX_MEAN = 105.0
 _MIN_DIGIT_HEIGHT_RATIO = 0.35
 _MAX_DIGIT_HEIGHT_RATIO = 1.05
 _MIN_DIGIT_WIDTH_RATIO = 0.28
@@ -99,21 +100,32 @@ def _digit_templates() -> List[Tuple[int, np.ndarray]]:
     return out
 
 
-def _yellow_mask(bgr: np.ndarray) -> Optional[np.ndarray]:
+def _locator_masks(bgr: np.ndarray) -> List[np.ndarray]:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (14, 70, 110), (42, 255, 255))
-    if int(np.count_nonzero(mask)) < 40:
-        return None
+    masks = [
+        cv2.inRange(hsv, (14, 70, 110), (42, 255, 255)),
+        cv2.inRange(hsv, (10, 40, 80), (50, 255, 255)),
+        cv2.inRange(hsv, (0, 0, 120), (180, 70, 255)),
+    ]
+    _, white = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    masks.append(white)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return [cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel, iterations=1) for m in masks]
 
 
 def _gray_digit_strip(gray: np.ndarray, bgr: np.ndarray) -> Optional[np.ndarray]:
-    """金色領域の位置から数字列だけのグレー帯を切り出す（黄色二値化は使わない）。"""
-    mask = _yellow_mask(bgr)
-    if mask is None:
+    """明るい領域の位置から数字列だけのグレー帯を切り出す。"""
+    best_mask: Optional[np.ndarray] = None
+    best_count = 0
+    for mask in _locator_masks(bgr):
+        count = int(np.count_nonzero(mask))
+        if count >= 24 and count > best_count:
+            best_count = count
+            best_mask = mask
+    if best_mask is None:
         return None
-    ys, xs = np.where(mask > 0)
+    ys, xs = np.where(best_mask > 0)
     if len(xs) < 24:
         return None
     x0, x1 = int(xs.min()), int(xs.max())
@@ -132,11 +144,30 @@ def _gray_digit_strip(gray: np.ndarray, bgr: np.ndarray) -> Optional[np.ndarray]
     return strip
 
 
-def _binarize_variants(gray: np.ndarray) -> List[np.ndarray]:
+def _prepare_gray(gray: np.ndarray) -> np.ndarray:
     h, w = gray.shape
+    target_h = max(72, min(120, h * 5))
+    scale = target_h / max(1, h)
+    resized = cv2.resize(
+        gray,
+        (max(1, int(w * scale)), target_h),
+        interpolation=cv2.INTER_CUBIC,
+    )
+    tile_w = max(2, min(8, resized.shape[1] // 8))
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(2, tile_w))
+    return clahe.apply(resized)
+
+
+def _binarize_variants(gray: np.ndarray) -> List[np.ndarray]:
+    prepared = _prepare_gray(gray)
+    h, w = prepared.shape
     target_h = max(48, min(96, h * 3))
     scale = target_h / max(1, h)
-    resized = cv2.resize(gray, (max(1, int(w * scale)), target_h), interpolation=cv2.INTER_CUBIC)
+    resized = cv2.resize(
+        prepared,
+        (max(1, int(w * scale)), target_h),
+        interpolation=cv2.INTER_CUBIC,
+    )
     blurred = cv2.GaussianBlur(resized, (3, 3), 0)
     variants: List[np.ndarray] = []
     for inv in (False, True):
@@ -153,12 +184,82 @@ def _binarize_variants(gray: np.ndarray) -> List[np.ndarray]:
     return variants
 
 
+def _find_split_valley(proj: np.ndarray, lo_ratio: float, hi_ratio: float) -> Optional[int]:
+    bw = len(proj)
+    mid_lo = int(bw * lo_ratio)
+    mid_hi = int(bw * hi_ratio)
+    if mid_hi <= mid_lo:
+        return None
+    valley = mid_lo + int(np.argmin(proj[mid_lo:mid_hi]))
+    if valley <= 2 or valley >= bw - 3:
+        return None
+    return valley
+
+
+def _split_wide_box(
+    binary: np.ndarray, box: Tuple[int, int, int, int]
+) -> List[Tuple[int, int, int, int]]:
+    x, y, bw, bh = box
+    if bw < bh * 0.55:
+        return [box]
+    patch = binary[y : y + bh, x : x + bw]
+    proj = patch.sum(axis=0).astype(np.float32)
+    if proj.max() <= 0:
+        return [box]
+
+    target_parts = 3 if bw >= bh * 1.55 else 2
+    cuts: List[int] = []
+    segments = [(0, bw)]
+    while len(cuts) < target_parts - 1 and segments:
+        start, end = segments.pop(0)
+        span = end - start
+        if span < bh * 0.45:
+            segments.insert(0, (start, end))
+            break
+        sub = proj[start:end]
+        valley = _find_split_valley(sub, 0.22, 0.78)
+        if valley is None:
+            segments.insert(0, (start, end))
+            break
+        cut = start + valley
+        cuts.append(cut)
+        segments = [(start, cut), (cut, end)] + segments
+
+    if not cuts:
+        return [box]
+    cuts = sorted(set(cuts))
+    parts: List[Tuple[int, int, int, int]] = []
+    prev = 0
+    for cut in cuts:
+        w = cut - prev
+        if w >= 4:
+            parts.append((x + prev, y, w, bh))
+        prev = cut
+    if bw - prev >= 4:
+        parts.append((x + prev, y, bw - prev, bh))
+    if len(parts) < 2 or len(parts) > _MAX_DIGITS:
+        return [box]
+    return parts
+
+
+def _is_coin_icon_box(x: int, bw: int, bh: int, w: int) -> bool:
+    return x < int(w * 0.06) and bw >= int(bh * 0.75) and (x + bw) <= int(w * 0.22)
+
+
+def _is_comma_box(bw: int, bh: int) -> bool:
+    return bw < max(2, int(bh * 0.18))
+
+
 def _segment_digit_boxes(binary: np.ndarray) -> List[Tuple[int, int, int, int]]:
     h, w = binary.shape
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     boxes: List[Tuple[int, int, int, int]] = []
     for cnt in contours:
         x, y, bw, bh = cv2.boundingRect(cnt)
+        if _is_coin_icon_box(x, bw, bh, w):
+            continue
+        if _is_comma_box(bw, bh):
+            continue
         if bh < h * _MIN_DIGIT_HEIGHT_RATIO or bh > h * _MAX_DIGIT_HEIGHT_RATIO:
             continue
         if bw < max(4, int(bh * _MIN_DIGIT_WIDTH_RATIO)) or bw > w * 0.45:
@@ -218,7 +319,9 @@ def _select_primary_row(
     return sorted(best, key=lambda b: b[0])
 
 
-def _match_digit(patch: np.ndarray) -> Tuple[Optional[int], float]:
+def _match_digit(
+    patch: np.ndarray, max_mean: float = _DIGIT_MATCH_MAX_MEAN
+) -> Tuple[Optional[int], float]:
     templates = _digit_templates()
     if patch.size == 0 or not templates:
         return None, 1e9
@@ -231,31 +334,144 @@ def _match_digit(patch: np.ndarray) -> Tuple[Optional[int], float]:
         if err < best_err:
             best_err = err
             best_digit = digit
-    if best_digit is None or best_err > _DIGIT_MATCH_MAX_MEAN:
+    if best_digit is None or best_err > max_mean:
         return None, best_err
     return best_digit, best_err
 
 
-def _decode_binary(binary: np.ndarray) -> Tuple[Optional[int], float, str]:
-    boxes = _select_primary_row(_segment_digit_boxes(binary))
-    if not boxes:
-        return None, 1e9, "digit_boxes=0"
-    if _stroke_artifact_boxes(boxes):
-        return None, 1e9, "stroke_artifact"
-    n = len(boxes)
-    if n < _MIN_DIGITS or n > _MAX_DIGITS:
-        return None, 1e9, f"digit_count={n}"
+def _expand_box_to_digits(
+    binary: np.ndarray, box: Tuple[int, int, int, int]
+) -> List[Tuple[int, float]]:
+    x, y, bw, bh = box
+    patch = binary[y : y + bh, x : x + bw]
+    digit, err = _match_digit(patch)
+    if digit is not None:
+        return [(digit, err)]
+    if bw >= bh * 0.55:
+        return _multi_split_expand(binary, box)
+    return []
+
+
+def _tail_digit_penalty(digits: List[int]) -> float:
+    penalty = 0.0
+    text = "".join(str(d) for d in digits)
+    if "11" in text:
+        penalty += 18.0
+    if len(digits) >= 3 and digits[-1] == digits[-2]:
+        penalty += 12.0
+    return penalty
+
+
+def _multi_split_expand(
+    binary: np.ndarray,
+    box: Tuple[int, int, int, int],
+    *,
+    hint_digit: Optional[int] = None,
+) -> List[Tuple[int, float]]:
+    x, y, bw, bh = box
+    if bw < bh * 0.55:
+        return []
+    patch = binary[y : y + bh, x : x + bw]
+    proj = patch.sum(axis=0).astype(np.float32)
+    min_cut = max(4, int(bh * 0.35))
+    candidates: List[List[Tuple[int, float]]] = []
+
+    def consider(parts: List[np.ndarray]) -> None:
+        seq: List[Tuple[int, float]] = []
+        for part in parts:
+            digit, err = _match_digit(part, _WIDE_SPLIT_MAX_MEAN)
+            if digit is None:
+                return
+            seq.append((digit, err))
+        if len(seq) >= 2:
+            candidates.append(seq)
+
+    cut_candidates: List[int] = []
+    if bw > min_cut * 2:
+        mid_lo = min_cut
+        mid_hi = bw - min_cut
+        if mid_hi > mid_lo:
+            cut_candidates.append(mid_lo + int(np.argmin(proj[mid_lo:mid_hi])))
+        valley = _find_split_valley(proj, 0.2, 0.8)
+        if valley is not None:
+            cut_candidates.append(valley)
+        for ratio in (0.33, 0.45, 0.55, 0.67):
+            cut_candidates.append(int(bw * ratio))
+    for cut in sorted(set(c for c in cut_candidates if min_cut <= c <= bw - min_cut)):
+        consider([patch[:, :cut], patch[:, cut:]])
+
+    for c1 in sorted(set(c for c in cut_candidates if min_cut <= c <= bw - min_cut * 2)):
+        rest = patch[:, c1:]
+        rest_proj = rest.sum(axis=0).astype(np.float32)
+        inner_cuts = [int(len(rest_proj) * r) for r in (0.35, 0.5, 0.65)]
+        valley = _find_split_valley(rest_proj, 0.2, 0.8)
+        if valley is not None:
+            inner_cuts.append(valley)
+        for c2 in sorted(set(c for c in inner_cuts if min_cut <= c <= len(rest_proj) - min_cut)):
+            consider([patch[:, :c1], patch[:, c1 : c1 + c2], patch[:, c1 + c2 :]])
+
+    if not candidates:
+        return []
+    if hint_digit is not None:
+        hinted = [seq for seq in candidates if seq[0][0] == hint_digit]
+        if hinted:
+            three_part = [seq for seq in hinted if len(seq) >= 3]
+            pool = three_part if three_part else hinted
+            return min(
+                pool,
+                key=lambda seq: (
+                    sum(err for _digit, err in seq)
+                    + _tail_digit_penalty([digit for digit, _err in seq]),
+                    -len(seq),
+                ),
+            )
+    return min(candidates, key=lambda seq: sum(err for _digit, err in seq))
+
+
+def _try_bookend_decode(
+    binary: np.ndarray, boxes: List[Tuple[int, int, int, int]]
+) -> Optional[Tuple[int, float, str]]:
+    if len(boxes) < 2:
+        return None
+    head = _expand_box_to_digits(binary, boxes[0])
+    if not head:
+        return None
+    hint_digit: Optional[int] = None
+    if len(boxes) >= 3:
+        middle = _expand_box_to_digits(binary, boxes[1])
+        if middle:
+            hint_digit = middle[0][0]
+    tail = _multi_split_expand(binary, boxes[-1], hint_digit=hint_digit)
+    if not tail:
+        return None
+    head_digit, head_err = head[0]
+    tail_digits = [digit for digit, _err in tail]
+    tail_err = sum(err for _digit, err in tail)
+    value = int(f"{head_digit}{''.join(map(str, tail_digits))}")
+    err = (head_err + tail_err) / (1 + len(tail_digits))
+    penalty = 0.0
+    total_digits = len(str(value))
+    if len(boxes) >= 3 and len(tail_digits) < 3:
+        penalty += 40.0
+    if total_digits not in _PREFERRED_DIGITS:
+        penalty += 12.0
+    return value, err + penalty, f"bookend n={1 + len(tail_digits)}"
+
+
+def _decode_box_group(
+    binary: np.ndarray, boxes: List[Tuple[int, int, int, int]]
+) -> Tuple[Optional[int], float, str]:
     digits: List[str] = []
     total_err = 0.0
-    for x, y, bw, bh in boxes:
-        patch = binary[y : y + bh, x : x + bw]
-        digit, err = _match_digit(patch)
-        if digit is None:
-            return None, 1e9, f"match_fail@{x}"
-        digits.append(str(digit))
-        total_err += err
-    if not digits:
-        return None, 1e9, "no_digits"
+    for box in boxes:
+        expanded = _expand_box_to_digits(binary, box)
+        if not expanded:
+            return None, 1e9, f"match_fail@{box[0]}"
+        for digit, err in expanded:
+            digits.append(str(digit))
+            total_err += err
+    if len(digits) < _MIN_DIGITS:
+        return None, 1e9, f"digit_count={len(digits)}"
     try:
         value = int("".join(digits))
     except ValueError:
@@ -265,25 +481,97 @@ def _decode_binary(binary: np.ndarray) -> Tuple[Optional[int], float, str]:
     if _suspicious_coin_value(value):
         return None, 1e9, "suspicious"
     mean_err = total_err / len(digits)
-    penalty = 0.0
-    if n not in _PREFERRED_DIGITS:
-        penalty += 12.0
-    return value, mean_err + penalty, f"n={n}"
+    penalty = 0.0 if len(digits) in _PREFERRED_DIGITS else 12.0
+    return value, mean_err + penalty, f"n={len(digits)}"
 
 
-def _decode_gray_sources(gray: np.ndarray, bgr: Optional[np.ndarray]) -> List[Tuple[int, float, str]]:
-    out: List[Tuple[int, float, str]] = []
-    sources: List[Tuple[np.ndarray, str]] = [(gray, "full")]
+def _decode_binary(binary: np.ndarray) -> Tuple[Optional[int], float, str]:
+    boxes = _select_primary_row(_segment_digit_boxes(binary))
+    if not boxes:
+        return None, 1e9, "digit_boxes=0"
+    if _stroke_artifact_boxes(boxes):
+        return None, 1e9, "stroke_artifact"
+
+    best: Optional[Tuple[int, float, str]] = None
+    bookend = _try_bookend_decode(binary, boxes)
+    if bookend is not None:
+        best = bookend
+    for start in range(len(boxes)):
+        for end in range(start + _MIN_DIGITS, min(start + _MAX_DIGITS + 1, len(boxes) + 1)):
+            window = boxes[start:end]
+            val, err, dbg = _decode_box_group(binary, window)
+            if val is None:
+                continue
+            if best is None or err < best[1]:
+                best = (val, err, dbg)
+    if best is None:
+        n = len(boxes)
+        return None, 1e9, f"digit_count={n}"
+    return best
+
+
+def _right_digit_strip(gray: np.ndarray, skip_ratio: float = 0.22) -> Optional[np.ndarray]:
+    x_skip = int(gray.shape[1] * skip_ratio)
+    if gray.shape[1] - x_skip < 16:
+        return None
+    return gray[:, x_skip:]
+
+
+def _gray_source_variants(gray: np.ndarray, bgr: Optional[np.ndarray]) -> List[Tuple[np.ndarray, str]]:
+    sources: List[Tuple[np.ndarray, str]] = []
     if bgr is not None:
         strip = _gray_digit_strip(gray, bgr)
         if strip is not None:
             sources.append((strip, "strip"))
-    for src, tag in sources:
-        for binary in _binarize_variants(src):
-            val, err, dbg = _decode_binary(binary)
-            if val is not None:
-                bonus = -4.0 if tag == "strip" else 0.0
-                out.append((val, err + bonus, f"{tag} {dbg}"))
+    if gray.shape[0] >= 18:
+        bottom = gray[int(gray.shape[0] * 0.42) :]
+        if bottom.shape[0] >= 8:
+            sources.append((bottom, "bottom"))
+            right = _right_digit_strip(bottom)
+            if right is not None:
+                sources.append((right, "bottom-right"))
+    right = _right_digit_strip(gray)
+    if right is not None:
+        sources.append((right, "right"))
+    sources.append((gray, "full"))
+    return sources
+
+
+def _enhance_gray_variants(gray: np.ndarray) -> List[Tuple[np.ndarray, str]]:
+    variants: List[Tuple[np.ndarray, str]] = [(gray, "raw")]
+    if float(gray.mean()) >= 40:
+        return variants
+    if float(gray.max()) >= 200 and len(np.unique(gray)) <= 16:
+        return variants
+    tile_w = max(2, min(8, gray.shape[1] // 8))
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(2, tile_w))
+    enhanced = clahe.apply(gray)
+    variants.append((enhanced, "clahe"))
+    boosted = np.clip(enhanced.astype(np.float32) * 2.2, 0, 255).astype(np.uint8)
+    variants.append((boosted, "boost"))
+    return variants
+
+
+def _decode_gray_sources(gray: np.ndarray, bgr: Optional[np.ndarray]) -> List[Tuple[int, float, str]]:
+    out: List[Tuple[int, float, str]] = []
+    if float(gray.max()) >= 200 and len(np.unique(gray)) <= 16:
+        val, err, dbg = _decode_binary(gray)
+        if val is not None:
+            out.append((val, err - 8.0, f"binary {dbg}"))
+    for base_gray, base_tag in _enhance_gray_variants(gray):
+        for src, tag in _gray_source_variants(base_gray, bgr):
+            src_tag = tag if base_tag == "raw" else f"{base_tag}/{tag}"
+            for binary in _binarize_variants(src):
+                val, err, dbg = _decode_binary(binary)
+                if val is not None:
+                    bonus = 0.0
+                    if tag in {"strip", "bottom-right", "right"}:
+                        bonus -= 4.0
+                    elif tag == "bottom":
+                        bonus -= 2.0
+                    if base_tag == "clahe":
+                        bonus -= 1.0
+                    out.append((val, err + bonus, f"{src_tag} {dbg}"))
     return out
 
 
@@ -303,7 +591,19 @@ def read_coin_gain(roi: QImage) -> Tuple[Optional[int], float, str]:
     candidates = _decode_gray_sources(gray, bgr)
     if not candidates:
         return None, 1e9, "decode失敗"
-    best = min(candidates, key=lambda c: c[1])
+
+    def _candidate_rank(item: Tuple[int, float, str]) -> tuple[float, float]:
+        val, err, dbg = item
+        score = err
+        if len(str(val)) not in _PREFERRED_DIGITS:
+            score += 15.0
+        if "bookend" in dbg:
+            score -= 6.0
+        if _suspicious_coin_value(val):
+            score += 50.0
+        return (score, err)
+
+    best = min(candidates, key=_candidate_rank)
     return best[0], best[1], f"ok err={best[1]:.1f} {best[2]}"
 
 

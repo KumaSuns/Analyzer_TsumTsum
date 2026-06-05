@@ -150,4 +150,70 @@ def deduplicate_scene_dataset(
                 if log:
                     log(f"  削除失敗: {p} ({exc})")
 
+    invalidate_scene_image_hash_index()
     return report
+
+
+SAVE_SKIP_DUPLICATE_PREFIX = "skip_duplicate:"
+
+
+def file_content_hash(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def build_scene_image_hash_index(images_root: Path) -> dict[str, Path]:
+    index: dict[str, Path] = {}
+    for path in _collect_images(images_root):
+        digest = file_content_hash(path)
+        if digest and digest not in index:
+            index[digest] = path
+    return index
+
+
+class _SceneImageHashIndex:
+    def __init__(self) -> None:
+        self._root: Path | None = None
+        self._index: dict[str, Path] = {}
+
+    def ensure(self, images_root: Path) -> None:
+        root = images_root.resolve()
+        if self._root != root:
+            self._root = root
+            self._index = build_scene_image_hash_index(root)
+
+    def find(self, images_root: Path, digest: str) -> Path | None:
+        self.ensure(images_root)
+        return self._index.get(digest)
+
+    def register(self, path: Path) -> None:
+        digest = file_content_hash(path)
+        if digest:
+            self._index[digest] = path
+
+    def invalidate(self) -> None:
+        self._root = None
+        self._index.clear()
+
+
+_scene_image_hash_index = _SceneImageHashIndex()
+
+
+def invalidate_scene_image_hash_index() -> None:
+    _scene_image_hash_index.invalidate()
+
+
+def find_duplicate_scene_image(images_root: Path, image) -> Path | None:
+    """保存前のフレームが train/val に既にある完全同一 PNG ならそのパスを返す。"""
+    from app.services.image_save import training_image_content_hash
+
+    digest = training_image_content_hash(image)
+    if not digest:
+        return None
+    return _scene_image_hash_index.find(images_root, digest)
+
+
+def register_saved_scene_image(path: Path) -> None:
+    _scene_image_hash_index.register(path)
