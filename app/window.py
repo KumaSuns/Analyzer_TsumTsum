@@ -78,9 +78,14 @@ from app.services.skill_classifier import (
 )
 from app.services.use_tsum_classifier import UseTsumClassifier
 from app.services.coin_gain_reader import (
+    _is_slot_decode_dbg,
+    bonus_coin_hud_rect,
+    coin_gain_confirmed_combined,
     consensus_coin_gain,
     opencv_available,
+    plausible_coin_value,
     read_coin_gain,
+    read_coin_hud,
 )
 from app.services.remaining_time_reader import read_remaining_seconds
 from app.services.file_video import FileVideoSource, is_file_video_available
@@ -115,8 +120,8 @@ _PREGAME_HIT_NONE_GAP = 3
 _CNN_GO_MARGIN_MAX = 0.45
 # item 確定後の ready 探索（猶予は streak 用。WAIT_GO へ進むのは CNN ready のみ）
 _WAIT_READY_GRACE_SAMPLES = 60
-# ready/go: train/none 参照・セッション veto・いいえ後抑制は使わない（CNN 判定をそのまま使う）
-_PREGAME_READY_SUPPRESSION_ENABLED = False
+# ready: train/none 参照・セッション veto で none 画面の誤 ready を抑える（go は CNN のまま）
+_PREGAME_READY_SUPPRESSION_ENABLED = True
 _SESSION_READY_NONE_VETO_MAX = 30
 _CNN_READY_NONE_MARGIN = 0.08
 _READY_STRONG_AFTER_REJECT_MAX = 0.42
@@ -553,11 +558,15 @@ class MainWindow(QMainWindow):
         self._go_confirmed_this_game = False
         self._timeup_confirmed_this_game = False
         self._coin_confirmed_this_game = False
+        self._coin_cnn_detected_this_game = False
+        self._coin_post_detect_ocr_left = 0
+        self._coin_modal_acknowledged = False
         self._coin_flow_latched = False
         self._result_confirmed_this_game = False
         self._go_clock_anchor_ms: Optional[int] = None
         self._go_to_timeup_sec: Optional[float] = None
         self._go_to_result_sec: Optional[float] = None
+        self._timeup_position_ms: int = 0
         self._ready_suppressed_this_game = False
         self._wait_ready_grace = 0
         self._item_scan_targets: set[str] = set()
@@ -585,8 +594,10 @@ class MainWindow(QMainWindow):
         ]
         self.crop_target_display = {key: display for display, key in self.crop_targets}
         self._coin_gain_best: Optional[int] = None
-        self._coin_gain_reads: list[tuple[int, float]] = []
+        self._hud_coin_reads: list[tuple[int, float, str]] = []
+        self._gain_coin_reads: list[tuple[int, float, str]] = []
         self._coin_gain_last_debug = ""
+        self._last_completed_round: Optional[dict] = None
         self.trainer = SimpleTrainer(
             images_root=self.project_root / "app/assets/images",
             model_root=self.project_root / "app/models/main_model",
@@ -1221,6 +1232,9 @@ class MainWindow(QMainWindow):
         self._go_confirmed_this_game = False
         self._timeup_confirmed_this_game = False
         self._coin_confirmed_this_game = False
+        self._coin_cnn_detected_this_game = False
+        self._coin_post_detect_ocr_left = 0
+        self._coin_modal_acknowledged = False
         self._coin_flow_latched = False
         self._coin_reject_cooldown = 0
         self._analysis_coin_none_veto = []
@@ -1238,16 +1252,16 @@ class MainWindow(QMainWindow):
         self._wait_ready_grace = 0
         self._analysis_confirm_edge_key = ""
         self._clear_analysis_confirm_edge_prefix("coin")
-        self._go_clock_anchor_ms = None
-        self._go_to_timeup_sec = None
-        self._go_to_result_sec = None
-        self._refresh_round_timing_label()
 
     def _refresh_round_timing_label(self) -> None:
         label = getattr(self, "counter_round_timing_label", None)
         if label is None or not _is_alive_qobject(label):
             return
-        if self._go_clock_anchor_ms is None:
+        if (
+            self._go_clock_anchor_ms is None
+            and self._go_to_timeup_sec is None
+            and self._go_to_result_sec is None
+        ):
             label.setText("go→timeup -- / go→result --")
             return
         tu = (
@@ -1319,7 +1333,7 @@ class MainWindow(QMainWindow):
         if scene_key == "timeup":
             return flow_phase == "IN_GAME"
         if scene_key == "coin":
-            if self._coin_confirmed_this_game or self._coin_flow_latched:
+            if self._coin_confirmed_this_game or self._coin_cnn_detected_this_game:
                 return False
             return flow_phase in ("WAIT_BONUS", "WAIT_COIN")
         if scene_key == "result":
@@ -1330,6 +1344,7 @@ class MainWindow(QMainWindow):
         if self._timeup_confirmed_this_game:
             return
         self._timeup_confirmed_this_game = True
+        self._timeup_position_ms = max(0, int(position_ms))
         elapsed = self._elapsed_sec_since_go(position_ms)
         if elapsed is not None:
             self._go_to_timeup_sec = elapsed
@@ -1341,6 +1356,7 @@ class MainWindow(QMainWindow):
             self.flow_phase = "WAIT_COIN"
             self._reset_coin_gain_capture()
             self._reset_coin_hunt_state()
+            self._coin_flow_latched = True
         self._reset_fever_latch()
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
             self.counter_analysis_state_label
@@ -1410,9 +1426,29 @@ class MainWindow(QMainWindow):
 
     def _reset_coin_gain_capture(self) -> None:
         self._coin_gain_best = None
-        self._coin_gain_reads = []
+        self._hud_coin_reads = []
+        self._gain_coin_reads = []
         self._coin_gain_last_debug = ""
         self._refresh_coin_gain_label()
+
+    @staticmethod
+    def _unreliable_slot_coin_read(dbg: str) -> bool:
+        return _is_slot_decode_dbg(dbg) and "n=4" not in dbg and "head_tail" not in dbg
+
+    def _recompute_coin_gain_best(self) -> None:
+        hud_pick = consensus_coin_gain(
+            [(v, e) for v, e, _d in self._hud_coin_reads]
+        )
+        gain_pick = consensus_coin_gain(
+            [(v, e) for v, e, _d in self._gain_coin_reads]
+        )
+        if hud_pick is not None and (
+            gain_pick is None
+            or len(self._hud_coin_reads) >= len(self._gain_coin_reads)
+        ):
+            self._coin_gain_best = hud_pick
+        else:
+            self._coin_gain_best = gain_pick
 
     def _reset_coin_hunt_state(self) -> None:
         """timeup/bonus 後の coin 探索開始時に、誤検知 veto で検知不能になるのを防ぐ。"""
@@ -1420,16 +1456,48 @@ class MainWindow(QMainWindow):
         self._coin_veto_frame_indices = set()
         self._coin_reject_cooldown = 0
         self._coin_flow_latched = False
+        self._coin_modal_acknowledged = False
         self._clear_analysis_confirm_edge_prefix("coin")
+
+    def _snapshot_completed_round(self) -> None:
+        self._last_completed_round = {
+            "use_tsum": self.locked_use_tsum,
+            "item_targets": list(self.locked_item_targets),
+            "coin_gain": self._coin_gain_best,
+            "fever_count": self._fever_count,
+            "skill_count": self._skill_count,
+        }
 
     def _refresh_coin_gain_label(self) -> None:
         label = getattr(self, "counter_coin_gain_label", None)
         if label is None or not _is_alive_qobject(label):
             return
-        if self._coin_gain_best is not None:
-            label.setText(f"獲得コイン: {self._coin_gain_best:,}")
+        coin_gain = self._coin_gain_best
+        if coin_gain is None and self._last_completed_round:
+            coin_gain = self._last_completed_round.get("coin_gain")
+        if coin_gain is not None:
+            label.setText(f"獲得コイン: {coin_gain:,}")
         else:
             label.setText("獲得コイン: --")
+
+    def _refresh_fever_skill_counter_labels(self) -> None:
+        fever = self._fever_count
+        skill = self._skill_count
+        if (
+            self._last_completed_round
+            and not self.locked_item_fixed
+            and not self._game_active
+        ):
+            fever = self._last_completed_round.get("fever_count", fever)
+            skill = self._last_completed_round.get("skill_count", skill)
+        if hasattr(self, "counter_fever_count_label") and _is_alive_qobject(
+            self.counter_fever_count_label
+        ):
+            self.counter_fever_count_label.setText(f"fever回数: {fever}")
+        if hasattr(self, "counter_skill_count_label") and _is_alive_qobject(
+            self.counter_skill_count_label
+        ):
+            self.counter_skill_count_label.setText(f"スキル回数: {skill}")
 
     def _crop_frame_roi(self, frame_image, key: str) -> Optional[QImage]:
         positions = self.crop_positions_for_analysis or self._load_crop_positions()
@@ -1468,26 +1536,148 @@ class MainWindow(QMainWindow):
             return None
         return cropped
 
-    def _update_coin_gain_capture(self, frame_image) -> None:
+    def _expanded_normalized_rect(
+        self, rect: list, *, pad_x: float, pad_y: float, grow_w: float, grow_h: float, min_h: float = 0.0
+    ) -> tuple[float, float, float, float]:
+        nx, ny, nw, nh = (float(rect[i]) for i in range(4))
+        nh = max(nh, min_h)
+        left = max(0.0, nx - nw * pad_x)
+        top = max(0.0, ny - nh * pad_y)
+        width = min(1.0 - left, nw * grow_w)
+        height = min(1.0 - top, nh * grow_h)
+        return (left, top, width, height)
+
+    def _coin_gain_rois_for_capture(self, frame_image, scene: str = "") -> list:
+        positions = self.crop_positions_for_analysis or self._load_crop_positions()
+        scene_key = (self._coin_effective_capture_scene(scene) or "").strip().lower()
+        rois: list = []
+        if scene_key == "bonus":
+            bonus_rect = bonus_coin_hud_rect(positions)
+            bonus_roi = UseTsumClassifier._crop_by_normalized_rect(
+                frame_image, bonus_rect
+            )
+            if bonus_roi is not None and not bonus_roi.isNull():
+                rois.append(bonus_roi)
+        coin_rect = positions.get("coin") if isinstance(positions, dict) else None
+        if isinstance(coin_rect, list) and len(coin_rect) == 4:
+            try:
+                nx, ny, nw, nh = (float(coin_rect[i]) for i in range(4))
+                nh = max(nh, 0.055)
+                tight = UseTsumClassifier._crop_by_normalized_rect(
+                    frame_image, (nx, ny, nw, nh)
+                )
+                if tight is not None and not tight.isNull():
+                    rois.append(tight)
+                hud_rect = (
+                    nx,
+                    max(0.0, ny - nh * 0.35),
+                    min(1.0 - nx, nw * 1.08),
+                    min(1.0 - max(0.0, ny - nh * 0.35), nh * 1.55),
+                )
+                coin_hud = UseTsumClassifier._crop_by_normalized_rect(
+                    frame_image, hud_rect
+                )
+                if coin_hud is not None and not coin_hud.isNull():
+                    rois.append(coin_hud)
+            except (TypeError, ValueError):
+                pass
+        gain_rois: list = []
+        primary = self._crop_frame_roi_from_positions(frame_image, positions, "coin_gain")
+        if primary is not None and not primary.isNull():
+            gain_rois.append(primary)
+        gain_rect = positions.get("coin_gain") if isinstance(positions, dict) else None
+        if isinstance(gain_rect, list) and len(gain_rect) == 4:
+            try:
+                expanded_rect = self._expanded_normalized_rect(
+                    gain_rect, pad_x=0.04, pad_y=0.35, grow_w=1.08, grow_h=1.7, min_h=0.048
+                )
+                expanded = UseTsumClassifier._crop_by_normalized_rect(
+                    frame_image, expanded_rect
+                )
+                if expanded is not None and not expanded.isNull():
+                    gain_rois.append(expanded)
+            except (TypeError, ValueError):
+                pass
+        if scene_key == "bonus":
+            return rois[:1] if rois else rois
+        if scene_key == "coin":
+            if gain_rois:
+                return gain_rois[:1]
+            return rois[:1] if rois else rois
+        return rois + gain_rois
+
+    def _coin_roi_read_jobs(
+        self, rois: list, scene: str
+    ) -> list[tuple[QImage, str]]:
+        scene_key = (scene or "").strip().lower()
+        jobs: list[tuple[QImage, str]] = []
+        n_hud = min(2, len(rois))
+        for idx, roi in enumerate(rois):
+            if scene_key == "bonus":
+                source = "hud"
+            elif scene_key == "coin":
+                source = "gain" if idx < max(0, len(rois) - n_hud) else "hud"
+            else:
+                source = "hud" if idx < n_hud else "gain"
+            jobs.append((roi, source))
+        return jobs
+
+    def _coin_effective_capture_scene(self, scene: str) -> str:
+        return scene
+
+    def _coin_capture_scene_allowed(self, scene: str) -> bool:
+        return (scene or "").strip().lower() == "coin"
+
+    def _update_coin_gain_capture(self, frame_image, scene: str = "") -> None:
         if frame_image is None or frame_image.isNull():
+            return
+        scene = self._coin_effective_capture_scene(scene)
+        if not self._coin_capture_scene_allowed(scene):
             return
         if not opencv_available():
             self._coin_gain_last_debug = "opencv未導入"
             self._refresh_coin_gain_label()
             return
-        roi = self._crop_frame_roi(frame_image, "coin_gain")
-        if roi is None:
+        rois = self._coin_gain_rois_for_capture(frame_image, scene=scene)
+        if not rois:
             self._coin_gain_last_debug = "範囲未設定"
             self._refresh_coin_gain_label()
             return
-        value, err, dbg = read_coin_gain(roi)
+        frame_reads: list[tuple[int, float, str, str]] = []
+        for roi, source in self._coin_roi_read_jobs(rois, scene):
+            if source == "hud":
+                value, err, dbg = read_coin_hud(roi)
+            else:
+                value, err, dbg = read_coin_gain(roi)
+            if value is None or not plausible_coin_value(value):
+                self._coin_gain_last_debug = dbg
+                continue
+            frame_reads.append((value, err, dbg, source))
+        if len({value for value, _err, _dbg, _src in frame_reads}) > 1:
+            parts = ", ".join(
+                f"{value}@{err:.1f}({src})"
+                for value, err, _dbg, src in frame_reads
+            )
+            self._coin_gain_last_debug = f"roi_conflict {parts}"
+            self._refresh_coin_gain_label()
+            return
+        if not frame_reads:
+            self._refresh_coin_gain_label()
+            return
+        value, err, dbg, source = min(frame_reads, key=lambda item: item[1])
+        if source == "gain" and self._unreliable_slot_coin_read(dbg):
+            self._coin_gain_last_debug = f"skip_gain {value} ({dbg})"
+            self._refresh_coin_gain_label()
+            self._maybe_finalize_coin_confirmation()
+            return
         self._coin_gain_last_debug = dbg
-        if value is not None:
-            self._coin_gain_reads.append((value, err))
-            picked = consensus_coin_gain(self._coin_gain_reads)
-            if picked is not None:
-                self._coin_gain_best = picked
+        if source == "hud":
+            self._hud_coin_reads.append((value, err, dbg))
+        else:
+            self._gain_coin_reads.append((value, err, dbg))
+        self._recompute_coin_gain_best()
         self._refresh_coin_gain_label()
+        self._maybe_finalize_coin_confirmation()
 
     def _log_coin_gain_capture(self, note: str = "") -> None:
         if not hasattr(self, "log_view") or not _is_alive_qobject(self.log_view):
@@ -1506,6 +1696,7 @@ class MainWindow(QMainWindow):
         self.flow_phase = "WAIT_COIN"
         self._reset_coin_gain_capture()
         self._reset_coin_hunt_state()
+        self._coin_flow_latched = True
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
             self.counter_analysis_state_label
         ):
@@ -1580,11 +1771,13 @@ class MainWindow(QMainWindow):
             feat, self._analysis_coin_none_veto, _NONE_VETO_SESSION_MAX
         )
 
-    def _confirm_coin_detection(self, frame_image=None) -> None:
+    def _finalize_coin_confirmation(self) -> None:
         if self._coin_confirmed_this_game:
             return
-        if frame_image is not None and not frame_image.isNull():
-            self._update_coin_gain_capture(frame_image)
+        if not plausible_coin_value(self._coin_gain_best):
+            return
+        if not coin_gain_confirmed_combined(self._hud_coin_reads, self._gain_coin_reads):
+            return
         self._coin_confirmed_this_game = True
         self._log_coin_gain_capture("coin確定")
         self.flow_phase = "WAIT_RESULT"
@@ -1594,6 +1787,52 @@ class MainWindow(QMainWindow):
             self.counter_analysis_state_label.setText(
                 f"解析状態: G{self.flow_game_index} {self.flow_phase}"
             )
+
+    def _maybe_finalize_coin_confirmation(self, frame_image=None) -> None:
+        if self._coin_confirmed_this_game:
+            return
+        if (
+            self._analysis_scene_confirm_enabled("coin")
+            and not self._coin_modal_acknowledged
+        ):
+            return
+        if not self._coin_flow_latched:
+            return
+        if not coin_gain_confirmed_combined(self._hud_coin_reads, self._gain_coin_reads):
+            return
+        self._finalize_coin_confirmation()
+
+    def _acknowledge_coin_scene(self, frame_image=None) -> None:
+        """コイン画面の確認（モーダル「はい」）。数値が読めたら WAIT_RESULT へ進む。"""
+        self._coin_modal_acknowledged = True
+        self._coin_flow_latched = True
+        if frame_image is not None and not frame_image.isNull():
+            self._update_coin_gain_capture(frame_image, scene="coin")
+        self._maybe_finalize_coin_confirmation()
+
+    def _mark_coin_cnn_detected(self) -> None:
+        """coin シーン CNN 検知は1ゲーム1回。"""
+        self._coin_cnn_detected_this_game = True
+        self._coin_flow_latched = True
+        self._coin_post_detect_ocr_left = 3
+
+    def _coin_ocr_scene_this_step(self, flow_raw: str) -> str | None:
+        """coin 画面検知後のみ OCR（coin シーンフレームから獲得コインを読む）。"""
+        if self._coin_confirmed_this_game or not self._coin_cnn_detected_this_game:
+            return None
+        if self._coin_post_detect_ocr_left <= 0:
+            return None
+        if (flow_raw or "").strip().lower() != "coin":
+            return None
+        self._coin_post_detect_ocr_left -= 1
+        return "coin"
+
+    def _confirm_coin_detection(self, frame_image=None, scene: str = "") -> None:
+        if self._coin_confirmed_this_game:
+            return
+        if frame_image is not None and not frame_image.isNull():
+            self._update_coin_gain_capture(frame_image, scene=scene)
+        self._maybe_finalize_coin_confirmation()
 
     def _record_coin_none_rejection(self, frame_image, frame_index: int) -> None:
         self._coin_reject_cooldown = _COIN_REJECT_COOLDOWN_SAMPLES
@@ -1648,6 +1887,25 @@ class MainWindow(QMainWindow):
     def _result_cnn_top1_detected(self, ranked: list) -> bool:
         return bool(ranked) and ranked[0][0] == "result" and ranked[0][1] < _CNN_RESULT_DETECT_MAX
 
+    def _result_cnn_detected(self, ranked: list) -> bool:
+        """WAIT_RESULT: top1=result または score が僅差の result 候補。"""
+        if not ranked:
+            return False
+        if self._result_cnn_top1_detected(ranked):
+            return True
+        top_score = float(ranked[0][1])
+        for i, (cls, score) in enumerate(ranked[:4]):
+            if cls != "result":
+                continue
+            sc = float(score)
+            if sc >= _CNN_RESULT_DETECT_MAX:
+                continue
+            if i == 0:
+                return True
+            if sc - top_score <= 0.14:
+                return True
+        return False
+
     def _append_session_result_none_veto(self, frame_image) -> None:
         if frame_image is None or frame_image.isNull():
             return
@@ -1663,7 +1921,7 @@ class MainWindow(QMainWindow):
     def _result_blocked_by_session_veto(
         self, frame_image, scene_feature=None, ranked: list | None = None
     ) -> bool:
-        if ranked and self._result_cnn_top1_detected(ranked):
+        if ranked and self._result_cnn_detected(ranked):
             return False
         if not self._analysis_result_none_veto:
             return False
@@ -1696,6 +1954,7 @@ class MainWindow(QMainWindow):
                 f"解析状態: G{self.flow_game_index} {self.flow_phase}"
             )
         self._refresh_item_counter_labels()
+        self._refresh_fever_skill_counter_labels()
 
     def _confirm_result_detection(self, position_ms: int = 0) -> None:
         if self._result_confirmed_this_game:
@@ -1705,6 +1964,7 @@ class MainWindow(QMainWindow):
             self._go_to_result_sec = elapsed
             self._log_go_elapsed("result", position_ms, elapsed)
             self._refresh_round_timing_label()
+        self._snapshot_completed_round()
         self._result_confirmed_this_game = True
         self._advance_after_result_confirmed()
 
@@ -2931,6 +3191,7 @@ class MainWindow(QMainWindow):
         self._on_player_position_changed(self._cv_position_ms)
         if analyze_now:
             self._run_analysis_step(self._cv_position_ms, img)
+            QApplication.processEvents()
 
     def _cv_play(self) -> None:
         if not getattr(self, "use_opencv_for_video", False) or self.cv_source is None or not self.cv_source.is_open:
@@ -2958,6 +3219,28 @@ class MainWindow(QMainWindow):
         self._update_playback_indicators(self._cv_position_ms)
         self._on_end_of_media_cleanup()
 
+    def _after_analysis_coin_phase(self) -> None:
+        if self._coin_confirmed_this_game:
+            return
+        if (
+            self.flow_phase == "WAIT_COIN"
+            and coin_gain_confirmed_combined(
+                self._hud_coin_reads, self._gain_coin_reads
+            )
+        ):
+            self._finalize_coin_confirmation()
+        if (
+            hasattr(self, "log_view")
+            and _is_alive_qobject(self.log_view)
+            and self.flow_phase == "WAIT_COIN"
+            and not self._coin_confirmed_this_game
+        ):
+            self.log_view.append(
+                "獲得コイン未確定: "
+                f"hud={len(self._hud_coin_reads)} gain={len(self._gain_coin_reads)} "
+                f"[{self._coin_gain_last_debug}]"
+            )
+
     def _on_end_of_media_cleanup(self) -> None:
         if self.analysis_running:
             self.analysis_running = False
@@ -2968,6 +3251,11 @@ class MainWindow(QMainWindow):
             self._sync_analysis_control_buttons(running=False)
             if hasattr(self, "log_view"):
                 self.log_view.append("解析完了: 動画終端に到達しました。")
+            if (
+                self.flow_phase in ("WAIT_COIN", "WAIT_BONUS")
+                and not self._coin_confirmed_this_game
+            ):
+                self._after_analysis_coin_phase()
         self._update_step_buttons_enabled()
 
     def _on_player_error(self, error, error_string: str) -> None:
@@ -3793,9 +4081,22 @@ class MainWindow(QMainWindow):
         margin_max: float = _CNN_PREGAME_MARGIN_MAX,
         frame_image=None,
         scene_feature=None,
+        frame_index: int = -1,
     ) -> str:
         if use_cnn:
-            return self._pregame_cnn_hit_strength(raw_scene, ranked, target=target)
+            strength = self._pregame_cnn_hit_strength(raw_scene, ranked, target=target)
+            if (
+                target == "ready"
+                and strength != "none"
+                and (
+                    (frame_index >= 0 and self._ready_frame_vetoed(frame_index))
+                    or self._ready_blocked_by_session_veto(
+                        frame_image, scene_feature, ranked=ranked
+                    )
+                )
+            ):
+                return "none"
+            return strength
         if raw_scene == target:
             return "strong"
         if ranked and ranked[0][0] == target:
@@ -3942,30 +4243,12 @@ class MainWindow(QMainWindow):
     ) -> bool:
         if not _PREGAME_READY_SUPPRESSION_ENABLED:
             return False
-        if (
-            ranked
-            and ranked[0][0] == "ready"
-            and float(ranked[0][1]) < _CNN_READY_DETECT_MAX
-        ):
-            return False
-        if self._ready_cnn_none_ranked_blocks(ranked):
-            return True
         feat = scene_feature
         if not feat and frame_image is not None and not frame_image.isNull():
             feat = image_to_feature(frame_image)
         if not feat:
             return False
-        ready_score = None
-        if ranked:
-            ready_score = next((float(s) for c, s in ranked if c == "ready"), None)
-        centroid = self.video_analyzer.scene_classifier.model
-        if centroid.none_veto_exemplars:
-            if feature_matches_none_exemplars(
-                feat, centroid.none_veto_exemplars, max(_NONE_VETO_ABSOLUTE_MAX, 0.02)
-            ):
-                return True
-            if centroid.none_veto_blocks_ready(feat, ready_score=ready_score):
-                return True
+        # 解析中に「いいえ→none」した画面は CNN の自信度より優先
         if self._analysis_ready_none_veto and feature_matches_none_exemplars(
             feat, self._analysis_ready_none_veto, _NONE_VETO_SESSION_MAX
         ):
@@ -3973,6 +4256,23 @@ class MainWindow(QMainWindow):
         if self._analysis_ready_none_veto and feature_matches_none_exemplars(
             feat, self._analysis_ready_none_veto, _NONE_VETO_ABSOLUTE_MAX
         ):
+            return True
+        ready_score = None
+        if ranked:
+            ready_score = next((float(s) for c, s in ranked if c == "ready"), None)
+        centroid = self.video_analyzer.scene_classifier.model
+        if centroid.none_veto_exemplars:
+            if feature_matches_none_exemplars(
+                feat, centroid.none_veto_exemplars, _NONE_VETO_SESSION_MAX
+            ):
+                return True
+            if feature_matches_none_exemplars(
+                feat, centroid.none_veto_exemplars, _NONE_VETO_ABSOLUTE_MAX
+            ):
+                return True
+            if centroid.none_veto_blocks_ready(feat, ready_score=ready_score):
+                return True
+        if self._ready_cnn_none_ranked_blocks(ranked):
             return True
         return False
 
@@ -4782,13 +5082,13 @@ class MainWindow(QMainWindow):
                 )
                 item_debug = "item_lock:ON"
             result.scene_label = scene_label
+            coin_ocr_scene = self._coin_ocr_scene_this_step(flow_raw)
             if (
-                not self._coin_confirmed_this_game
+                coin_ocr_scene
                 and frame_image is not None
                 and not frame_image.isNull()
-                and scene_label == "coin"
             ):
-                self._update_coin_gain_capture(frame_image)
+                self._update_coin_gain_capture(frame_image, scene=coin_ocr_scene)
             skill_tsum_dir = (
                 self._resolve_tsum_dir(self.locked_use_tsum) if self.locked_item_fixed else use_tsum_dir
             )
@@ -4859,6 +5159,13 @@ class MainWindow(QMainWindow):
             if confirm_label == "bonus" and (
                 self._bonus_frame_vetoed(result.frame_index)
                 or self._bonus_blocked_by_session_veto(
+                    frame_image, scene_feature, ranked=ranked
+                )
+            ):
+                confirm_label = "none"
+            if confirm_label == "ready" and (
+                self._ready_frame_vetoed(result.frame_index)
+                or self._ready_blocked_by_session_veto(
                     frame_image, scene_feature, ranked=ranked
                 )
             ):
@@ -5063,7 +5370,7 @@ class MainWindow(QMainWindow):
                 rs = self._result_score_from_ranked(ranked)
                 top = ranked[0][0] if ranked else "-"
                 if top == "result" or (rs is not None and rs < 0.20):
-                    det = self._result_cnn_top1_detected(ranked)
+                    det = self._result_cnn_detected(ranked)
                     self.log_view.append(
                         f"  result_cnn: top1={top} score={rs:.3f} "
                         f"detect={'YES' if det else 'NO'} (閾値<{_CNN_RESULT_DETECT_MAX})"
@@ -5098,6 +5405,7 @@ class MainWindow(QMainWindow):
                 self._timeup_stop_seen = 0
 
     def _reset_analysis_flow(self) -> None:
+        self._last_completed_round = None
         self._clear_time_efficiency_go_skip_state()
         self.flow_phase = "WAIT_ITEM"
         self.flow_game_index = 1
@@ -5141,6 +5449,11 @@ class MainWindow(QMainWindow):
         self._pregame_go_latched = False
         self._game_active = False
         self._reset_per_game_scene_flags()
+        self._go_clock_anchor_ms = None
+        self._go_to_timeup_sec = None
+        self._go_to_result_sec = None
+        self._timeup_position_ms = 0
+        self._refresh_round_timing_label()
         self._item_scan_targets = set()
         self._item_scene_active = False
         self._item_use_tsum_pending = "-"
@@ -5158,10 +5471,9 @@ class MainWindow(QMainWindow):
         self._item_use_tsum_pending = "-"
         self._restore_analysis_sampling()
         self._ingame_sample_saved = None
-        if hasattr(self, "counter_fever_count_label") and _is_alive_qobject(self.counter_fever_count_label):
-            self.counter_fever_count_label.setText("fever回数: 0")
-        if hasattr(self, "counter_skill_count_label") and _is_alive_qobject(self.counter_skill_count_label):
-            self.counter_skill_count_label.setText("スキル回数: 0")
+        self._refresh_item_counter_labels()
+        self._refresh_coin_gain_label()
+        self._refresh_fever_skill_counter_labels()
 
     def _register_fever_count(self, position_ms: int) -> None:
         """fever 確定のたびにカウンタ（同一フィーバーは間隔でまとめる）。"""
@@ -5287,6 +5599,7 @@ class MainWindow(QMainWindow):
                 margin_max=_CNN_READY_MARGIN_MAX,
                 frame_image=frame_image,
                 scene_feature=scene_feature,
+                frame_index=frame_index,
             )
             ready_hit_frame = ready_strength != "none"
             if ready_hit_frame:
@@ -5338,6 +5651,7 @@ class MainWindow(QMainWindow):
                     margin_max=_CNN_READY_MARGIN_MAX,
                     frame_image=frame_image,
                     scene_feature=scene_feature,
+                    frame_index=frame_index,
                 )
                 if late_ready != "none":
                     self._pregame_ready_pending = True
@@ -5610,12 +5924,10 @@ class MainWindow(QMainWindow):
                         frame_image=frame_image,
                     )
                 ):
-                    self._coin_flow_latched = True
+                    self._mark_coin_cnn_detected()
                     scene = "coin"
-                    if frame_image is not None and not frame_image.isNull():
-                        self._update_coin_gain_capture(frame_image)
                     if not self._analysis_scene_confirm_enabled("coin"):
-                        self._confirm_coin_detection(frame_image)
+                        self._maybe_finalize_coin_confirmation()
             else:
                 if self._bonus_reject_cooldown > 0:
                     self._bonus_reject_cooldown -= 1
@@ -5651,12 +5963,10 @@ class MainWindow(QMainWindow):
                 ):
                     # bonus 無し: timeup 後に coin が来たら WAIT_COIN へ
                     self._confirm_bonus_detection()
-                    self._coin_flow_latched = True
+                    self._mark_coin_cnn_detected()
                     scene = "coin"
-                    if frame_image is not None and not frame_image.isNull():
-                        self._update_coin_gain_capture(frame_image)
                     if not self._analysis_scene_confirm_enabled("coin"):
-                        self._confirm_coin_detection(frame_image)
+                        self._maybe_finalize_coin_confirmation()
         elif phase == "WAIT_COIN":
             coin_detected = (
                 self._can_detect_scene_once_per_game("coin", phase)
@@ -5671,12 +5981,10 @@ class MainWindow(QMainWindow):
                 )
             )
             if coin_detected:
-                self._coin_flow_latched = True
+                self._mark_coin_cnn_detected()
                 scene = "coin"
-                if frame_image is not None and not frame_image.isNull():
-                    self._update_coin_gain_capture(frame_image)
                 if not self._analysis_scene_confirm_enabled("coin"):
-                    self._confirm_coin_detection(frame_image)
+                    self._maybe_finalize_coin_confirmation()
         elif phase == "WAIT_RESULT":
             self._reset_fever_latch()
             if self._result_reject_cooldown > 0:
@@ -5684,7 +5992,11 @@ class MainWindow(QMainWindow):
             result_detected = False
             if use_scene_cnn:
                 result_detected = (
-                    self._result_cnn_top1_detected(ranked)
+                    (
+                        self._result_cnn_detected(ranked)
+                        or raw_scene == "result"
+                        or result_hit
+                    )
                     and self._result_reject_cooldown <= 0
                     and not (
                         (frame_index >= 0 and self._result_frame_vetoed(frame_index))
@@ -5905,6 +6217,8 @@ class MainWindow(QMainWindow):
             return
         if confirm_label == "coin" and self._coin_confirmed_this_game:
             return
+        if confirm_label == "coin" and self._coin_modal_acknowledged:
+            return
         if confirm_label == "fever" and frame_index >= 0:
             if self._fever_frame_vetoed(frame_index):
                 return
@@ -5972,7 +6286,7 @@ class MainWindow(QMainWindow):
                 elif confirm_label == "bonus":
                     self._confirm_bonus_detection()
                 elif confirm_label == "coin":
-                    self._confirm_coin_detection(frame_image)
+                    self._acknowledge_coin_scene(frame_image)
                 elif confirm_label == "result":
                     self._confirm_result_detection(position_ms)
                 elif confirm_label == "fever":
@@ -6088,7 +6402,7 @@ class MainWindow(QMainWindow):
                             self._reject_bonus_detection(frame_image, frame_index)
                     elif confirm_label == "coin":
                         if choice == "coin":
-                            self._confirm_coin_detection(frame_image)
+                            self._acknowledge_coin_scene(frame_image)
                         elif flow_scene == "coin":
                             self._reject_coin_detection(frame_image, frame_index)
                     elif confirm_label == "result":
@@ -6289,6 +6603,8 @@ class MainWindow(QMainWindow):
                 keys = []
             elif self._item_scan_targets:
                 keys = _item_select_keys_from(list(self._item_scan_targets))
+            elif self._last_completed_round:
+                keys = list(self._last_completed_round.get("item_targets") or [])
             else:
                 keys = []
             if keys:
@@ -6304,6 +6620,8 @@ class MainWindow(QMainWindow):
                 tsum = "--"
             elif self._item_use_tsum_pending not in {"-", "unknown", ""}:
                 tsum = self._item_use_tsum_pending
+            elif self._last_completed_round:
+                tsum = self._last_completed_round.get("use_tsum", "-")
             else:
                 tsum = "--"
             if tsum in {"-", ""}:
