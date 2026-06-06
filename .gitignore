@@ -21,3 +21,4 @@ app/models/**/*.pth
 !app/assets/videos/.gitkeep
 !app/models/.gitkeep
 !app/models/main_model/crop_positions.json
+!app/assets/images/coin_hud_ref_5395.png
