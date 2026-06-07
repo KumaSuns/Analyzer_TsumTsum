@@ -52,11 +52,13 @@ def bonus_coin_hud_rect(positions: dict) -> tuple[float, float, float, float]:
     if isinstance(cg, list) and len(cg) == 4:
         try:
             nx, ny, nw, nh = (float(cg[i]) for i in range(4))
+            nh = max(nh, 0.055)
+            nw = max(nw, 0.17)
             return (
                 max(0.0, nx - 0.02),
                 max(0.0, ny),
                 min(0.50, nw + 0.04),
-                max(0.030, nh + 0.005),
+                nh,
             )
         except (TypeError, ValueError):
             pass
@@ -125,7 +127,42 @@ def _suspicious_coin_value(value: int) -> bool:
         return True
     if len(s) == 5 and ones >= 3:
         return True
+    for digit in "0123456789":
+        if s.count(digit) >= 3:
+            return True
     return False
+
+
+def detect_coin_hud_rect(bgr: np.ndarray) -> Optional[tuple[float, float, float, float]]:
+    """コインアイコン付き HUD 数字列 ROI を推定。"""
+    if not _CV2_OK or bgr is None or bgr.size == 0:
+        return None
+    fh, fw = bgr.shape[:2]
+    x0, x1 = int(fw * 0.08), int(fw * 0.68)
+    y0, y1 = int(fh * 0.12), int(fh * 0.32)
+    patch = bgr[y0:y1, x0:x1]
+    if patch.size == 0:
+        return None
+    patch_gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    row = _hud_digit_row_gray(patch_gray)
+    if row is None:
+        return None
+    span = _hud_trimmed_ink_span(row)
+    if span is None:
+        return None
+    rx0, rx1, _proj = span
+    row_h = row.shape[0]
+    pad_x = max(4, int(row_h * 0.45))
+    pad_y = max(2, int(row_h * 0.18))
+    left = max(0, x0 + rx0 - pad_x)
+    top = max(0, y0 + int((y1 - y0) * 0.12) - pad_y)
+    width = min(fw - left, (rx1 - rx0) + pad_x * 2 + int(row_h * 0.55))
+    height = min(fh - top, int(row_h * 1.15) + pad_y * 2)
+    nw = width / max(1, fw)
+    nh = height / max(1, fh)
+    if not (0.12 <= nw <= 0.24 and 0.038 <= nh <= 0.09):
+        return None
+    return (left / fw, top / fh, nw, nh)
 
 
 @lru_cache(maxsize=1)
@@ -1077,11 +1114,10 @@ def _game_hud_ref_templates() -> dict[int, List[np.ndarray]]:
 
 
 def _patch_digit_errors(patch: np.ndarray) -> List[float]:
-    """各桁 0-9 の照合誤差（参照テンプレート優先）。"""
+    """各桁 0-9 の照合誤差（合成 + 実機 HUD 参照）。"""
     errs = _synth_digit_errors(patch)
-    refs = _game_hud_ref_templates()
-    for digit, ref_list in refs.items():
-        for ref in ref_list:
+    for digit, refs in _game_hud_ref_templates().items():
+        for ref in refs:
             errs[digit] = min(errs[digit], _match_patch_to_ref(patch, ref))
     return errs
 
@@ -1098,18 +1134,122 @@ def _hud_ink_span(row: np.ndarray) -> Optional[tuple[int, int, np.ndarray]]:
     return x0, x1, proj
 
 
+def _hud_icon_skip_x(row: np.ndarray, x0: int, x1: int) -> int:
+    """コインアイコン分を除き、数字列の左端を返す。"""
+    h = row.shape[0]
+    mask = cv2.inRange(row, 112, 255)
+    skip = _digit_strip_start_x(mask, x0, x1)
+    span_x = max(1, x1 - x0)
+    char_w = max(10, int(h * 0.42))
+    if skip - x0 >= char_w * 0.85:
+        return skip
+    proj = mask.sum(axis=0).astype(np.float32)
+    peak = float(proj[x0:x1].max()) if x1 > x0 else 0.0
+    if peak <= 0:
+        return skip
+    left_peak = float(proj[x0 : min(x1, x0 + char_w)].max())
+    if left_peak < peak * 0.22:
+        return skip
+    if x0 > char_w * 0.2:
+        return skip
+    low = (mask.sum(axis=0) <= h * 4).astype(np.uint8)
+    low = cv2.dilate(low.reshape(1, -1), np.ones((1, 7), np.uint8)).flatten()
+    search_hi = min(x1, x0 + int(char_w * 1.45))
+    best_len = 0
+    best_end = skip
+    run = 0
+    for idx in range(x0 + 4, search_hi):
+        if low[idx]:
+            run += 1
+        else:
+            if run > best_len:
+                best_len = run
+                best_end = idx
+            run = 0
+    if run > best_len:
+        best_end = search_hi
+    if best_len >= 6 and best_end > skip:
+        return best_end
+    crop = mask[:, max(0, x0) : min(mask.shape[1], x1 + 1)]
+    if crop.size == 0:
+        return skip
+    icon_end = 0
+    contours, _ = cv2.findContours(crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
+        bx, _by, bw, bh = cv2.boundingRect(cnt)
+        if bx > int(span_x * 0.08):
+            continue
+        if bh >= max(8, int(h * 0.24)) and bw >= max(8, int(bh * 0.45)):
+            icon_end = max(icon_end, bx + bw + 2)
+    if icon_end > skip - x0:
+        return x0 + icon_end
+    return skip
+
+
+def _hud_right_digit_edge(proj: np.ndarray, x0: int, x1: int) -> int:
+    """右端の薄いインクを落とし、数字列の終端に合わせる。"""
+    if x1 <= x0:
+        return x1
+    span = proj[x0:x1]
+    if len(span) < 8:
+        return x1
+    peak = float(span.max())
+    if peak <= 0:
+        return x1
+    thresh = peak * 0.14
+    for rel in range(len(span) - 1, -1, -1):
+        if span[rel] >= thresh:
+            return x0 + rel + 1
+    return x1
+
+
+def _hud_trimmed_ink_span(row: np.ndarray) -> Optional[tuple[int, int, np.ndarray]]:
+    """HUD 数字列だけに span を絞る（アイコン・右側ノイズを除外）。"""
+    span = _hud_ink_span(row)
+    if span is None:
+        return None
+    x0, x1, proj = span
+    x0 = _hud_icon_skip_x(row, x0, x1)
+    h = row.shape[0]
+    char_w = max(10, int(h * 0.42))
+    max_w = int(char_w * 4.6)
+    x1 = min(x1, x0 + max_w)
+    x1 = _hud_right_digit_edge(proj, x0, x1)
+    if x1 - x0 < char_w * 2:
+        return None
+    return x0, x1, proj
+
+
 def _hud_parts_from_cuts(row: np.ndarray, cuts: List[int]) -> Optional[List[np.ndarray]]:
     if len(cuts) != 5:
         return None
     parts = [row[:, cuts[i] : cuts[i + 1]] for i in range(4)]
     if any(p.shape[1] < 4 for p in parts):
         return None
+    if not _hud_parts_plausible(row, parts):
+        return None
     return parts
+
+
+def _hud_max_part_width(row: np.ndarray) -> int:
+    return max(12, int(row.shape[0] * 0.75))
+
+
+def _hud_parts_plausible(row: np.ndarray, parts: List[np.ndarray]) -> bool:
+    max_w = _hud_max_part_width(row)
+    return all(4 <= part.shape[1] <= max_w for part in parts)
+
+
+def _hud_comma_parts_plausible(row: np.ndarray, parts: List[np.ndarray]) -> bool:
+    if len(parts) != 4 or not _hud_parts_plausible(row, parts[1:]):
+        return False
+    char_w = max(10, int(row.shape[0] * 0.42))
+    return parts[0].shape[1] <= max(12, int(char_w * 1.6))
 
 
 def _hud_split_four_digits(row: np.ndarray) -> Optional[List[np.ndarray]]:
     """インク列を 4 桁分に分割（参照 5,395 と同型レイアウト）。"""
-    span = _hud_ink_span(row)
+    span = _hud_trimmed_ink_span(row)
     if span is None:
         return None
     x0, x1, _proj = span
@@ -1150,7 +1290,7 @@ def _hud_ref_cut_ratios() -> tuple[float, float, float, float, float]:
 
 
 def _hud_split_four_digits_ref(row: np.ndarray) -> Optional[List[np.ndarray]]:
-    span = _hud_ink_span(row)
+    span = _hud_trimmed_ink_span(row)
     if span is None:
         return None
     x0, x1, _proj = span
@@ -1193,9 +1333,73 @@ def _hud_valley_cut_indices(proj: np.ndarray, x0: int, x1: int) -> Optional[List
     return [x0, x0 + picked[0], x0 + picked[1], x0 + picked[2], x1]
 
 
+def _hud_split_comma_four_digits(row: np.ndarray) -> Optional[List[np.ndarray]]:
+    """5,395 型（1桁+カンマ+3桁）向け分割。"""
+    span = _hud_trimmed_ink_span(row)
+    if span is None:
+        return None
+    x0, x1, proj = span
+    width = max(1, x1 - x0)
+    span_proj = proj[x0:x1]
+    if len(span_proj) < 16:
+        return None
+    h = row.shape[0]
+    comma_max_w = max(4, int(h * 0.14))
+    comma_min_gap = max(6, int(h * 0.28))
+    best_comma: Optional[int] = None
+    best_score = 1e9
+    for idx in range(comma_min_gap, len(span_proj) - comma_min_gap):
+        left = max(0, idx - comma_max_w // 2)
+        right = min(len(span_proj), idx + comma_max_w // 2 + 1)
+        col_w = right - left
+        if col_w > comma_max_w:
+            continue
+        col_ink = float(span_proj[left:right].max())
+        row_ink = float(span_proj.max())
+        if col_ink > row_ink * 0.34:
+            continue
+        if float(span_proj[:idx].max()) < row_ink * 0.55:
+            continue
+        if float(span_proj[idx:].max()) < row_ink * 0.55:
+            continue
+        score = col_ink + abs(idx / width - 0.22) * row_ink * 0.25
+        if score < best_score:
+            best_score = score
+            best_comma = idx
+    if best_comma is None:
+        return None
+    left = row[:, x0 : x0 + best_comma]
+    tail = row[:, x0 + best_comma : x1]
+    if left.shape[1] < 4 or tail.shape[1] < 12:
+        return None
+    tail_span = _hud_trimmed_ink_span(tail)
+    if tail_span is None:
+        return None
+    tx0, tx1, tproj = tail_span
+    tail_cuts = _hud_valley_cut_indices(tproj, tx0, tx1)
+    if tail_cuts is not None:
+        tail_parts = _hud_parts_from_cuts(tail, tail_cuts)
+        if tail_parts is not None and len(tail_parts) == 4:
+            parts = [left, tail_parts[1], tail_parts[2], tail_parts[3]]
+            if _hud_comma_parts_plausible(row, parts):
+                return parts
+    tail_w = max(1, tx1 - tx0)
+    tail_ratios = (0.0, 0.33, 0.66, 1.0)
+    tail_parts = [
+        tail[:, tx0 + int(tail_w * tail_ratios[i]) : tx0 + int(tail_w * tail_ratios[i + 1])]
+        for i in range(3)
+    ]
+    if any(p.shape[1] < 4 for p in tail_parts):
+        return None
+    parts = [left, tail_parts[0], tail_parts[1], tail_parts[2]]
+    if not _hud_comma_parts_plausible(row, parts):
+        return None
+    return parts
+
+
 def _hud_split_four_digits_valley(row: np.ndarray) -> Optional[List[np.ndarray]]:
     """垂直投影の谷で 4 桁分割（カンマ位置も谷として扱う）。"""
-    span = _hud_ink_span(row)
+    span = _hud_trimmed_ink_span(row)
     if span is None:
         return None
     x0, x1, proj = span
@@ -1209,6 +1413,7 @@ def _hud_split_four_digit_variants(row: np.ndarray) -> List[tuple[List[np.ndarra
     variants: List[tuple[List[np.ndarray], str]] = []
     seen: set[tuple[int, ...]] = set()
     for parts, tag in (
+        (_hud_split_comma_four_digits(row), "comma"),
         (_hud_split_four_digits_valley(row), "valley"),
         (_hud_split_four_digits_ref(row), "ref"),
         (_hud_split_four_digits(row), "ratio"),
@@ -1223,20 +1428,13 @@ def _hud_split_four_digit_variants(row: np.ndarray) -> List[tuple[List[np.ndarra
     return variants
 
 
-def _hud_ref_nine_match_err(patch: np.ndarray) -> Optional[float]:
-    refs = _game_hud_ref_templates().get(9)
-    if not refs:
-        return None
-    return min(_match_patch_to_ref(patch, ref) for ref in refs)
-
-
 def _hud_maybe_fix_seven_nine_confusion(
     parts: List[np.ndarray],
     part_errs: List[List[float]],
     value: int,
     total_err: float,
 ) -> tuple[int, float]:
-    """3 桁目の 7/9 取り違え（5375→5395 等）を参照 9 で補正。"""
+    """3 桁目の 7/9 取り違え（5375→5395 等）。"""
     if (value // 10) % 10 != 7:
         return value, total_err
     alt = value + 20
@@ -1246,12 +1444,36 @@ def _hud_maybe_fix_seven_nine_confusion(
     e9 = part_errs[2][9]
     if e9 - e7 >= 0.24:
         return value, total_err
-    ref_nine = _hud_ref_nine_match_err(parts[2])
-    if ref_nine is None or ref_nine > e7 + 0.16:
-        return value, total_err
-    alt_err = total_err - e7 + min(e9, ref_nine)
+    alt_err = total_err - e7 + e9
     if alt_err <= total_err + 0.32:
         return alt, alt_err
+    return value, total_err
+
+
+def _hud_maybe_fix_ref_confusable_digits(
+    parts: List[np.ndarray],
+    part_errs: List[List[float]],
+    value: int,
+    total_err: float,
+) -> tuple[int, float]:
+    """実機 HUD で起きやすい 3/4・5/4 の僅差誤読を参照誤差で補正。"""
+    digits = [int(ch) for ch in str(value)]
+    if len(digits) != 4:
+        return value, total_err
+    swaps = ((0, 1, 5), (1, 4, 3), (2, 8, 9), (3, 4, 5))
+    for pos, wrong, right in swaps:
+        if digits[pos] != wrong:
+            continue
+        if part_errs[pos][right] >= part_errs[pos][wrong] + 0.12:
+            continue
+        alt = digits[:]
+        alt[pos] = right
+        alt_val = ((alt[0] * 10 + alt[1]) * 10 + alt[2]) * 10 + alt[3]
+        if not plausible_coin_value(alt_val) or _suspicious_coin_value(alt_val):
+            continue
+        total_err = total_err - part_errs[pos][wrong] + part_errs[pos][right]
+        digits = alt
+    value = ((digits[0] * 10 + digits[1]) * 10 + digits[2]) * 10 + digits[3]
     return value, total_err
 
 
@@ -1287,31 +1509,41 @@ def _decode_hud_four_parts(
     best_val, best_err = _hud_maybe_fix_seven_nine_confusion(
         parts, part_errs, best_val, best_err
     )
-    return best_val, best_err / 4.0 - 20.0, f"hud_ref n=4 {tag}"
+    best_val, best_err = _hud_maybe_fix_ref_confusable_digits(
+        parts, part_errs, best_val, best_err
+    )
+    mean_err = best_err / 4.0
+    if mean_err > 1.15:
+        return None
+    return best_val, mean_err - 20.0, f"hud n=4 {tag}"
 
 
 def _hud_digit_row_gray(gray: np.ndarray) -> Optional[np.ndarray]:
-    scale = max(14.0, 120.0 / max(1, gray.shape[0]))
-    up = cv2.resize(
-        gray,
-        (max(1, int(gray.shape[1] * scale)), max(1, int(gray.shape[0] * scale))),
-        interpolation=cv2.INTER_LANCZOS4,
-    )
+    h, w = gray.shape[:2]
+    target_h = 120.0
+    if h < target_h * 0.92:
+        scale = target_h / max(1.0, h)
+        up = cv2.resize(
+            gray,
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+    else:
+        up = gray
     clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8)).apply(up)
     h = clahe.shape[0]
     row = clahe[int(h * 0.12) : int(h * 0.90), :]
-    mask = cv2.inRange(row, 112, 255)
-    proj = mask.sum(axis=0).astype(np.float32)
-    ink = np.where(proj > row.shape[0] * 5)[0]
-    if len(ink) < 10:
+    trim = _hud_trimmed_ink_span(row)
+    if trim is None:
         return None
-    return row[:, int(ink[0]) : int(ink[-1]) + 1]
+    x0, x1, _proj = trim
+    if x1 - x0 < 12:
+        return None
+    return row[:, x0:x1]
 
 
 def _try_hud_four_digit_decode(gray: np.ndarray) -> Optional[Tuple[int, float, str]]:
-    """実機 HUD 向け: 4 桁分割 + 参照テンプレート総当たり。"""
-    if not _game_hud_ref_templates():
-        return None
+    """実機 HUD 向け: 4 桁分割 + テンプレート照合。"""
     row = _hud_digit_row_gray(gray)
     if row is None:
         return None
@@ -1349,22 +1581,22 @@ def read_coin_hud(roi: QImage) -> Tuple[Optional[int], float, str]:
     if gray is None:
         return None, 1e9, "gray失敗"
     bgr = qimage_to_bgr(roi)
-    gray, bgr = _upscale_gray_for_hud(gray, bgr)
     candidates: List[Tuple[int, float, str]] = []
     hud_ref = _try_hud_four_digit_decode(gray)
     if hud_ref is not None:
         _append_decode_candidate(
             candidates, hud_ref[0], hud_ref[1], f"hud {hud_ref[2]}", bonus=-24.0
         )
-    if bgr is not None:
-        strip = _gray_digit_strip(gray, bgr)
+    gray_up, bgr_up = _upscale_gray_for_hud(gray, bgr)
+    if bgr_up is not None:
+        strip = _gray_digit_strip(gray_up, bgr_up)
         if strip is not None:
             for binary in _binarize_variants(strip):
                 val, err, dbg = _decode_binary(binary)
                 _append_decode_candidate(
                     candidates, val, err, f"hud_strip {dbg}", bonus=-6.0
                 )
-    for val, err, dbg in _decode_gray_sources(gray, bgr):
+    for val, err, dbg in _decode_gray_sources(gray_up, bgr_up):
         _append_decode_candidate(candidates, val, err, f"hud {dbg}")
     if not candidates:
         return None, 1e9, "hud_decode失敗"
@@ -1372,7 +1604,9 @@ def read_coin_hud(roi: QImage) -> Tuple[Optional[int], float, str]:
     acceptable = [
         cand
         for cand in ranked
-        if plausible_coin_value(cand[0]) and cand[1] <= _MAX_HUD_ACCEPTABLE_ERR
+        if plausible_coin_value(cand[0])
+        and not _suspicious_coin_value(cand[0])
+        and cand[1] <= _MAX_HUD_ACCEPTABLE_ERR
     ]
     if not acceptable:
         top = ranked[0]

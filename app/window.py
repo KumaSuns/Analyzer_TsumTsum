@@ -78,6 +78,7 @@ from app.services.skill_classifier import (
 )
 from app.services.use_tsum_classifier import UseTsumClassifier
 from app.services.coin_gain_reader import (
+    _MAX_HUD_ACCEPTABLE_ERR,
     _is_slot_decode_dbg,
     bonus_coin_hud_rect,
     coin_gain_confirmed_combined,
@@ -94,6 +95,7 @@ from app.services.file_video import FileVideoSource, is_file_video_available
 _ANALYSIS_SCENE_CONFIRM_LABELS = tuple(c for c in SimpleTrainer.CLASSES if c != "none")
 # 初回起動時に確認モーダルを ON にするシーン
 _SCENE_CONFIRM_DEFAULT_ON = frozenset({"ready", "go", "fever", "timeup", "bonus", "coin", "result"})
+_APP_VERSION = "Version_002_2026_06_07"
 # いまは timeup 精度改善に集中するため解析中の fever 検知を止める（True で復帰）
 _ANALYSIS_FEVER_ENABLED = False
 # IN_GAME: 弱い fever は連続2サンプル（1サンプルだけの誤検知を出さない）
@@ -186,6 +188,8 @@ _INGAME_GO_GRACE_SAMPLES = 18
 
 _SCENE_CONFIRM_PREVIEW_MAX_W = 560
 _SCENE_CONFIRM_PREVIEW_MAX_H = 315
+_COIN_GAIN_CROP_PREVIEW_MAX_W = 480
+_COIN_GAIN_CROP_PREVIEW_MAX_H = 200
 
 
 def _preview_pixmap_for_scene_modal(frame_image, max_w: int, max_h: int) -> QPixmap:
@@ -306,6 +310,35 @@ def _format_duration_min_sec(elapsed_sec: float) -> str:
     return f"{minutes:02d}分{seconds:02d}秒"
 
 
+class VideoCropOverlay(QWidget):
+    """動画の上にトリミング枠を描画（QVideoWidget のネイティブ面の上に出す）。"""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._frame_rect = QRect()
+        self.hide()
+
+    def set_frame_rect(self, rect: QRect) -> None:
+        self._frame_rect = rect
+        self.setVisible(not rect.isNull())
+        self.update()
+
+    def frame_rect(self) -> QRect:
+        return self._frame_rect
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        if self._frame_rect.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#00E5FF"), 3)
+        painter.setPen(pen)
+        painter.setBrush(QColor(0, 229, 255, 55))
+        painter.drawRect(self._frame_rect)
+
+
 class AspectFitVideoContainer(QWidget):
     clicked = Signal()
     cropSelected = Signal(float, float, float, float)
@@ -327,22 +360,37 @@ class AspectFitVideoContainer(QWidget):
         self.frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.frame_label.hide()
         self._opencv_display = False
+        self._crop_overlay = VideoCropOverlay(self)
         self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
+        self._rubber_band.hide()
         self._rubber_band.setStyleSheet("border: 2px solid #00E5FF; background: rgba(0, 229, 255, 40);")
         self._drag_origin = QPoint()
+        self._crop_dragging = False
         self._crop_enabled = False
         self._selected_rect = QRect()
+        self._normalized_rect: Optional[tuple[float, float, float, float]] = None
         self._source_width = 0
         self._source_height = 0
 
     def set_crop_enabled(self, enabled: bool) -> None:
         self._crop_enabled = enabled
+        for surface in (self.video_widget, self.frame_label):
+            surface.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, enabled)
         if not enabled:
+            self._crop_dragging = False
             self._rubber_band.hide()
+        self._sync_crop_overlay()
 
     def set_source_size(self, width: int, height: int) -> None:
         self._source_width = max(0, width)
         self._source_height = max(0, height)
+        self._sync_crop_overlay()
+
+    def clear_crop_overlay(self) -> None:
+        self._normalized_rect = None
+        self._selected_rect = QRect()
+        self._crop_overlay.set_frame_rect(QRect())
+        self._rubber_band.hide()
 
     def set_opencv_display(self, on: bool) -> None:
         self._opencv_display = bool(on)
@@ -376,16 +424,32 @@ class AspectFitVideoContainer(QWidget):
         r = QRect(x, y, best_w, best_h)
         self.video_widget.setGeometry(r)
         self.frame_label.setGeometry(r)
+        self._sync_crop_overlay()
+
+    def _local_rect_in_content(self, rect: QRect, content_rect: QRect) -> QRect:
+        return QRect(
+            rect.x() - content_rect.x(),
+            rect.y() - content_rect.y(),
+            rect.width(),
+            rect.height(),
+        )
+
+    def _set_drag_overlay(self, rect: QRect) -> None:
+        content_rect = self._content_rect()
+        if content_rect.width() <= 0 or content_rect.height() <= 0 or rect.isNull():
+            return
+        clipped = rect.intersected(content_rect)
+        self._crop_overlay.setGeometry(content_rect)
+        self._crop_overlay.set_frame_rect(self._local_rect_in_content(clipped, content_rect))
+        self._crop_overlay.raise_()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if self._crop_enabled and event.button() == Qt.MouseButton.LeftButton:
             pos = event.position().toPoint()
-            # Only allow cropping when press starts inside displayed video area.
             if self._content_rect().contains(pos):
                 self._drag_origin = pos
-                self._rubber_band.setGeometry(QRect(self._drag_origin, self._drag_origin))
-                self._rubber_band.show()
-            # In crop mode, never treat click as play/pause toggle.
+                self._crop_dragging = True
+                self._set_drag_overlay(QRect(self._drag_origin, self._drag_origin))
             super().mousePressEvent(event)
             return
         elif event.button() == Qt.MouseButton.LeftButton:
@@ -393,50 +457,62 @@ class AspectFitVideoContainer(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-        if self._crop_enabled and self._rubber_band.isVisible():
+        if self._crop_enabled and self._crop_dragging:
             current = event.position().toPoint()
-            self._rubber_band.setGeometry(QRect(self._drag_origin, current).normalized())
+            self._set_drag_overlay(QRect(self._drag_origin, current).normalized())
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
-        if self._crop_enabled and event.button() == Qt.MouseButton.LeftButton and self._rubber_band.isVisible():
-            selected = self._rubber_band.geometry()
+        if (
+            self._crop_enabled
+            and self._crop_dragging
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self._crop_dragging = False
             content_rect = self._content_rect()
-            clipped = selected.intersected(content_rect)
-            if clipped.width() > 2 and clipped.height() > 2 and content_rect.width() > 0 and content_rect.height() > 0:
+            frame_rect = self._crop_overlay.frame_rect()
+            if (
+                frame_rect.width() > 2
+                and frame_rect.height() > 2
+                and content_rect.width() > 0
+                and content_rect.height() > 0
+            ):
+                clipped = QRect(
+                    content_rect.x() + frame_rect.x(),
+                    content_rect.y() + frame_rect.y(),
+                    frame_rect.width(),
+                    frame_rect.height(),
+                )
                 self._selected_rect = clipped
-                self._rubber_band.setGeometry(clipped)
-                self._rubber_band.show()
-                nx = (clipped.x() - content_rect.x()) / content_rect.width()
-                ny = (clipped.y() - content_rect.y()) / content_rect.height()
-                nw = clipped.width() / content_rect.width()
-                nh = clipped.height() / content_rect.height()
+                nx = frame_rect.x() / content_rect.width()
+                ny = frame_rect.y() / content_rect.height()
+                nw = frame_rect.width() / content_rect.width()
+                nh = frame_rect.height() / content_rect.height()
+                self._normalized_rect = (nx, ny, nw, nh)
                 self.cropSelected.emit(nx, ny, nw, nh)
-                self.update()
+                self._sync_crop_overlay()
         super().mouseReleaseEvent(event)
 
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        super().paintEvent(event)
-        if self._selected_rect.isNull():
-            return
-        painter = QPainter(self)
-        pen = QPen(QColor("#00E5FF"))
-        pen.setWidth(2)
-        painter.setPen(pen)
-        painter.drawRect(self._selected_rect)
-
     def set_selected_normalized_rect(self, nx: float, ny: float, nw: float, nh: float) -> None:
+        self._normalized_rect = (float(nx), float(ny), float(nw), float(nh))
+        self._sync_crop_overlay()
+
+    def _sync_crop_overlay(self) -> None:
+        if self._normalized_rect is None:
+            self._crop_overlay.set_frame_rect(QRect())
+            return
         content_rect = self._content_rect()
         if content_rect.width() <= 0 or content_rect.height() <= 0:
             return
-        x = int(content_rect.x() + nx * content_rect.width())
-        y = int(content_rect.y() + ny * content_rect.height())
-        w = int(nw * content_rect.width())
-        h = int(nh * content_rect.height())
-        self._selected_rect = QRect(x, y, w, h).intersected(content_rect)
-        self._rubber_band.setGeometry(self._selected_rect)
-        self._rubber_band.show()
-        self.update()
+        nx, ny, nw, nh = self._normalized_rect
+        lx = int(nx * content_rect.width())
+        ly = int(ny * content_rect.height())
+        lw = max(1, int(nw * content_rect.width()))
+        lh = max(1, int(nh * content_rect.height()))
+        self._selected_rect = QRect(content_rect.x() + lx, content_rect.y() + ly, lw, lh)
+        self._crop_overlay.setGeometry(content_rect)
+        self._crop_overlay.set_frame_rect(QRect(lx, ly, lw, lh))
+        self._crop_overlay.raise_()
 
     def selected_pixmap(self) -> QPixmap:
         if self._selected_rect.isNull():
@@ -560,6 +636,7 @@ class MainWindow(QMainWindow):
         self._coin_confirmed_this_game = False
         self._coin_cnn_detected_this_game = False
         self._coin_post_detect_ocr_left = 0
+        self._coin_result_ocr_left = 0
         self._coin_modal_acknowledged = False
         self._coin_flow_latched = False
         self._result_confirmed_this_game = False
@@ -597,6 +674,7 @@ class MainWindow(QMainWindow):
         self._hud_coin_reads: list[tuple[int, float, str]] = []
         self._gain_coin_reads: list[tuple[int, float, str]] = []
         self._coin_gain_last_debug = ""
+        self._coin_gain_last_capture_frame: Optional[QImage] = None
         self._last_completed_round: Optional[dict] = None
         self.trainer = SimpleTrainer(
             images_root=self.project_root / "app/assets/images",
@@ -741,7 +819,7 @@ class MainWindow(QMainWindow):
         footer_layout = QHBoxLayout(footer)
         footer_layout.setContentsMargins(0, 0, 16, 0)
         version_label = QLabel(
-            f"Version_002_2026_06_04  {self.os_name}  {self.compute_status}",
+            f"{_APP_VERSION}  {self.os_name}  {self.compute_status}",
             footer,
         )
         version_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -766,6 +844,10 @@ class MainWindow(QMainWindow):
         if mode_id == 1:
             stack.setCurrentIndex(0)
             stack.setVisible(True)
+            if self.pending_crop_rect is not None:
+                self._prepare_trim_overlay_on_video()
+            elif hasattr(self, "crop_target_buttons"):
+                self._on_crop_target_selection_changed()
         elif mode_id == 2:
             stack.setCurrentIndex(1)
             stack.setVisible(True)
@@ -1234,6 +1316,7 @@ class MainWindow(QMainWindow):
         self._coin_confirmed_this_game = False
         self._coin_cnn_detected_this_game = False
         self._coin_post_detect_ocr_left = 0
+        self._coin_result_ocr_left = 0
         self._coin_modal_acknowledged = False
         self._coin_flow_latched = False
         self._coin_reject_cooldown = 0
@@ -1429,6 +1512,7 @@ class MainWindow(QMainWindow):
         self._hud_coin_reads = []
         self._gain_coin_reads = []
         self._coin_gain_last_debug = ""
+        self._coin_gain_last_capture_frame = None
         self._refresh_coin_gain_label()
 
     @staticmethod
@@ -1502,6 +1586,75 @@ class MainWindow(QMainWindow):
     def _crop_frame_roi(self, frame_image, key: str) -> Optional[QImage]:
         positions = self.crop_positions_for_analysis or self._load_crop_positions()
         return self._crop_frame_roi_from_positions(frame_image, positions, key)
+
+    def _coin_gain_crop_preview_pixmap(
+        self,
+        frame_image,
+        max_w: int = _COIN_GAIN_CROP_PREVIEW_MAX_W,
+        max_h: int = _COIN_GAIN_CROP_PREVIEW_MAX_H,
+    ) -> QPixmap:
+        crop = self._crop_frame_roi(frame_image, "coin_gain")
+        if crop is None or crop.isNull():
+            pm = QPixmap(min(320, max_w), min(120, max_h))
+            pm.fill(QColor(60, 60, 60))
+            return pm
+        pm = QPixmap.fromImage(crop)
+        if pm.isNull():
+            pm = QPixmap(min(320, max_w), min(120, max_h))
+            pm.fill(QColor(60, 60, 60))
+            return pm
+        return pm.scaled(
+            max_w,
+            max_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+    def _show_coin_gain_crop_confirm_dialog(
+        self, frame_image, coin_value: Optional[int]
+    ) -> None:
+        if frame_image is None or frame_image.isNull():
+            return
+        was_cv = getattr(self, "use_opencv_for_video", False)
+        was_playing = self._is_player_playing()
+        if was_playing:
+            if was_cv:
+                self._cv_pause()
+            elif hasattr(self, "player") and _is_alive_qobject(self.player):
+                self.player.pause()
+        try:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("獲得コイン確定")
+            dlg.setModal(True)
+            layout = QVBoxLayout(dlg)
+            if coin_value is not None:
+                info = QLabel(f"獲得コイン: {coin_value:,} (coin確定)")
+            else:
+                info = QLabel("獲得コイン: 読み取れませんでした (coin確定)")
+            info.setWordWrap(True)
+            layout.addWidget(info)
+            crop_title = QLabel("coin_gain 切り抜き（OCR範囲）")
+            crop_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(crop_title)
+            crop_img = QLabel()
+            crop_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            crop_img.setPixmap(self._coin_gain_crop_preview_pixmap(frame_image))
+            layout.addWidget(crop_img)
+            ok_btn = QPushButton("OK")
+            ok_btn.setDefault(True)
+            ok_btn.clicked.connect(dlg.accept)
+            row = QHBoxLayout()
+            row.addStretch(1)
+            row.addWidget(ok_btn)
+            row.addStretch(1)
+            layout.addLayout(row)
+            dlg.exec()
+        finally:
+            if was_playing and self.analysis_running:
+                if was_cv:
+                    self._cv_play()
+                elif hasattr(self, "player") and _is_alive_qobject(self.player):
+                    self.player.play()
 
     @staticmethod
     def _crop_rect_defined(positions: dict, key: str) -> bool:
@@ -1604,6 +1757,10 @@ class MainWindow(QMainWindow):
             if gain_rois:
                 return gain_rois[:1]
             return rois[:1] if rois else rois
+        if scene_key == "result":
+            if gain_rois:
+                return gain_rois[:1]
+            return rois[:1] if rois else rois
         return rois + gain_rois
 
     def _coin_roi_read_jobs(
@@ -1653,14 +1810,6 @@ class MainWindow(QMainWindow):
                 self._coin_gain_last_debug = dbg
                 continue
             frame_reads.append((value, err, dbg, source))
-        if len({value for value, _err, _dbg, _src in frame_reads}) > 1:
-            parts = ", ".join(
-                f"{value}@{err:.1f}({src})"
-                for value, err, _dbg, src in frame_reads
-            )
-            self._coin_gain_last_debug = f"roi_conflict {parts}"
-            self._refresh_coin_gain_label()
-            return
         if not frame_reads:
             self._refresh_coin_gain_label()
             return
@@ -1671,6 +1820,7 @@ class MainWindow(QMainWindow):
             self._maybe_finalize_coin_confirmation()
             return
         self._coin_gain_last_debug = dbg
+        self._coin_gain_last_capture_frame = frame_image.copy()
         if source == "hud":
             self._hud_coin_reads.append((value, err, dbg))
         else:
@@ -1771,6 +1921,12 @@ class MainWindow(QMainWindow):
             feat, self._analysis_coin_none_veto, _NONE_VETO_SESSION_MAX
         )
 
+    def _read_coin_gain_hud_crop(self, frame_image) -> tuple[Optional[int], float, str]:
+        crop = self._crop_frame_roi(frame_image, "coin_gain")
+        if crop is None or crop.isNull():
+            return None, 1e9, "cropなし"
+        return read_coin_hud(crop)
+
     def _finalize_coin_confirmation(self) -> None:
         if self._coin_confirmed_this_game:
             return
@@ -1778,8 +1934,20 @@ class MainWindow(QMainWindow):
             return
         if not coin_gain_confirmed_combined(self._hud_coin_reads, self._gain_coin_reads):
             return
+        frame = self._coin_gain_last_capture_frame
+        if frame is not None and not frame.isNull():
+            crop_val, crop_err, crop_dbg = self._read_coin_gain_hud_crop(frame)
+            if crop_val is not None and plausible_coin_value(crop_val):
+                if crop_err <= _MAX_HUD_ACCEPTABLE_ERR or "hud n=4" in crop_dbg:
+                    self._coin_gain_best = crop_val
+                    self._coin_gain_last_debug = crop_dbg
         self._coin_confirmed_this_game = True
         self._log_coin_gain_capture("coin確定")
+        if self._analysis_scene_confirm_enabled("coin"):
+            self._show_coin_gain_crop_confirm_dialog(
+                self._coin_gain_last_capture_frame,
+                self._coin_gain_best,
+            )
         self.flow_phase = "WAIT_RESULT"
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
             self.counter_analysis_state_label
@@ -1814,15 +1982,15 @@ class MainWindow(QMainWindow):
         """coin シーン CNN 検知は1ゲーム1回。"""
         self._coin_cnn_detected_this_game = True
         self._coin_flow_latched = True
-        self._coin_post_detect_ocr_left = 3
+        self._coin_post_detect_ocr_left = 6
 
     def _coin_ocr_scene_this_step(self, flow_raw: str) -> str | None:
-        """coin 画面検知後のみ OCR（coin シーンフレームから獲得コインを読む）。"""
+        """coin 検知後: WAIT_COIN 中に数フレーム OCR。"""
         if self._coin_confirmed_this_game or not self._coin_cnn_detected_this_game:
             return None
         if self._coin_post_detect_ocr_left <= 0:
             return None
-        if (flow_raw or "").strip().lower() != "coin":
+        if self.flow_phase != "WAIT_COIN":
             return None
         self._coin_post_detect_ocr_left -= 1
         return "coin"
@@ -3123,6 +3291,8 @@ class MainWindow(QMainWindow):
             if self._video_frame_size != (w, h):
                 self._video_frame_size = (w, h)
                 self.current_video_container.set_source_size(w, h)
+            elif self.pending_crop_rect is not None:
+                self._apply_pending_rect_to_video()
             lbl = self.current_video_container.frame_label
             geo = lbl.geometry()
             tw, th = geo.width(), geo.height()
@@ -4493,6 +4663,28 @@ class MainWindow(QMainWindow):
         self._update_crop_controls_from_pending()
         self._refresh_crop_preview()
 
+    def _prepare_trim_overlay_on_video(self) -> None:
+        """動画ツール・トリミング: 保存済み範囲を動画上に表示する。"""
+        if self.current_video_container is None:
+            return
+        image = self.current_video_frame_image
+        if image is not None and not image.isNull():
+            w, h = image.width(), image.height()
+            if w > 0 and h > 0:
+                self.current_video_container.set_source_size(w, h)
+        if self.pending_crop_rect is None and hasattr(self, "crop_target_buttons"):
+            selected = [
+                k
+                for k, b in self.crop_target_buttons.items()
+                if _is_alive_qobject(b) and b.isChecked()
+            ]
+            if selected:
+                rect = self._load_crop_positions().get(selected[0])
+                if isinstance(rect, list) and len(rect) == 4:
+                    self.pending_crop_rect = [float(rect[i]) for i in range(4)]
+                    self._update_crop_controls_from_pending()
+        self._apply_pending_rect_to_video()
+
     def _on_crop_target_selection_changed(self) -> None:
         if not hasattr(self, "crop_target_buttons") or not hasattr(self, "crop_rect_label"):
             return
@@ -4508,10 +4700,12 @@ class MainWindow(QMainWindow):
         if rect:
             self.pending_crop_rect = [float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])]
             self._update_crop_controls_from_pending()
-            self._apply_pending_rect_to_video()
+            self._prepare_trim_overlay_on_video()
             self._refresh_crop_preview()
         else:
             self.crop_rect_label.setText("範囲: 未選択")
+            if self.current_video_container is not None:
+                self.current_video_container.clear_crop_overlay()
 
     def _on_save_crop_clicked(self) -> None:
         if self.pending_crop_rect is None:
@@ -4529,6 +4723,7 @@ class MainWindow(QMainWindow):
         data = self._load_crop_positions()
         for key in selected_keys:
             data[key] = self.pending_crop_rect
+        data["version"] = _APP_VERSION
         path = self.project_root / "app/models/main_model/crop_positions.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -4628,7 +4823,7 @@ class MainWindow(QMainWindow):
         ]
         if hasattr(self, "crop_rect_label") and _is_alive_qobject(self.crop_rect_label):
             self.crop_rect_label.setText(f"範囲: {self.pending_crop_rect}")
-        self._apply_pending_rect_to_video()
+        self._prepare_trim_overlay_on_video()
         self._refresh_crop_preview()
 
     def _on_check_crop_preview_clicked(self) -> None:
@@ -4773,6 +4968,8 @@ class MainWindow(QMainWindow):
                 self._train_log("トリミング開始: フレーム取得待ちです。動画を少し動かすと選択できます。")
         if self.current_video_container is not None:
             self.current_video_container.set_crop_enabled(enabled)
+        if enabled:
+            self._prepare_trim_overlay_on_video()
         if hasattr(self, "crop_status_label"):
             self.crop_status_label.setText("状態: 選択中" if enabled else "状態: 停止")
         if hasattr(self, "crop_start_button"):
@@ -4781,6 +4978,11 @@ class MainWindow(QMainWindow):
     def _apply_pending_rect_to_video(self) -> None:
         if self.pending_crop_rect is None or self.current_video_container is None:
             return
+        image = self.current_video_frame_image
+        if image is not None and not image.isNull():
+            w, h = image.width(), image.height()
+            if w > 0 and h > 0:
+                self.current_video_container.set_source_size(w, h)
         self.current_video_container.set_selected_normalized_rect(
             self.pending_crop_rect[0],
             self.pending_crop_rect[1],
@@ -4841,6 +5043,8 @@ class MainWindow(QMainWindow):
             if self._video_frame_size != (w, h):
                 self._video_frame_size = (w, h)
                 self.current_video_container.set_source_size(w, h)
+            elif self.pending_crop_rect is not None:
+                self._apply_pending_rect_to_video()
         if self.analysis_running:
             self.analysis_frame_seq += 1
             if self.analysis_frame_seq % self._analysis_sample_step() == 0:

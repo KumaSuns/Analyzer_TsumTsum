@@ -67,15 +67,16 @@ def test_suspicious_rejects_stroke_artifacts() -> None:
     assert _suspicious_coin_value(17111)
     assert _suspicious_coin_value(11111)
     assert _suspicious_coin_value(11513)
+    assert _suspicious_coin_value(8885)
     assert not _suspicious_coin_value(7205)
     assert not _suspicious_coin_value(5395)
 
 
 def test_bonus_coin_hud_rect_from_coin_gain() -> None:
-    rect = bonus_coin_hud_rect({"coin_gain": [0.36, 0.215, 0.28, 0.025]})
-    assert abs(rect[0] - 0.34) < 1e-6
-    assert abs(rect[2] - 0.32) < 1e-6
-    assert rect[3] >= 0.030
+    rect = bonus_coin_hud_rect({"coin_gain": [0.305, 0.195, 0.171, 0.055]})
+    assert abs(rect[0] - 0.285) < 1e-6
+    assert abs(rect[2] - 0.211) < 1e-6
+    assert abs(rect[3] - 0.055) < 1e-6
 
 
 def test_bonus_coin_hud_rect_prefers_coin_bonus() -> None:
@@ -201,6 +202,15 @@ def test_reads_real_hud_ref_5395_crop() -> None:
         / "images"
         / "coin_hud_ref_5395.png"
     )
+    if not path.exists():
+        return
+    image = QImage(str(path))
+    value, err, dbg = read_coin_hud(image)
+    assert value == 5395, f"{value} err={err} {dbg}"
+
+
+def test_reads_coin_5395_debug_crop() -> None:
+    path = Path(__file__).resolve().parents[1] / "_coin_5395_crop.png"
     if not path.exists():
         return
     image = QImage(str(path))
