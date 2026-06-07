@@ -3070,7 +3070,7 @@ class MainWindow(QMainWindow):
             train_page_layout.addWidget(QLabel("スキル発動モデル（ツム別）"))
             skill_train_hint = QLabel(
                 "画像: app/assets/images/skills/<dir>/activation/\n"
-                "「モデル保存」で使用ツム・スキル・シーンをまとめて学習します。"
+                "「モデル保存」でシーン・コイン桁・使用ツム・スキルをまとめて学習・保存します。"
                 "スキルだけなら学習開始は不要です。"
             )
             skill_train_hint.setWordWrap(True)
@@ -7301,6 +7301,11 @@ class MainWindow(QMainWindow):
                 emit("スキルモデルを更新中…")
                 self._train_skill_models(log=emit)
                 self.skill_classifier_pool.reload()
+                emit("コイン桁 CNN を解析に反映中…")
+                from app.services.coin_digit_cnn import reload_coin_digit_classifier
+
+                reload_coin_digit_classifier()
+                emit("コイン桁 CNN を反映しました。")
                 q.put("__SAVE_DONE__")
             except Exception as exc:
                 q.put(f"__SAVE_ERROR__:{exc}")

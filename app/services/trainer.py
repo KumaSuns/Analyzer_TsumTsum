@@ -36,6 +36,8 @@ class SimpleTrainer:
         self.summary: DatasetSummary | None = None
         self.scene_cnn = SceneCnnClassifier()
         self.scene_model = SceneCentroidModel()
+        self.coin_digit_cnn = None
+        self.coin_digit_val_accuracy = 0.0
         self.val_accuracy = 0.0
         self.last_fever_metrics: dict[str, int] = {}
         self.scene_backend = "none"
@@ -135,6 +137,29 @@ class SimpleTrainer:
         self.is_running = False
         log("学習を停止しました。")
 
+    def train_coin_digit_cnn(self, log: Callable[[str], None]) -> bool:
+        """コイン桁 CNN（参照画像＋合成データ）を学習。"""
+        if not torch_available():
+            log("コイン桁 CNN: PyTorch 未導入のためスキップします。")
+            return False
+        from app.services.coin_digit_cnn import (
+            CoinDigitCnnClassifier,
+            build_digit_training_samples,
+        )
+
+        log("コイン桁 CNN を学習します…")
+        try:
+            train_samples, val_samples = build_digit_training_samples()
+            clf = CoinDigitCnnClassifier()
+            acc = clf.train_from_samples(train_samples, val_samples, log=log)
+            self.coin_digit_cnn = clf
+            self.coin_digit_val_accuracy = acc
+            log(f"コイン桁 CNN 検証精度: {acc:.3f}")
+            return True
+        except Exception as exc:
+            log(f"コイン桁 CNN 学習失敗: {exc}")
+            return False
+
     def save(self, log: Callable[[str], None], version: str = "version_1") -> Path:
         self.summarize_dataset()
         summary = self.summary or self.summarize_dataset()
@@ -233,6 +258,12 @@ class SimpleTrainer:
             meta_payload["fever_val_any"] = self.last_fever_metrics.get("fever_val_any", 0)
             meta_payload["fever_val_total"] = self.last_fever_metrics.get("fever_val_total", 0)
 
+        if torch_available():
+            if self.coin_digit_cnn is None or not self.coin_digit_cnn.is_loaded():
+                self.train_coin_digit_cnn(log)
+            if self.coin_digit_cnn is not None and self.coin_digit_cnn.is_loaded():
+                meta_payload["coin_digit_val_accuracy"] = self.coin_digit_val_accuracy
+
         out_file.write_text(
             "\n".join(
                 [
@@ -256,6 +287,16 @@ class SimpleTrainer:
         if self.scene_backend == "centroid":
             self.scene_model.save(out_scene_model)
             log(f"centroid 保存: {out_scene_model}")
+
+        if torch_available():
+            if self.coin_digit_cnn is not None and self.coin_digit_cnn.is_loaded():
+                out_coin_digit = out_dir / "coin_digit.pt"
+                log("coin_digit.pt を書き込み中…")
+                self.coin_digit_cnn.save(out_coin_digit)
+                log(
+                    f"コイン桁 CNN 保存: {out_coin_digit} "
+                    f"(val={self.coin_digit_val_accuracy:.3f})"
+                )
 
         active_marker = self.model_root / "ACTIVE_VERSION"
         active_marker.write_text(version, encoding="utf-8")

@@ -466,11 +466,13 @@ def get_coin_digit_classifier() -> CoinDigitCnnClassifier:
     clf = CoinDigitCnnClassifier()
     path = default_coin_digit_model_path()
     if not clf.load(path):
-        fallback = _model_root() / "version_1" / WEIGHTS_NAME
-        if not clf.load(fallback):
-            train_and_save_default_model()
-            clf.load(path)
+        clf.load(_model_root() / "version_1" / WEIGHTS_NAME)
     return clf
+
+
+def reload_coin_digit_classifier() -> CoinDigitCnnClassifier:
+    get_coin_digit_classifier.cache_clear()
+    return get_coin_digit_classifier()
 
 
 def coin_digit_cnn_available() -> bool:
