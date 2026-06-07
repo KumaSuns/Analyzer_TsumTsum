@@ -14,6 +14,7 @@ from app.services.coin_gain_reader import (
     consensus_coin_gain,
     plausible_coin_value,
     read_coin_gain,
+    read_coin_gain_crop,
     read_coin_hud,
 )
 
@@ -215,6 +216,38 @@ def test_reads_coin_5395_debug_crop() -> None:
         return
     image = QImage(str(path))
     value, err, dbg = read_coin_hud(image)
+    assert value == 5395, f"{value} err={err} {dbg}"
+
+
+def test_reads_coin_gain_crop_wide_roi() -> None:
+    import cv2
+    import numpy as np
+
+    ref = cv2.imread(
+        str(
+            Path(__file__).resolve().parents[1]
+            / "app"
+            / "assets"
+            / "images"
+            / "coin_hud_ref_5395.png"
+        )
+    )
+    if ref is None:
+        return
+    canvas = np.full((45, 461, 3), (18, 16, 12), dtype=np.uint8)
+    rh = min(ref.shape[0], 45)
+    small = cv2.resize(ref, (ref.shape[1], rh))
+    y0 = (45 - rh) // 2
+    canvas[y0 : y0 + rh, 20 : 20 + ref.shape[1]] = small
+    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+    image = QImage(
+        rgb.data,
+        rgb.shape[1],
+        rgb.shape[0],
+        rgb.strides[0],
+        QImage.Format.Format_RGB888,
+    ).copy()
+    value, err, dbg = read_coin_gain_crop(image)
     assert value == 5395, f"{value} err={err} {dbg}"
 
 

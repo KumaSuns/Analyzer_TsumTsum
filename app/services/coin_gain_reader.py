@@ -443,7 +443,7 @@ def _select_primary_row(
     return sorted(best, key=lambda b: b[0])
 
 
-def _match_digit(
+def _match_digit_template(
     patch: np.ndarray, max_mean: float = _DIGIT_MATCH_MAX_MEAN
 ) -> Tuple[Optional[int], float]:
     templates = _digit_templates()
@@ -461,6 +461,22 @@ def _match_digit(
     if best_digit is None or best_err > max_mean:
         return None, best_err
     return best_digit, best_err
+
+
+def _match_digit(
+    patch: np.ndarray, max_mean: float = _DIGIT_MATCH_MAX_MEAN
+) -> Tuple[Optional[int], float]:
+    if patch.size == 0:
+        return None, 1e9
+    try:
+        from app.services.coin_digit_cnn import get_coin_digit_classifier
+
+        cnn = get_coin_digit_classifier()
+        if cnn.is_loaded():
+            return cnn.match_digit(patch, max_mean=max_mean)
+    except Exception:
+        pass
+    return _match_digit_template(patch, max_mean=max_mean)
 
 
 def _expand_box_to_digits(
@@ -948,6 +964,15 @@ def _candidate_rank_item(item: Tuple[int, float, str]) -> tuple[float, float]:
     if not plausible_coin_value(val):
         return (1e9, err)
     score = err
+    try:
+        from app.services.coin_digit_cnn import coin_digit_cnn_available
+
+        if coin_digit_cnn_available() and (
+            "slots" in dbg or "valley_slots" in dbg or "slot_" in dbg
+        ):
+            score += 90.0
+    except Exception:
+        pass
     digits = len(str(val))
     if digits not in _PREFERRED_DIGITS:
         score += 15.0
@@ -1114,7 +1139,15 @@ def _game_hud_ref_templates() -> dict[int, List[np.ndarray]]:
 
 
 def _patch_digit_errors(patch: np.ndarray) -> List[float]:
-    """各桁 0-9 の照合誤差（合成 + 実機 HUD 参照）。"""
+    """各桁 0-9 の照合誤差（CNN 優先、未学習時はテンプレート）。"""
+    try:
+        from app.services.coin_digit_cnn import get_coin_digit_classifier
+
+        cnn = get_coin_digit_classifier()
+        if cnn.is_loaded():
+            return cnn.digit_errors(patch)
+    except Exception:
+        pass
     errs = _synth_digit_errors(patch)
     for digit, refs in _game_hud_ref_templates().items():
         for ref in refs:
@@ -1460,7 +1493,7 @@ def _hud_maybe_fix_ref_confusable_digits(
     digits = [int(ch) for ch in str(value)]
     if len(digits) != 4:
         return value, total_err
-    swaps = ((0, 1, 5), (1, 4, 3), (2, 8, 9), (3, 4, 5))
+    swaps = ((0, 1, 5), (0, 4, 5), (1, 4, 3), (1, 1, 3), (2, 5, 9), (2, 8, 9), (3, 4, 5), (3, 9, 5))
     for pos, wrong, right in swaps:
         if digits[pos] != wrong:
             continue
@@ -1542,19 +1575,78 @@ def _hud_digit_row_gray(gray: np.ndarray) -> Optional[np.ndarray]:
     return row[:, x0:x1]
 
 
+def _decode_hud_four_parts_cnn(
+    parts: List[np.ndarray], tag: str
+) -> Optional[Tuple[int, float, str]]:
+    """CNN 各桁 argmin 誤差で 4 桁を復元（分割方式の選択用）。"""
+    if len(parts) != 4:
+        return None
+    digits: List[int] = []
+    errs: List[float] = []
+    for part in parts:
+        part_errs = _patch_digit_errors(part)
+        digit = min(range(10), key=lambda d: part_errs[d])
+        digits.append(digit)
+        errs.append(part_errs[digit])
+    value = ((digits[0] * 10 + digits[1]) * 10 + digits[2]) * 10 + digits[3]
+    if not plausible_coin_value(value) or _suspicious_coin_value(value):
+        return None
+    mean_err = sum(errs) / 4.0
+    if mean_err > 0.55 or max(errs) > 0.50:
+        return None
+    return value, mean_err - 20.0, f"hud n=4 {tag}"
+
+
+def _hud_decode_rank(item: Tuple[int, float, str], *, prefer_ref_split: bool) -> tuple[int, float, float]:
+    """分割方式の優先度。低解像度 crop では ref/valley、通常は ratio を優先。"""
+    _val, err, dbg = item
+    tag = dbg.rsplit(" ", 1)[-1] if dbg else ""
+    if prefer_ref_split:
+        order = {"comma": 0, "ref": 1, "valley": 2, "ratio": 3}.get(tag, 9)
+    else:
+        order = {"comma": 0, "ratio": 1, "ref": 2, "valley": 3}.get(tag, 9)
+    return (order, err, err)
+
+
+def _coin_digit_cnn_ready() -> bool:
+    try:
+        from app.services.coin_digit_cnn import coin_digit_cnn_available
+
+        return coin_digit_cnn_available()
+    except Exception:
+        return False
+
+
 def _try_hud_four_digit_decode(gray: np.ndarray) -> Optional[Tuple[int, float, str]]:
-    """実機 HUD 向け: 4 桁分割 + テンプレート照合。"""
+    """実機 HUD 向け: 4 桁分割 + 桁分類（CNN 優先）。"""
     row = _hud_digit_row_gray(gray)
     if row is None:
         return None
-    best: Optional[Tuple[int, float, str]] = None
+    use_cnn = _coin_digit_cnn_ready()
+    if use_cnn:
+        ref_parts = _hud_split_four_digits_ref(row)
+        if ref_parts is not None:
+            ref_decoded = _decode_hud_four_parts_cnn(ref_parts, "ref")
+            if ref_decoded is not None:
+                return ref_decoded
+    prefer_ref_split = gray.shape[0] < 110
+    decoded_list: List[Tuple[int, float, str]] = []
     for parts, tag in _hud_split_four_digit_variants(row):
-        decoded = _decode_hud_four_parts(parts, tag)
+        if use_cnn:
+            decoded = _decode_hud_four_parts_cnn(parts, tag)
+        else:
+            decoded = _decode_hud_four_parts(parts, tag)
         if decoded is None:
             continue
-        if best is None or decoded[1] < best[1]:
-            best = decoded
-    return best
+        decoded_list.append(decoded)
+    if not decoded_list:
+        return None
+    if use_cnn:
+        return min(decoded_list, key=lambda item: (item[1], item[0]))
+    return min(
+        decoded_list,
+        key=lambda item: _hud_decode_rank(item, prefer_ref_split=prefer_ref_split),
+    )
 
 
 def _upscale_gray_for_hud(gray: np.ndarray, bgr: Optional[np.ndarray]) -> tuple[np.ndarray, Optional[np.ndarray]]:
@@ -1571,6 +1663,82 @@ def _upscale_gray_for_hud(gray: np.ndarray, bgr: Optional[np.ndarray]) -> tuple[
     return gray_up, bgr_up
 
 
+def _coin_gain_strip_for_hud(gray: np.ndarray, bgr: Optional[np.ndarray]) -> np.ndarray:
+    """横長 coin_gain ROI を HUD 4 桁 OCR 向けに数字列だけへ絞る。"""
+    if gray is None or gray.size == 0:
+        return gray
+    h, w = gray.shape[:2]
+    aspect = w / max(1, h)
+    if aspect <= 3.0:
+        prepared, _ = _upscale_gray_for_hud(gray, bgr)
+        return prepared
+    strip = _gray_digit_strip(gray, bgr) if bgr is not None else None
+    if strip is None or strip.size == 0 or strip.shape[1] < 16:
+        prepared, _ = _upscale_gray_for_hud(gray, bgr)
+        return prepared
+    sh, sw = strip.shape[:2]
+    target_h = max(96, min(120, sh * 4)) if sh < 40 else max(72, min(120, sh * 4))
+    scale = target_h / max(1, sh)
+    return cv2.resize(
+        strip,
+        (max(1, int(sw * scale)), max(1, int(sh * scale))),
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+
+def read_coin_gain_crop(roi: QImage) -> Tuple[Optional[int], float, str]:
+    """coin_gain 切り抜き（横長・低解像度）向け。確定ダイアログと coin 画面で使用。"""
+    if not _CV2_OK:
+        return None, 1e9, "opencv未導入"
+    if roi is None or roi.isNull() or roi.width() < 12 or roi.height() < 6:
+        return None, 1e9, "crop_roi小"
+    gray = qimage_to_gray(roi)
+    if gray is None:
+        return None, 1e9, "gray失敗"
+    bgr = qimage_to_bgr(roi)
+    candidates: List[Tuple[int, float, str]] = []
+    strip_hud = _try_hud_four_digit_decode(_coin_gain_strip_for_hud(gray, bgr))
+    if strip_hud is not None:
+        _append_decode_candidate(
+            candidates, strip_hud[0], strip_hud[1], f"crop {strip_hud[2]}", bonus=-32.0
+        )
+    row_hud = _try_hud_four_digit_decode(gray)
+    if row_hud is not None:
+        _append_decode_candidate(
+            candidates, row_hud[0], row_hud[1], f"crop {row_hud[2]}", bonus=-30.0
+        )
+    try:
+        from app.services.coin_digit_cnn import coin_digit_cnn_available
+
+        cnn_ready = coin_digit_cnn_available()
+    except Exception:
+        cnn_ready = False
+    if not cnn_ready:
+        hud_val, hud_err, hud_dbg = read_coin_hud(roi)
+        _append_decode_candidate(candidates, hud_val, hud_err, f"crop {hud_dbg}", bonus=-8.0)
+        gain_val, gain_err, gain_dbg = read_coin_gain(roi)
+        gain_bonus = -6.0 if "head_tail" in gain_dbg or " n=4" in gain_dbg else 0.0
+        _append_decode_candidate(candidates, gain_val, gain_err, f"crop {gain_dbg}", bonus=gain_bonus)
+    else:
+        hud_val, hud_err, hud_dbg = read_coin_hud(roi)
+        _append_decode_candidate(candidates, hud_val, hud_err, f"crop {hud_dbg}", bonus=-12.0)
+    if not candidates:
+        return None, 1e9, "crop_decode失敗"
+    ranked = sorted(candidates, key=_candidate_rank_item)
+    acceptable = [
+        cand
+        for cand in ranked
+        if plausible_coin_value(cand[0])
+        and not _suspicious_coin_value(cand[0])
+        and cand[1] <= _MAX_HUD_ACCEPTABLE_ERR
+    ]
+    if not acceptable:
+        top = ranked[0]
+        return None, 1e9, f"crop_err_high={top[1]:.1f} {top[2]}"
+    best = acceptable[0]
+    return best[0], best[1], f"ok err={best[1]:.1f} {best[2]}"
+
+
 def read_coin_hud(roi: QImage) -> Tuple[Optional[int], float, str]:
     """プレイ中 HUD（coin 枠）向け。小さい ROI を拡大して読む。"""
     if not _CV2_OK:
@@ -1585,19 +1753,27 @@ def read_coin_hud(roi: QImage) -> Tuple[Optional[int], float, str]:
     hud_ref = _try_hud_four_digit_decode(gray)
     if hud_ref is not None:
         _append_decode_candidate(
-            candidates, hud_ref[0], hud_ref[1], f"hud {hud_ref[2]}", bonus=-24.0
+            candidates, hud_ref[0], hud_ref[1], f"hud {hud_ref[2]}", bonus=-28.0
         )
-    gray_up, bgr_up = _upscale_gray_for_hud(gray, bgr)
-    if bgr_up is not None:
-        strip = _gray_digit_strip(gray_up, bgr_up)
-        if strip is not None:
-            for binary in _binarize_variants(strip):
-                val, err, dbg = _decode_binary(binary)
-                _append_decode_candidate(
-                    candidates, val, err, f"hud_strip {dbg}", bonus=-6.0
-                )
-    for val, err, dbg in _decode_gray_sources(gray_up, bgr_up):
-        _append_decode_candidate(candidates, val, err, f"hud {dbg}")
+    if gray.shape[1] / max(1, gray.shape[0]) > 3.0:
+        prepared = _coin_gain_strip_for_hud(gray, bgr)
+        strip_hud = _try_hud_four_digit_decode(prepared)
+        if strip_hud is not None:
+            _append_decode_candidate(
+                candidates, strip_hud[0], strip_hud[1], f"hud {strip_hud[2]}", bonus=-24.0
+            )
+    if not _coin_digit_cnn_ready():
+        gray_up, bgr_up = _upscale_gray_for_hud(gray, bgr)
+        if bgr_up is not None:
+            strip = _gray_digit_strip(gray_up, bgr_up)
+            if strip is not None:
+                for binary in _binarize_variants(strip):
+                    val, err, dbg = _decode_binary(binary)
+                    _append_decode_candidate(
+                        candidates, val, err, f"hud_strip {dbg}", bonus=-6.0
+                    )
+        for val, err, dbg in _decode_gray_sources(gray_up, bgr_up):
+            _append_decode_candidate(candidates, val, err, f"hud {dbg}")
     if not candidates:
         return None, 1e9, "hud_decode失敗"
     ranked = sorted(candidates, key=_candidate_rank_item)

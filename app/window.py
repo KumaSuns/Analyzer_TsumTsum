@@ -86,6 +86,7 @@ from app.services.coin_gain_reader import (
     opencv_available,
     plausible_coin_value,
     read_coin_gain,
+    read_coin_gain_crop,
     read_coin_hud,
 )
 from app.services.remaining_time_reader import read_remaining_seconds
@@ -1627,6 +1628,11 @@ class MainWindow(QMainWindow):
             dlg.setWindowTitle("獲得コイン確定")
             dlg.setModal(True)
             layout = QVBoxLayout(dlg)
+            crop = self._crop_frame_roi(frame_image, "coin_gain")
+            if crop is not None and not crop.isNull():
+                crop_val, _crop_err, _crop_dbg = read_coin_gain_crop(crop)
+                if crop_val is not None and plausible_coin_value(crop_val):
+                    coin_value = crop_val
             if coin_value is not None:
                 info = QLabel(f"獲得コイン: {coin_value:,} (coin確定)")
             else:
@@ -1802,7 +1808,10 @@ class MainWindow(QMainWindow):
             return
         frame_reads: list[tuple[int, float, str, str]] = []
         for roi, source in self._coin_roi_read_jobs(rois, scene):
-            if source == "hud":
+            if scene == "coin":
+                value, err, dbg = read_coin_gain_crop(roi)
+                source = "hud"
+            elif source == "hud":
                 value, err, dbg = read_coin_hud(roi)
             else:
                 value, err, dbg = read_coin_gain(roi)
@@ -1925,7 +1934,7 @@ class MainWindow(QMainWindow):
         crop = self._crop_frame_roi(frame_image, "coin_gain")
         if crop is None or crop.isNull():
             return None, 1e9, "cropなし"
-        return read_coin_hud(crop)
+        return read_coin_gain_crop(crop)
 
     def _finalize_coin_confirmation(self) -> None:
         if self._coin_confirmed_this_game:
@@ -1938,7 +1947,7 @@ class MainWindow(QMainWindow):
         if frame is not None and not frame.isNull():
             crop_val, crop_err, crop_dbg = self._read_coin_gain_hud_crop(frame)
             if crop_val is not None and plausible_coin_value(crop_val):
-                if crop_err <= _MAX_HUD_ACCEPTABLE_ERR or "hud n=4" in crop_dbg:
+                if crop_err <= _MAX_HUD_ACCEPTABLE_ERR or "hud n=4" in crop_dbg or "crop hud" in crop_dbg:
                     self._coin_gain_best = crop_val
                     self._coin_gain_last_debug = crop_dbg
         self._coin_confirmed_this_game = True
