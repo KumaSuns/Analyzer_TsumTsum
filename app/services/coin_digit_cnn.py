@@ -158,10 +158,13 @@ def _synthetic_digit_patch(digit: int, rng: random.Random, *, hud_style: bool) -
     return _augment_patch(canvas, rng)
 
 
-def _extract_ref_digit_patches(ref_path: Path) -> Dict[int, List[np.ndarray]]:
+def _extract_labeled_ref_digit_patches(
+    ref_path: Path, labels: Tuple[int, ...]
+) -> Dict[int, List[np.ndarray]]:
     from app.services.coin_gain_reader import (
         _hud_digit_row_gray,
         _hud_split_four_digit_variants,
+        _patch_digit_errors,
     )
 
     out: Dict[int, List[np.ndarray]] = {d: [] for d in range(10)}
@@ -169,17 +172,28 @@ def _extract_ref_digit_patches(ref_path: Path) -> Dict[int, List[np.ndarray]]:
     if gray is None:
         return out
     row = _hud_digit_row_gray(gray)
-    if row is None:
+    if row is None or len(labels) != 4:
         return out
-    labels = (5, 3, 9, 5)
+    best_parts: Optional[List[np.ndarray]] = None
+    best_score = 1e9
     for parts, _tag in _hud_split_four_digit_variants(row):
         if len(parts) != 4:
             continue
-        for digit, part in zip(labels, parts):
-            if part is not None and part.size > 0:
-                out[digit].append(_normalize_digit_patch(part))
-        break
+        part_errs = [_patch_digit_errors(p) for p in parts]
+        score = sum(part_errs[i][labels[i]] for i in range(4))
+        if score < best_score:
+            best_score = score
+            best_parts = parts
+    if best_parts is None:
+        return out
+    for digit, part in zip(labels, best_parts):
+        if part is not None and part.size > 0:
+            out[digit].append(_normalize_digit_patch(part))
     return out
+
+
+def _extract_ref_digit_patches(ref_path: Path) -> Dict[int, List[np.ndarray]]:
+    return _extract_labeled_ref_digit_patches(ref_path, (5, 3, 9, 5))
 
 
 def _extract_wide_crop_digit_patches(
@@ -252,6 +266,13 @@ def build_digit_training_samples(
     rng = random.Random(seed)
     ref_path = _assets_root() / "images" / "coin_hud_ref_5395.png"
     ref_patches = _extract_ref_digit_patches(ref_path) if ref_path.exists() else {}
+    ref3065_path = _assets_root() / "images" / "coin_hud_ref_3065.png"
+    if not ref3065_path.exists():
+        ref3065_path = Path(__file__).resolve().parents[2] / "_dlg_crop_extract.png"
+    if ref3065_path.exists():
+        extra = _extract_labeled_ref_digit_patches(ref3065_path, (3, 0, 6, 5))
+        for digit, patches in extra.items():
+            ref_patches.setdefault(digit, []).extend(patches)
     wide_patches = (
         _extract_wide_crop_digit_patches(ref_path, rng, n_variants=100)
         if ref_path.exists()

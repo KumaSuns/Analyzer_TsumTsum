@@ -1,4 +1,4 @@
-"""コイン獲得画面の数字領域を読み取る（OpenCV テンプレート照合）。"""
+"""コイン獲得画面の数字領域を読み取る（coin_digit CNN / DL）。"""
 from __future__ import annotations
 
 from functools import lru_cache
@@ -468,6 +468,8 @@ def _match_digit(
 ) -> Tuple[Optional[int], float]:
     if patch.size == 0:
         return None, 1e9
+    if not _coin_digit_cnn_ready():
+        return None, 1e9
     try:
         from app.services.coin_digit_cnn import get_coin_digit_classifier
 
@@ -476,7 +478,7 @@ def _match_digit(
             return cnn.match_digit(patch, max_mean=max_mean)
     except Exception:
         pass
-    return _match_digit_template(patch, max_mean=max_mean)
+    return None, 1e9
 
 
 def _expand_box_to_digits(
@@ -980,7 +982,7 @@ def _candidate_rank_item(item: Tuple[int, float, str]) -> tuple[float, float]:
         score += _FIVE_DIGIT_EXTRA_ERR
     if "bookend" in dbg:
         score -= 3.0
-    if dbg.startswith("n=4") or " n=4" in dbg:
+    if dbg.startswith("n=4") or " n=4" in dbg or "dl n=4" in dbg:
         score -= 12.0
     if " strip " in f" {dbg} " or dbg.startswith("strip "):
         score -= 8.0
@@ -998,7 +1000,12 @@ def _candidate_rank_item(item: Tuple[int, float, str]) -> tuple[float, float]:
 
 
 def _is_box_decode_dbg(dbg: str) -> bool:
-    return dbg.startswith("n=4") or " n=4" in dbg or "head_tail" in dbg
+    return (
+        dbg.startswith("n=4")
+        or " n=4" in dbg
+        or "dl n=4" in dbg
+        or "head_tail" in dbg
+    )
 
 
 def _is_slot_decode_dbg(dbg: str) -> bool:
@@ -1139,20 +1146,33 @@ def _game_hud_ref_templates() -> dict[int, List[np.ndarray]]:
 
 
 def _patch_digit_errors(patch: np.ndarray) -> List[float]:
-    """各桁 0-9 の照合誤差（CNN 優先、未学習時はテンプレート）。"""
-    try:
-        from app.services.coin_digit_cnn import get_coin_digit_classifier
+    """各桁 0-9 の DL 分類誤差（coin_digit CNN + HUD テンプレ補助）。"""
+    cnn_errs: Optional[List[float]] = None
+    if _coin_digit_cnn_ready():
+        try:
+            from app.services.coin_digit_cnn import get_coin_digit_classifier
 
-        cnn = get_coin_digit_classifier()
-        if cnn.is_loaded():
-            return cnn.digit_errors(patch)
-    except Exception:
-        pass
-    errs = _synth_digit_errors(patch)
-    for digit, refs in _game_hud_ref_templates().items():
-        for ref in refs:
-            errs[digit] = min(errs[digit], _match_patch_to_ref(patch, ref))
-    return errs
+            cnn = get_coin_digit_classifier()
+            if cnn.is_loaded():
+                cnn_errs = cnn.digit_errors(patch)
+        except Exception:
+            pass
+    synth_errs = _synth_digit_errors(patch)
+    if cnn_errs is None:
+        return synth_errs
+    out: List[float] = []
+    for digit in range(10):
+        cnn_e = cnn_errs[digit]
+        synth_e = synth_errs[digit]
+        err = cnn_e
+        if synth_e < 0.68:
+            err = min(err, synth_e * 0.86 + 0.05)
+        elif cnn_e > 0.82 and synth_e < cnn_e:
+            err = min(err, synth_e * 0.94 + 0.08)
+        if digit in (0, 6) and synth_e < 0.82:
+            err = min(err, synth_e * 0.70 + 0.04)
+        out.append(err)
+    return out
 
 
 def _hud_ink_span(row: np.ndarray) -> Optional[tuple[int, int, np.ndarray]]:
@@ -1366,68 +1386,193 @@ def _hud_valley_cut_indices(proj: np.ndarray, x0: int, x1: int) -> Optional[List
     return [x0, x0 + picked[0], x0 + picked[1], x0 + picked[2], x1]
 
 
-def _hud_split_comma_four_digits(row: np.ndarray) -> Optional[List[np.ndarray]]:
-    """5,395 型（1桁+カンマ+3桁）向け分割。"""
-    span = _hud_trimmed_ink_span(row)
+def _hud_valley_n_part_cuts(
+    proj: np.ndarray, x0: int, x1: int, *, valleys_needed: int
+) -> Optional[List[int]]:
+    """谷を valleys_needed 個拾い (valleys_needed+1) 分割の切り位置を返す。"""
+    width = max(1, x1 - x0)
+    span = proj[x0:x1]
+    if len(span) < 12:
+        return None
+    smooth = np.convolve(span, np.ones(5, dtype=np.float32) / 5.0, mode="same")
+    margin = max(2, int(width * 0.05))
+    valleys: List[tuple[float, int]] = []
+    for idx in range(margin, len(smooth) - margin):
+        left = smooth[idx - 1]
+        mid = smooth[idx]
+        right = smooth[idx + 1]
+        if mid <= left and mid <= right:
+            valleys.append((float(mid), idx))
+    if not valleys:
+        return None
+    valleys.sort()
+    min_gap = max(3, int(width * 0.08))
+    picked: List[int] = []
+    for _depth, rel_idx in valleys:
+        if any(abs(rel_idx - p) < min_gap for p in picked):
+            continue
+        picked.append(rel_idx)
+        if len(picked) == valleys_needed:
+            break
+    if len(picked) != valleys_needed:
+        return None
+    picked.sort()
+    cuts = [x0]
+    cuts.extend(x0 + p for p in picked)
+    cuts.append(x1)
+    return cuts
+
+
+def _hud_subpatch_ink_span(row: np.ndarray) -> Optional[tuple[int, int, np.ndarray]]:
+    """単桁・尾桁など部分切り出し向け（全行用の最小幅制約なし）。"""
+    span = _hud_ink_span(row)
     if span is None:
         return None
     x0, x1, proj = span
-    width = max(1, x1 - x0)
-    span_proj = proj[x0:x1]
-    if len(span_proj) < 16:
+    if x1 - x0 < 4:
         return None
-    h = row.shape[0]
-    comma_max_w = max(4, int(h * 0.14))
-    comma_min_gap = max(6, int(h * 0.28))
-    best_comma: Optional[int] = None
-    best_score = 1e9
-    for idx in range(comma_min_gap, len(span_proj) - comma_min_gap):
-        left = max(0, idx - comma_max_w // 2)
-        right = min(len(span_proj), idx + comma_max_w // 2 + 1)
-        col_w = right - left
-        if col_w > comma_max_w:
-            continue
-        col_ink = float(span_proj[left:right].max())
-        row_ink = float(span_proj.max())
-        if col_ink > row_ink * 0.34:
-            continue
-        if float(span_proj[:idx].max()) < row_ink * 0.55:
-            continue
-        if float(span_proj[idx:].max()) < row_ink * 0.55:
-            continue
-        score = col_ink + abs(idx / width - 0.22) * row_ink * 0.25
-        if score < best_score:
-            best_score = score
-            best_comma = idx
-    if best_comma is None:
+    return x0, x1, proj
+
+
+def _hud_find_leading_comma_idx(span_proj: np.ndarray, width: int) -> Optional[int]:
+    """1桁+カンマ+3桁（5,395 / 3,065）の先頭カンマ直後（尾3桁開始）。"""
+    peak = float(span_proj.max())
+    if peak <= 0 or width < 20:
         return None
-    left = row[:, x0 : x0 + best_comma]
-    tail = row[:, x0 + best_comma : x1]
-    if left.shape[1] < 4 or tail.shape[1] < 12:
+    thresh = peak * 0.10
+    first_digit_w = max(6, int(width * 0.14))
+    if float(span_proj[:first_digit_w].max()) < peak * 0.30:
         return None
-    tail_span = _hud_trimmed_ink_span(tail)
-    if tail_span is None:
+    lead_end = max(5, int(width * 0.05))
+    search = max(14, int(width * 0.52))
+    run_start: Optional[int] = None
+    best_end: Optional[int] = None
+    best_len = 0
+    for idx in range(lead_end, min(search, len(span_proj) - 3)):
+        if float(span_proj[idx]) <= thresh:
+            if run_start is None:
+                run_start = idx
+        elif run_start is not None:
+            run_len = idx - run_start
+            if run_len >= 2 and float(span_proj[idx:].max()) >= peak * 0.30:
+                if run_len > best_len:
+                    best_len = run_len
+                    best_end = idx
+            run_start = None
+    return best_end
+
+
+def _hud_tail_three_digit_parts(
+    tail: np.ndarray, tx0: int, tx1: int, proj: np.ndarray
+) -> Optional[List[np.ndarray]]:
+    """カンマ右の3桁を切り出す（谷優先、ダメなら等分）。"""
+    width = max(1, tx1 - tx0)
+    if width < 12:
         return None
-    tx0, tx1, tproj = tail_span
-    tail_cuts = _hud_valley_cut_indices(tproj, tx0, tx1)
-    if tail_cuts is not None:
-        tail_parts = _hud_parts_from_cuts(tail, tail_cuts)
-        if tail_parts is not None and len(tail_parts) == 4:
-            parts = [left, tail_parts[1], tail_parts[2], tail_parts[3]]
-            if _hud_comma_parts_plausible(row, parts):
-                return parts
-    tail_w = max(1, tx1 - tx0)
-    tail_ratios = (0.0, 0.33, 0.66, 1.0)
-    tail_parts = [
-        tail[:, tx0 + int(tail_w * tail_ratios[i]) : tx0 + int(tail_w * tail_ratios[i + 1])]
-        for i in range(3)
-    ]
-    if any(p.shape[1] < 4 for p in tail_parts):
-        return None
-    parts = [left, tail_parts[0], tail_parts[1], tail_parts[2]]
-    if not _hud_comma_parts_plausible(row, parts):
+    cuts = _hud_valley_n_part_cuts(proj, tx0, tx1, valleys_needed=2)
+    if cuts is not None and len(cuts) == 4:
+        parts = [tail[:, cuts[i] : cuts[i + 1]] for i in range(3)]
+        widths = [p.shape[1] for p in parts]
+        if all(w >= 4 for w in widths) and max(widths) <= min(widths) * 3.2:
+            return parts
+    c1 = tx0 + int(width * 0.33)
+    c2 = tx0 + int(width * 0.66)
+    parts = [tail[:, tx0:c1], tail[:, c1:c2], tail[:, c2:tx1]]
+    if any(p.shape[1] < 4 for p in parts):
         return None
     return parts
+
+
+def _hud_leading_digit_patch(row_left: np.ndarray) -> np.ndarray:
+    """カンマ左の先頭1桁だけを切り出す（カンマ列を除外）。"""
+    span = _hud_subpatch_ink_span(row_left)
+    if span is None:
+        return row_left
+    x0, x1, proj = span
+    width = max(1, x1 - x0)
+    sub = proj[x0:x1].astype(np.float32)
+    peak = float(sub.max())
+    if peak <= 0:
+        return row_left[:, x0:x1]
+    min_w = max(4, int(width * 0.28))
+    for rel in range(width - 2, min_w, -1):
+        if sub[rel] <= peak * 0.18:
+            cut = x0 + rel
+            if cut - x0 >= 4:
+                return row_left[:, x0:cut]
+    cut = x0 + max(4, int(width * 0.52))
+    if cut - x0 >= 4:
+        return row_left[:, x0:cut]
+    return row_left[:, x0:x1]
+
+
+def _hud_comma_split_variant_list(row: np.ndarray) -> List[List[np.ndarray]]:
+    """カンマ検出 + 尾3桁の分割比率を複数試す。"""
+    span = _hud_trimmed_ink_span(row)
+    if span is None:
+        return []
+    x0, x1, proj = span
+    span_proj = proj[x0:x1]
+    if len(span_proj) < 16:
+        return []
+    width = max(1, x1 - x0)
+    comma_rel = _hud_find_leading_comma_idx(span_proj, width)
+    if comma_rel is None:
+        return []
+    comma_candidates = sorted(
+        set(
+            comma_rel + delta
+            for delta in range(-3, 4)
+            if 8 <= comma_rel + delta <= width - 14
+        )
+    )
+    ratio_pairs = ((0.28, 0.58), (0.30, 0.62), (0.33, 0.66), (0.35, 0.68))
+    out: List[List[np.ndarray]] = []
+    seen: set[tuple[int, ...]] = set()
+    for comma_rel in comma_candidates:
+        comma_x = x0 + comma_rel
+        left = row[:, x0:comma_x]
+        tail = row[:, comma_x:x1]
+        if left.shape[1] < 4 or tail.shape[1] < 12:
+            continue
+        left_trim = _hud_subpatch_ink_span(left)
+        if left_trim is not None:
+            lx0, lx1, _ = left_trim
+            left = left[:, lx0:lx1]
+        left = _hud_leading_digit_patch(left)
+        tail_span = _hud_subpatch_ink_span(tail)
+        if tail_span is None:
+            continue
+        tx0, tx1, tproj = tail_span
+        tail_w = max(1, tx1 - tx0)
+        attempts: List[List[np.ndarray]] = []
+        valley_parts = _hud_tail_three_digit_parts(tail, tx0, tx1, tproj)
+        if valley_parts is not None:
+            attempts.append(valley_parts)
+        for r1, r2 in ratio_pairs:
+            c1 = tx0 + int(tail_w * r1)
+            c2 = tx0 + int(tail_w * r2)
+            if c2 - c1 < 4 or c1 - tx0 < 4 or tx1 - c2 < 4:
+                continue
+            attempts.append(
+                [tail[:, tx0:c1], tail[:, c1:c2], tail[:, c2:tx1]]
+            )
+        for tail_parts in attempts:
+            parts = [left, tail_parts[0], tail_parts[1], tail_parts[2]]
+            if not _hud_comma_parts_plausible(row, parts):
+                continue
+            key = tuple(p.shape[1] for p in parts)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(parts)
+    return out
+
+
+def _hud_split_comma_four_digits(row: np.ndarray) -> Optional[List[np.ndarray]]:
+    """5,395 / 3,065 型（1桁+カンマ+3桁）向け分割。"""
+    variants = _hud_comma_split_variant_list(row)
+    return variants[0] if variants else None
 
 
 def _hud_split_four_digits_valley(row: np.ndarray) -> Optional[List[np.ndarray]]:
@@ -1445,8 +1590,13 @@ def _hud_split_four_digits_valley(row: np.ndarray) -> Optional[List[np.ndarray]]
 def _hud_split_four_digit_variants(row: np.ndarray) -> List[tuple[List[np.ndarray], str]]:
     variants: List[tuple[List[np.ndarray], str]] = []
     seen: set[tuple[int, ...]] = set()
+    for parts in _hud_comma_split_variant_list(row):
+        key = tuple(p.shape[1] for p in parts)
+        if key in seen:
+            continue
+        seen.add(key)
+        variants.append((parts, "comma"))
     for parts, tag in (
-        (_hud_split_comma_four_digits(row), "comma"),
         (_hud_split_four_digits_valley(row), "valley"),
         (_hud_split_four_digits_ref(row), "ref"),
         (_hud_split_four_digits(row), "ratio"),
@@ -1493,11 +1643,31 @@ def _hud_maybe_fix_ref_confusable_digits(
     digits = [int(ch) for ch in str(value)]
     if len(digits) != 4:
         return value, total_err
-    swaps = ((0, 1, 5), (0, 4, 5), (1, 4, 3), (1, 1, 3), (2, 5, 9), (2, 8, 9), (3, 4, 5), (3, 9, 5))
+    swaps = (
+        (0, 1, 5),
+        (0, 4, 5),
+        (0, 3, 5),
+        (1, 4, 3),
+        (1, 1, 3),
+        (1, 3, 0),
+        (1, 5, 0),
+        (1, 5, 6),
+        (1, 2, 0),
+        (2, 3, 9),
+        (2, 5, 6),
+        (2, 5, 9),
+        (2, 8, 9),
+        (2, 9, 6),
+        (0, 3, 5),
+        (3, 3, 5),
+        (3, 4, 5),
+        (3, 9, 5),
+    )
     for pos, wrong, right in swaps:
         if digits[pos] != wrong:
             continue
-        if part_errs[pos][right] >= part_errs[pos][wrong] + 0.12:
+        margin = 0.08 if wrong in (3, 5) and right in (0, 5, 6) else 0.12
+        if part_errs[pos][right] >= part_errs[pos][wrong] + margin:
             continue
         alt = digits[:]
         alt[pos] = right
@@ -1578,23 +1748,12 @@ def _hud_digit_row_gray(gray: np.ndarray) -> Optional[np.ndarray]:
 def _decode_hud_four_parts_cnn(
     parts: List[np.ndarray], tag: str
 ) -> Optional[Tuple[int, float, str]]:
-    """CNN 各桁 argmin 誤差で 4 桁を復元（分割方式の選択用）。"""
-    if len(parts) != 4:
+    """CNN 4 桁復元（全組合せ + 僅差補正）。"""
+    decoded = _decode_hud_four_parts(parts, tag)
+    if decoded is None:
         return None
-    digits: List[int] = []
-    errs: List[float] = []
-    for part in parts:
-        part_errs = _patch_digit_errors(part)
-        digit = min(range(10), key=lambda d: part_errs[d])
-        digits.append(digit)
-        errs.append(part_errs[digit])
-    value = ((digits[0] * 10 + digits[1]) * 10 + digits[2]) * 10 + digits[3]
-    if not plausible_coin_value(value) or _suspicious_coin_value(value):
-        return None
-    mean_err = sum(errs) / 4.0
-    if mean_err > 0.55 or max(errs) > 0.50:
-        return None
-    return value, mean_err - 20.0, f"hud n=4 {tag}"
+    val, err, dbg = decoded
+    return val, err, dbg.replace("hud n=4", "dl n=4")
 
 
 def _hud_decode_rank(item: Tuple[int, float, str], *, prefer_ref_split: bool) -> tuple[int, float, float]:
@@ -1618,35 +1777,27 @@ def _coin_digit_cnn_ready() -> bool:
 
 
 def _try_hud_four_digit_decode(gray: np.ndarray) -> Optional[Tuple[int, float, str]]:
-    """実機 HUD 向け: 4 桁分割 + 桁分類（CNN 優先）。"""
+    """実機 HUD 向け: 4 桁分割 + coin_digit CNN。"""
+    if not _coin_digit_cnn_ready():
+        return None
     row = _hud_digit_row_gray(gray)
     if row is None:
         return None
-    use_cnn = _coin_digit_cnn_ready()
-    if use_cnn:
-        ref_parts = _hud_split_four_digits_ref(row)
-        if ref_parts is not None:
-            ref_decoded = _decode_hud_four_parts_cnn(ref_parts, "ref")
-            if ref_decoded is not None:
-                return ref_decoded
-    prefer_ref_split = gray.shape[0] < 110
     decoded_list: List[Tuple[int, float, str]] = []
     for parts, tag in _hud_split_four_digit_variants(row):
-        if use_cnn:
-            decoded = _decode_hud_four_parts_cnn(parts, tag)
-        else:
-            decoded = _decode_hud_four_parts(parts, tag)
+        decoded = _decode_hud_four_parts_cnn(parts, tag)
         if decoded is None:
             continue
         decoded_list.append(decoded)
     if not decoded_list:
         return None
-    if use_cnn:
-        return min(decoded_list, key=lambda item: (item[1], item[0]))
-    return min(
-        decoded_list,
-        key=lambda item: _hud_decode_rank(item, prefer_ref_split=prefer_ref_split),
-    )
+
+    def _pick_key(item: Tuple[int, float, str]) -> tuple:
+        tag = item[2].rsplit(" ", 1)[-1] if item[2] else ""
+        tag_order = {"comma": 0, "valley": 1, "ratio": 2, "ref": 3}.get(tag, 9)
+        return (item[1], tag_order, item[0])
+
+    return min(decoded_list, key=_pick_key)
 
 
 def _upscale_gray_for_hud(gray: np.ndarray, bgr: Optional[np.ndarray]) -> tuple[np.ndarray, Optional[np.ndarray]]:
@@ -1664,7 +1815,7 @@ def _upscale_gray_for_hud(gray: np.ndarray, bgr: Optional[np.ndarray]) -> tuple[
 
 
 def _coin_gain_strip_for_hud(gray: np.ndarray, bgr: Optional[np.ndarray]) -> np.ndarray:
-    """横長 coin_gain ROI を HUD 4 桁 OCR 向けに数字列だけへ絞る。"""
+    """横長 coin_gain ROI を DL 4 桁読取向けに数字列だけへ絞る。"""
     if gray is None or gray.size == 0:
         return gray
     h, w = gray.shape[:2]
@@ -1687,9 +1838,11 @@ def _coin_gain_strip_for_hud(gray: np.ndarray, bgr: Optional[np.ndarray]) -> np.
 
 
 def read_coin_gain_crop(roi: QImage) -> Tuple[Optional[int], float, str]:
-    """coin_gain 切り抜き（横長・低解像度）向け。確定ダイアログと coin 画面で使用。"""
+    """coin_gain 切り抜き向け DL 読取（coin_digit CNN）。"""
     if not _CV2_OK:
         return None, 1e9, "opencv未導入"
+    if not _coin_digit_cnn_ready():
+        return None, 1e9, "coin_digit未学習"
     if roi is None or roi.isNull() or roi.width() < 12 or roi.height() < 6:
         return None, 1e9, "crop_roi小"
     gray = qimage_to_gray(roi)
@@ -1707,23 +1860,8 @@ def read_coin_gain_crop(roi: QImage) -> Tuple[Optional[int], float, str]:
         _append_decode_candidate(
             candidates, row_hud[0], row_hud[1], f"crop {row_hud[2]}", bonus=-30.0
         )
-    try:
-        from app.services.coin_digit_cnn import coin_digit_cnn_available
-
-        cnn_ready = coin_digit_cnn_available()
-    except Exception:
-        cnn_ready = False
-    if not cnn_ready:
-        hud_val, hud_err, hud_dbg = read_coin_hud(roi)
-        _append_decode_candidate(candidates, hud_val, hud_err, f"crop {hud_dbg}", bonus=-8.0)
-        gain_val, gain_err, gain_dbg = read_coin_gain(roi)
-        gain_bonus = -6.0 if "head_tail" in gain_dbg or " n=4" in gain_dbg else 0.0
-        _append_decode_candidate(candidates, gain_val, gain_err, f"crop {gain_dbg}", bonus=gain_bonus)
-    else:
-        hud_val, hud_err, hud_dbg = read_coin_hud(roi)
-        _append_decode_candidate(candidates, hud_val, hud_err, f"crop {hud_dbg}", bonus=-12.0)
     if not candidates:
-        return None, 1e9, "crop_decode失敗"
+        return None, 1e9, "crop_dl失敗"
     ranked = sorted(candidates, key=_candidate_rank_item)
     acceptable = [
         cand
@@ -1740,78 +1878,16 @@ def read_coin_gain_crop(roi: QImage) -> Tuple[Optional[int], float, str]:
 
 
 def read_coin_hud(roi: QImage) -> Tuple[Optional[int], float, str]:
-    """プレイ中 HUD（coin 枠）向け。小さい ROI を拡大して読む。"""
-    if not _CV2_OK:
-        return None, 1e9, "opencv未導入"
-    if roi is None or roi.isNull() or roi.width() < 12 or roi.height() < 6:
-        return None, 1e9, "hud_roi小"
-    gray = qimage_to_gray(roi)
-    if gray is None:
-        return None, 1e9, "gray失敗"
-    bgr = qimage_to_bgr(roi)
-    candidates: List[Tuple[int, float, str]] = []
-    hud_ref = _try_hud_four_digit_decode(gray)
-    if hud_ref is not None:
-        _append_decode_candidate(
-            candidates, hud_ref[0], hud_ref[1], f"hud {hud_ref[2]}", bonus=-28.0
-        )
-    if gray.shape[1] / max(1, gray.shape[0]) > 3.0:
-        prepared = _coin_gain_strip_for_hud(gray, bgr)
-        strip_hud = _try_hud_four_digit_decode(prepared)
-        if strip_hud is not None:
-            _append_decode_candidate(
-                candidates, strip_hud[0], strip_hud[1], f"hud {strip_hud[2]}", bonus=-24.0
-            )
-    if not _coin_digit_cnn_ready():
-        gray_up, bgr_up = _upscale_gray_for_hud(gray, bgr)
-        if bgr_up is not None:
-            strip = _gray_digit_strip(gray_up, bgr_up)
-            if strip is not None:
-                for binary in _binarize_variants(strip):
-                    val, err, dbg = _decode_binary(binary)
-                    _append_decode_candidate(
-                        candidates, val, err, f"hud_strip {dbg}", bonus=-6.0
-                    )
-        for val, err, dbg in _decode_gray_sources(gray_up, bgr_up):
-            _append_decode_candidate(candidates, val, err, f"hud {dbg}")
-    if not candidates:
-        return None, 1e9, "hud_decode失敗"
-    ranked = sorted(candidates, key=_candidate_rank_item)
-    acceptable = [
-        cand
-        for cand in ranked
-        if plausible_coin_value(cand[0])
-        and not _suspicious_coin_value(cand[0])
-        and cand[1] <= _MAX_HUD_ACCEPTABLE_ERR
-    ]
-    if not acceptable:
-        top = ranked[0]
-        return None, 1e9, f"hud_err_high={top[1]:.1f} {top[2]}"
-    best = acceptable[0]
-    return best[0], best[1], f"ok err={best[1]:.1f} {best[2]}"
+    """bonus HUD 等向け DL 読取。"""
+    val, err, dbg = read_coin_gain_crop(roi)
+    if val is None:
+        return val, err, dbg.replace("crop_", "hud_").replace("crop ", "hud ")
+    return val, err, dbg.replace("crop ", "hud ")
 
 
 def read_coin_gain(roi: QImage) -> Tuple[Optional[int], float, str]:
-    """トリミング ROI から獲得コイン数を推定。 (値, 誤差, debug)。"""
-    if not _CV2_OK:
-        return None, 1e9, "opencv未導入"
-    if roi is None or roi.isNull():
-        return None, 1e9, "roi空"
-    if roi.width() < 12 or roi.height() < 8:
-        return None, 1e9, "roi小"
-
-    gray = qimage_to_gray(roi)
-    if gray is None:
-        return None, 1e9, "gray失敗"
-    bgr = qimage_to_bgr(roi)
-    candidates = _decode_gray_sources(gray, bgr)
-    if not candidates:
-        return None, 1e9, f"decode失敗 roi={roi.width()}x{roi.height()}"
-
-    best = _pick_best_candidate(candidates)
-    if best[0] is None:
-        return best
-    return best[0], best[1], f"ok err={best[1]:.1f} {best[2]}"
+    """獲得コイン ROI 向け DL 読取（read_coin_gain_crop と同一）。"""
+    return read_coin_gain_crop(roi)
 
 
 def _reads_pass_quality_gate(matching: List[Tuple[float, str]], *, max_avg_err: float) -> bool:

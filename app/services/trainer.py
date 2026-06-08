@@ -160,6 +160,61 @@ class SimpleTrainer:
             log(f"コイン桁 CNN 学習失敗: {exc}")
             return False
 
+    def _try_load_saved_scene(self, version: str, log: Callable[[str], None]) -> bool:
+        """メモリ未学習時、保存済みシーンモデルをディスクから読み込む。"""
+        if self.scene_cnn.is_loaded() or self.scene_model.centroids:
+            return True
+        out_dir = self.model_root / version
+        cnn_path = out_dir / "scene_cnn.pt"
+        if cnn_path.exists() and self.scene_cnn.load(cnn_path):
+            self.scene_backend = "cnn"
+            meta_path = out_dir / "model_meta.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    self.val_accuracy = float(meta.get("val_accuracy", 0.0))
+                except Exception:
+                    pass
+            log(f"保存済み scene_cnn.pt を読み込みました: {cnn_path}")
+            return True
+        scene_path = out_dir / "scene_model.json"
+        if scene_path.exists() and self.scene_model.load(scene_path):
+            self.scene_backend = "centroid"
+            meta_path = out_dir / "model_meta.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    self.val_accuracy = float(meta.get("val_accuracy", 0.0))
+                except Exception:
+                    pass
+            log(f"保存済み scene_model.json を読み込みました: {scene_path}")
+            return True
+        return False
+
+    def save_coin_digit_only(
+        self, log: Callable[[str], None], version: str = "version_1"
+    ) -> Path:
+        """シーン CNN を触らず coin_digit.pt だけ学習・保存。"""
+        if not torch_available():
+            raise RuntimeError("PyTorch 未導入です。pip install torch torchvision を実行してください。")
+        out_dir = self.model_root / version
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if not self.train_coin_digit_cnn(log):
+            raise RuntimeError("コイン桁 CNN の学習に失敗しました。")
+        if self.coin_digit_cnn is None or not self.coin_digit_cnn.is_loaded():
+            raise RuntimeError("コイン桁 CNN が未学習です。")
+        out_coin_digit = out_dir / "coin_digit.pt"
+        log("coin_digit.pt を書き込み中…")
+        self.coin_digit_cnn.save(out_coin_digit)
+        log(
+            f"コイン桁 CNN 保存: {out_coin_digit} "
+            f"(val={self.coin_digit_val_accuracy:.3f})"
+        )
+        active_marker = self.model_root / "ACTIVE_VERSION"
+        active_marker.write_text(version, encoding="utf-8")
+        log(f"アクティブ版を更新: {active_marker} -> {version}")
+        return out_coin_digit
+
     def save(self, log: Callable[[str], None], version: str = "version_1") -> Path:
         self.summarize_dataset()
         summary = self.summary or self.summarize_dataset()
@@ -187,9 +242,12 @@ class SimpleTrainer:
                 "false_none_go_strong": 0,
                 "false_none_go_weak": 0,
             }
+        elif self._try_load_saved_scene(version, log):
+            pass
         elif torch_available():
             raise RuntimeError(
-                "シーン CNN が未学習です。先に「学習開始」を押し、完了してから「モデル保存」を実行してください。"
+                "シーン CNN が未学習です。先に「学習開始」を押すか、"
+                "「コイン桁 CNN だけ保存」で獲得コイン用モデルのみ保存してください。"
             )
         else:
             per_class = self.scene_model.fit_from_dataset(self.images_root)
