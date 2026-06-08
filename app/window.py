@@ -88,6 +88,7 @@ from app.services.coin_gain_reader import (
     read_coin_gain_crop,
 )
 from app.services.coin_digit_cnn import coin_digit_cnn_available
+from app.services.coin_digit_dataset import count_saved_crops, save_labeled_crop
 from app.services.remaining_time_reader import read_remaining_seconds
 from app.services.file_video import FileVideoSource, is_file_video_available
 
@@ -1655,6 +1656,29 @@ class MainWindow(QMainWindow):
             Qt.TransformationMode.SmoothTransformation,
         )
 
+    def _ask_coin_gain_training_value(
+        self, initial: Optional[int] = None
+    ) -> Optional[int]:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("獲得コインの正解値")
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("coin_gain 切り抜きの正解コイン数を入力してください。"))
+        spin = QSpinBox()
+        spin.setRange(100, 999_999)
+        if initial is not None and plausible_coin_value(initial):
+            spin.setValue(int(initial))
+        layout.addWidget(spin)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        value = int(spin.value())
+        return value if plausible_coin_value(value) else None
+
     def _show_coin_gain_crop_confirm_dialog(
         self, frame_image, coin_value: Optional[int]
     ) -> None:
@@ -1673,16 +1697,37 @@ class MainWindow(QMainWindow):
             dlg.setModal(True)
             layout = QVBoxLayout(dlg)
             crop = self._crop_frame_roi(frame_image, "coin_gain")
+            crop_val: Optional[int] = None
             if crop is not None and not crop.isNull():
-                crop_val, _crop_err, _crop_dbg = read_coin_gain_crop(crop)
-                if crop_val is not None and plausible_coin_value(crop_val):
-                    coin_value = crop_val
-            if coin_value is not None:
-                info = QLabel(f"獲得コイン: {coin_value:,} (coin確定)")
+                read_val, _crop_err, _crop_dbg = read_coin_gain_crop(crop)
+                if read_val is not None and plausible_coin_value(read_val):
+                    crop_val = int(read_val)
+            if crop_val is not None:
+                info = QLabel(f"OCR読取: {crop_val:,} (coin確定)")
             else:
-                info = QLabel("獲得コイン: 読み取れませんでした (coin確定)")
+                info = QLabel("OCR読取: 読み取れませんでした (coin確定)")
             info.setWordWrap(True)
             layout.addWidget(info)
+            value_row = QHBoxLayout()
+            value_row.addWidget(QLabel("正解値（学習用）"))
+            value_spin = QSpinBox()
+            value_spin.setRange(100, 999_999)
+            value_spin.setSingleStep(1)
+            spin_initial = crop_val
+            if spin_initial is None and coin_value is not None and plausible_coin_value(coin_value):
+                spin_initial = int(coin_value)
+            if spin_initial is not None:
+                value_spin.setValue(spin_initial)
+            value_row.addWidget(value_spin, 1)
+            layout.addLayout(value_row)
+            train_n, val_n = count_saved_crops(self.project_root / "app/assets/images")
+            save_hint = QLabel(
+                f"学習用 crop 保存先: app/assets/images/coin_digits/ "
+                f"(現在 train={train_n} val={val_n})"
+            )
+            save_hint.setWordWrap(True)
+            save_hint.setStyleSheet("color: #444;")
+            layout.addWidget(save_hint)
             crop_title = QLabel("coin_gain 切り抜き（OCR範囲）")
             crop_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(crop_title)
@@ -1690,15 +1735,58 @@ class MainWindow(QMainWindow):
             crop_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
             crop_img.setPixmap(self._coin_gain_crop_preview_pixmap(frame_image))
             layout.addWidget(crop_img)
+
+            def _save_coin_digit_training_sample() -> None:
+                if crop is None or crop.isNull():
+                    return
+                label = int(value_spin.value())
+                frame_index = 0
+                if hasattr(self, "player") and _is_alive_qobject(self.player):
+                    frame_index = int(
+                        (max(self._playback_position_ms(), 0) / 1000.0)
+                        * float(self.estimated_fps or 30.0)
+                    )
+                ok, msg = save_labeled_crop(
+                    crop,
+                    label,
+                    assets_root=self.project_root / "app/assets/images",
+                    frame_index=frame_index,
+                )
+                self._train_log(
+                    f"コイン桁学習用保存: {msg}" if ok else f"コイン桁学習用保存失敗: {msg}"
+                )
+                if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                    suffix = " → 学習タブで「コイン桁 CNN だけ保存」"
+                    self.log_view.append(
+                        (f"コイン桁学習用保存: {msg}{suffix}" if ok else f"保存失敗: {msg}")
+                    )
+                if ok and plausible_coin_value(label):
+                    nonlocal coin_value
+                    coin_value = label
+                    ocr_part = f"OCR読取: {crop_val:,} → " if crop_val is not None else ""
+                    info.setText(
+                        f"{ocr_part}正解値 {coin_value:,} を学習用に保存しました"
+                    )
+                    tn, vn = count_saved_crops(self.project_root / "app/assets/images")
+                    save_hint.setText(
+                        f"学習用 crop 保存先: app/assets/images/coin_digits/ "
+                        f"(現在 train={tn} val={vn})"
+                    )
+
+            save_train_btn = QPushButton("学習用に保存")
+            save_train_btn.clicked.connect(_save_coin_digit_training_sample)
             ok_btn = QPushButton("OK")
             ok_btn.setDefault(True)
             ok_btn.clicked.connect(dlg.accept)
             row = QHBoxLayout()
+            row.addWidget(save_train_btn)
             row.addStretch(1)
             row.addWidget(ok_btn)
-            row.addStretch(1)
             layout.addLayout(row)
             dlg.exec()
+            if crop is not None and not crop.isNull() and plausible_coin_value(value_spin.value()):
+                self._coin_gain_best = int(value_spin.value())
+                self._refresh_coin_gain_label()
         finally:
             if was_playing and self.analysis_running:
                 if was_cv:
@@ -3134,7 +3222,8 @@ class MainWindow(QMainWindow):
             skill_train_hint = QLabel(
                 "画像: app/assets/images/skills/<dir>/activation/\n"
                 "「モデル保存」でシーン・コイン桁・使用ツム・スキルをまとめて保存します。"
-                "獲得コイン DL だけなら「コイン桁 CNN だけ保存」（学習開始不要）。"
+                "コイン桁は獲得コイン確定ダイアログの「学習用に保存」で crop を貯めてから"
+                "「コイン桁 CNN だけ保存」（学習開始不要）。"
             )
             skill_train_hint.setWordWrap(True)
             skill_train_hint.setStyleSheet("color: #444;")
@@ -4928,6 +5017,24 @@ class MainWindow(QMainWindow):
             roi = image.copy(x, y, w, h)
             if roi.isNull():
                 self._train_log(f"保存スキップ: {key} 切り抜き画像が空です。")
+                continue
+
+            if key == "coin_gain":
+                label = self._ask_coin_gain_training_value()
+                if label is None:
+                    self._train_log("保存スキップ: coin_gain の正解値が未入力です。")
+                    continue
+                ok, msg = save_labeled_crop(
+                    roi,
+                    label,
+                    assets_root=self.project_root / "app/assets/images",
+                    frame_index=frame_index,
+                )
+                if ok:
+                    saved += 1
+                    self._train_log(f"コイン桁学習用保存: {msg}")
+                else:
+                    self._train_log(f"コイン桁学習用保存失敗: {msg}")
                 continue
 
             split = self._choose_train_val_split(key)

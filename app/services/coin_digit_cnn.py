@@ -262,45 +262,63 @@ def build_digit_training_samples(
     *,
     per_digit: int = 320,
     seed: int = 42,
+    log: Optional[Callable[[str], None]] = None,
 ) -> Tuple[List[Tuple[np.ndarray, int]], List[Tuple[np.ndarray, int]]]:
+    from app.services.coin_digit_dataset import (
+        build_saved_crop_training_samples,
+        count_saved_crops,
+        iter_saved_labeled_crops,
+    )
+
+    def _log(msg: str) -> None:
+        if log:
+            log(msg)
+
     rng = random.Random(seed)
+    saved_train, saved_val = build_saved_crop_training_samples()
+    train_n, val_n = count_saved_crops()
+    usable = sum(1 for _ in iter_saved_labeled_crops())
+    _log(
+        f"コイン桁 保存 crop: train={train_n} val={val_n}枚 "
+        f"(桁パッチ化 {len(saved_train) + len(saved_val)} 件)"
+    )
+    if usable == 0:
+        _log(
+            "コイン桁: UI 保存データなし。"
+            " 獲得コイン確定ダイアログまたは動画ツールで切り抜きを保存してください。"
+        )
+
+    train: List[Tuple[np.ndarray, int]] = list(saved_train)
+    val: List[Tuple[np.ndarray, int]] = list(saved_val)
+
     ref_path = _assets_root() / "images" / "coin_hud_ref_5395.png"
     ref_patches = _extract_ref_digit_patches(ref_path) if ref_path.exists() else {}
-    ref3065_path = _assets_root() / "images" / "coin_hud_ref_3065.png"
-    if not ref3065_path.exists():
-        ref3065_path = Path(__file__).resolve().parents[2] / "_dlg_crop_extract.png"
-    if ref3065_path.exists():
-        extra = _extract_labeled_ref_digit_patches(ref3065_path, (3, 0, 6, 5))
-        for digit, patches in extra.items():
-            ref_patches.setdefault(digit, []).extend(patches)
     wide_patches = (
-        _extract_wide_crop_digit_patches(ref_path, rng, n_variants=100)
-        if ref_path.exists()
+        _extract_wide_crop_digit_patches(ref_path, rng, n_variants=40)
+        if ref_path.exists() and usable < 3
         else {}
     )
 
-    train: List[Tuple[np.ndarray, int]] = []
-    val: List[Tuple[np.ndarray, int]] = []
+    synth_train = max(40, per_digit // 3) if usable >= 3 else per_digit
+    synth_val = max(12, per_digit // 10) if usable >= 3 else max(20, per_digit // 5)
     for digit in range(10):
         refs = ref_patches.get(digit, []) + wide_patches.get(digit, [])
-        n_train = int(per_digit * 0.85)
-        n_val = per_digit - n_train
-        for i in range(n_train):
-            if refs and i % 4 == 0:
-                patch = _lowres_augmented_patch(refs[i % len(refs)], rng)
-            elif refs and i % 3 != 2:
+        have_train = sum(1 for _, d in train if d == digit)
+        have_val = sum(1 for _, d in val if d == digit)
+        for i in range(max(0, synth_train - have_train)):
+            if refs and i % 3 != 2:
                 base = refs[i % len(refs)]
-                patch = _augment_patch(base, rng)
+                patch = (
+                    _lowres_augmented_patch(base, rng)
+                    if i % 4 == 0
+                    else _augment_patch(base, rng)
+                )
             else:
                 patch = _synthetic_digit_patch(digit, rng, hud_style=(i % 2 == 0))
             train.append((patch, digit))
-        for i in range(n_val):
+        for i in range(max(0, synth_val - have_val)):
             if refs and i % 2 == 0:
-                patch = (
-                    _lowres_augmented_patch(refs[i % len(refs)], rng)
-                    if i % 3 == 0
-                    else _augment_patch(refs[i % len(refs)], rng)
-                )
+                patch = _augment_patch(refs[i % len(refs)], rng)
             else:
                 patch = _synthetic_digit_patch(digit, rng, hud_style=True)
             val.append((patch, digit))

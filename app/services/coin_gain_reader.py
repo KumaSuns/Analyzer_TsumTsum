@@ -1611,75 +1611,6 @@ def _hud_split_four_digit_variants(row: np.ndarray) -> List[tuple[List[np.ndarra
     return variants
 
 
-def _hud_maybe_fix_seven_nine_confusion(
-    parts: List[np.ndarray],
-    part_errs: List[List[float]],
-    value: int,
-    total_err: float,
-) -> tuple[int, float]:
-    """3 桁目の 7/9 取り違え（5375→5395 等）。"""
-    if (value // 10) % 10 != 7:
-        return value, total_err
-    alt = value + 20
-    if not plausible_coin_value(alt) or _suspicious_coin_value(alt):
-        return value, total_err
-    e7 = part_errs[2][7]
-    e9 = part_errs[2][9]
-    if e9 - e7 >= 0.24:
-        return value, total_err
-    alt_err = total_err - e7 + e9
-    if alt_err <= total_err + 0.32:
-        return alt, alt_err
-    return value, total_err
-
-
-def _hud_maybe_fix_ref_confusable_digits(
-    parts: List[np.ndarray],
-    part_errs: List[List[float]],
-    value: int,
-    total_err: float,
-) -> tuple[int, float]:
-    """実機 HUD で起きやすい 3/4・5/4 の僅差誤読を参照誤差で補正。"""
-    digits = [int(ch) for ch in str(value)]
-    if len(digits) != 4:
-        return value, total_err
-    swaps = (
-        (0, 1, 5),
-        (0, 4, 5),
-        (0, 3, 5),
-        (1, 4, 3),
-        (1, 1, 3),
-        (1, 3, 0),
-        (1, 5, 0),
-        (1, 5, 6),
-        (1, 2, 0),
-        (2, 3, 9),
-        (2, 5, 6),
-        (2, 5, 9),
-        (2, 8, 9),
-        (2, 9, 6),
-        (0, 3, 5),
-        (3, 3, 5),
-        (3, 4, 5),
-        (3, 9, 5),
-    )
-    for pos, wrong, right in swaps:
-        if digits[pos] != wrong:
-            continue
-        margin = 0.08 if wrong in (3, 5) and right in (0, 5, 6) else 0.12
-        if part_errs[pos][right] >= part_errs[pos][wrong] + margin:
-            continue
-        alt = digits[:]
-        alt[pos] = right
-        alt_val = ((alt[0] * 10 + alt[1]) * 10 + alt[2]) * 10 + alt[3]
-        if not plausible_coin_value(alt_val) or _suspicious_coin_value(alt_val):
-            continue
-        total_err = total_err - part_errs[pos][wrong] + part_errs[pos][right]
-        digits = alt
-    value = ((digits[0] * 10 + digits[1]) * 10 + digits[2]) * 10 + digits[3]
-    return value, total_err
-
-
 def _decode_hud_four_parts(
     parts: List[np.ndarray], tag: str
 ) -> Optional[Tuple[int, float, str]]:
@@ -1709,12 +1640,6 @@ def _decode_hud_four_parts(
                     best_val = value
     if best_val is None:
         return None
-    best_val, best_err = _hud_maybe_fix_seven_nine_confusion(
-        parts, part_errs, best_val, best_err
-    )
-    best_val, best_err = _hud_maybe_fix_ref_confusable_digits(
-        parts, part_errs, best_val, best_err
-    )
     mean_err = best_err / 4.0
     if mean_err > 1.15:
         return None
@@ -1748,7 +1673,7 @@ def _hud_digit_row_gray(gray: np.ndarray) -> Optional[np.ndarray]:
 def _decode_hud_four_parts_cnn(
     parts: List[np.ndarray], tag: str
 ) -> Optional[Tuple[int, float, str]]:
-    """CNN 4 桁復元（全組合せ + 僅差補正）。"""
+    """CNN 4 桁復元（全組合せ、ルール補正なし）。"""
     decoded = _decode_hud_four_parts(parts, tag)
     if decoded is None:
         return None

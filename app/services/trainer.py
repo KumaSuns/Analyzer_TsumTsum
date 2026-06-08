@@ -138,7 +138,7 @@ class SimpleTrainer:
         log("学習を停止しました。")
 
     def train_coin_digit_cnn(self, log: Callable[[str], None]) -> bool:
-        """コイン桁 CNN（参照画像＋合成データ）を学習。"""
+        """コイン桁 CNN（UI 保存 crop 優先、不足分は合成で補完）を学習。"""
         if not torch_available():
             log("コイン桁 CNN: PyTorch 未導入のためスキップします。")
             return False
@@ -149,7 +149,7 @@ class SimpleTrainer:
 
         log("コイン桁 CNN を学習します…")
         try:
-            train_samples, val_samples = build_digit_training_samples()
+            train_samples, val_samples = build_digit_training_samples(log=log)
             clf = CoinDigitCnnClassifier()
             acc = clf.train_from_samples(train_samples, val_samples, log=log)
             self.coin_digit_cnn = clf
