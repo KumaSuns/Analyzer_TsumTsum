@@ -285,7 +285,7 @@ def build_digit_training_samples(
     if usable == 0:
         _log(
             "コイン桁: UI 保存データなし。"
-            " 獲得コイン確定ダイアログまたは動画ツールで切り抜きを保存してください。"
+            " 獲得コイン確定ダイアログまたは動画ツール3で切り抜きを保存してください。"
         )
 
     train: List[Tuple[np.ndarray, int]] = list(saved_train)

@@ -12,7 +12,7 @@ from PySide6.QtGui import QImage
 
 from app.services.image_save import save_training_png
 
-_LABEL_RE = re.compile(r"^coin_gain_(\d{3,6})_")
+_LABEL_RE = re.compile(r"^coin_gain_(\d{3,7})_")
 
 
 def coin_digits_root(assets_root: Path | None = None) -> Path:
@@ -36,7 +36,7 @@ def parse_crop_label(path: Path) -> int | None:
         value = int(match.group(1))
     except ValueError:
         return None
-    if value < 100 or value > 999_999:
+    if value < 100 or value > 9_999_999:
         return None
     return value
 
@@ -81,8 +81,8 @@ def save_labeled_crop(
     """coin_gain 切り抜きを train/val に保存。ファイル名に正解値を埋め込む。"""
     if image is None or image.isNull():
         return False, "画像がありません"
-    if value < 100 or value > 999_999:
-        return False, "獲得コインは 100〜999999 の範囲で指定してください"
+    if value < 100 or value > 9_999_999:
+        return False, "獲得コインは 100〜9999999 の範囲で指定してください"
     root = coin_digits_root(assets_root)
     split = choose_train_val_split(root)
     out_dir = root / split
@@ -97,18 +97,17 @@ def save_labeled_crop(
 def extract_digit_patches_from_crop(
     crop_path: Path, value: int
 ) -> List[Tuple[np.ndarray, int]] | None:
-    """保存済み crop から 4 桁パッチを切り出す。"""
+    """保存済み crop から N 桁パッチを切り出す（4〜7 桁）。"""
     from app.services.coin_digit_cnn import _normalize_digit_patch
     from app.services.coin_gain_reader import (
         _hud_digit_row_gray,
-        _hud_split_four_digit_variants,
+        _hud_split_n_digit_variants,
         _patch_digit_errors,
     )
 
     digits = [int(ch) for ch in str(value)]
-    if len(digits) not in (4, 5, 6):
-        return None
-    if len(digits) != 4:
+    n = len(digits)
+    if n < 4 or n > 7:
         return None
     gray = cv2.imread(str(crop_path), cv2.IMREAD_GRAYSCALE)
     if gray is None:
@@ -118,15 +117,15 @@ def extract_digit_patches_from_crop(
         return None
     best_parts = None
     best_score = 1e9
-    for parts, _tag in _hud_split_four_digit_variants(row):
-        if len(parts) != 4:
+    for parts, _tag in _hud_split_n_digit_variants(row, n):
+        if len(parts) != n:
             continue
         part_errs = [_patch_digit_errors(p) for p in parts]
-        score = sum(part_errs[i][digits[i]] for i in range(4))
+        score = sum(part_errs[i][digits[i]] for i in range(n))
         if score < best_score:
             best_score = score
             best_parts = parts
-    if best_parts is None or best_score > 2.5:
+    if best_parts is None or best_score > max(2.5, 0.45 * n + 1.0):
         return None
     out: List[Tuple[np.ndarray, int]] = []
     for digit, part in zip(digits, best_parts):

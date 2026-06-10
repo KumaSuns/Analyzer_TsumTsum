@@ -838,7 +838,7 @@ class MainWindow(QMainWindow):
         self._render_feature_ui(feature_id)
 
     def _on_video_tool_quick_mode_clicked(self, mode_id: int) -> None:
-        """動画ツール: 1=右列・トリミング、2=右列・シーン保存、3〜6=右列を空に。"""
+        """動画ツール: 1=トリミング、2=シーン保存、3=獲得コイン学習、4〜6=未割当。"""
         if self.button_group.checkedId() != 2:
             return
         stack = getattr(self, "_video_tool_right_stack", None)
@@ -855,9 +855,197 @@ class MainWindow(QMainWindow):
             stack.setCurrentIndex(1)
             stack.setVisible(True)
             self._hide_trim_overlay_on_video()
+        elif mode_id == 3:
+            stack.setCurrentIndex(2)
+            stack.setVisible(True)
+            self._hide_trim_overlay_on_video()
+            self._refresh_video_tool_coin_digit_preview(reset_read=True)
         else:
             stack.setVisible(False)
             self._hide_trim_overlay_on_video()
+
+    def _is_video_tool_coin_digit_mode(self) -> bool:
+        if self.button_group.checkedId() != 2:
+            return False
+        group = getattr(self, "_video_tool_mode_group", None)
+        if group is None or not _is_alive_qobject(group):
+            return False
+        return group.checkedId() == 3
+
+    def _video_tool_coin_digit_frame_image(self) -> Optional[QImage]:
+        if self._is_video_tool_coin_digit_mode() and self._is_player_paused():
+            ms = self._playback_position_ms()
+            img = self._read_frame_at_ms(ms)
+            if img is not None and not img.isNull():
+                self.current_video_frame_image = img
+                return img
+        image = self.current_video_frame_image
+        if image is not None and not image.isNull():
+            return image
+        return None
+
+    def _refresh_video_tool_coin_digit_preview(self, *, reset_read: bool = False) -> None:
+        """切り抜きプレビューと保存枚数のみ更新（CNN 読取は行わない）。"""
+        preview = getattr(self, "_video_tool_coin_preview_label", None)
+        read_label = getattr(self, "_video_tool_coin_read_label", None)
+        count_label = getattr(self, "_video_tool_coin_count_label", None)
+        if preview is None or not _is_alive_qobject(preview):
+            return
+
+        assets = self.project_root / "app/assets/images"
+        train_n, val_n = count_saved_crops(assets)
+        if count_label is not None and _is_alive_qobject(count_label):
+            count_label.setText(f"保存済み: train={train_n} val={val_n}")
+
+        if reset_read and read_label is not None and _is_alive_qobject(read_label):
+            read_label.setText("読取: 未実行")
+
+        frame_image = self._video_tool_coin_digit_frame_image()
+        if frame_image is None:
+            preview.setText("フレームなし")
+            preview.setPixmap(QPixmap())
+            if reset_read and read_label is not None and _is_alive_qobject(read_label):
+                read_label.setText("読取: 動画を止めてフレームを表示してください")
+            return
+
+        positions = self._load_crop_positions()
+        if not self._crop_rect_defined(positions, "coin_gain"):
+            preview.setText("coin_gain 範囲未設定")
+            preview.setPixmap(QPixmap())
+            if reset_read and read_label is not None and _is_alive_qobject(read_label):
+                read_label.setText("読取: 動画ツール1で獲得コイン範囲を保存してください")
+            return
+
+        crop = self._crop_frame_roi(frame_image, "coin_gain")
+        if crop is None or crop.isNull():
+            preview.setText("切り抜き失敗")
+            preview.setPixmap(QPixmap())
+            if reset_read and read_label is not None and _is_alive_qobject(read_label):
+                read_label.setText("読取: 切り抜きできませんでした")
+            return
+
+        pix = QPixmap.fromImage(crop)
+        if pix.isNull():
+            preview.setText("プレビューなし")
+            preview.setPixmap(QPixmap())
+        else:
+            preview.setText("")
+            preview.setPixmap(
+                pix.scaled(
+                    preview.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
+    def _on_video_tool_coin_digit_read_clicked(self) -> None:
+        """動画ツール3: 現在フレームの coin_gain を CNN で読取。"""
+        status = getattr(self, "_video_tool_coin_status", None)
+        read_label = getattr(self, "_video_tool_coin_read_label", None)
+        value_spin = getattr(self, "_video_tool_coin_value_spin", None)
+        if self.button_group.checkedId() != 2:
+            return
+        if not self._is_player_paused():
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("一時停止してから読取してください。")
+            return
+
+        frame_image = self._video_tool_coin_digit_frame_image()
+        if frame_image is None:
+            if read_label is not None and _is_alive_qobject(read_label):
+                read_label.setText("読取: フレームがありません")
+            return
+
+        crop = self._crop_frame_roi(frame_image, "coin_gain")
+        if crop is None or crop.isNull():
+            if read_label is not None and _is_alive_qobject(read_label):
+                read_label.setText("読取: coin_gain 範囲未設定か切り抜き失敗")
+            return
+
+        if not opencv_available():
+            if read_label is not None and _is_alive_qobject(read_label):
+                read_label.setText("読取: opencv 未導入")
+            return
+        if not coin_digit_cnn_available():
+            if read_label is not None and _is_alive_qobject(read_label):
+                read_label.setText("読取: coin_digit 未学習（学習タブでモデル保存）")
+            return
+
+        crop_val, _err, dbg = read_coin_gain_crop(crop)
+        if crop_val is not None and plausible_coin_value(crop_val):
+            if read_label is not None and _is_alive_qobject(read_label):
+                read_label.setText(f"読取: {int(crop_val):,}")
+            if value_spin is not None and _is_alive_qobject(value_spin):
+                value_spin.blockSignals(True)
+                value_spin.setValue(int(crop_val))
+                value_spin.blockSignals(False)
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #555;")
+                status.setText("読取完了。見た目と照合してください。")
+        else:
+            if read_label is not None and _is_alive_qobject(read_label):
+                read_label.setText(f"読取: 読み取れませんでした ({dbg})")
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("読取失敗。正解値を手入力して保存できます。")
+
+    def _on_video_tool_coin_digit_save_clicked(self) -> None:
+        """動画ツール3: 獲得コイン切り抜きを正解ラベル付きで学習用保存。"""
+        status = getattr(self, "_video_tool_coin_status", None)
+        value_spin = getattr(self, "_video_tool_coin_value_spin", None)
+        if self.button_group.checkedId() != 2 or value_spin is None or not _is_alive_qobject(value_spin):
+            return
+        if not self._is_player_paused():
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("一時停止してから保存してください。")
+            return
+
+        frame_image = self._video_tool_coin_digit_frame_image()
+        if frame_image is None:
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("フレームがありません。動画を止めてから保存してください。")
+            return
+
+        crop = self._crop_frame_roi(frame_image, "coin_gain")
+        if crop is None or crop.isNull():
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("coin_gain 範囲が未設定か切り抜きに失敗しました。")
+            return
+
+        label = int(value_spin.value())
+        if not plausible_coin_value(label):
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("正解値は 100〜999999 の範囲で入力してください。")
+            return
+
+        frame_index = int(
+            (max(self._playback_position_ms(), 0) / 1000.0) * float(self.estimated_fps or 30.0)
+        )
+        ok, msg = save_labeled_crop(
+            crop,
+            label,
+            assets_root=self.project_root / "app/assets/images",
+            frame_index=frame_index,
+        )
+        if status is not None and _is_alive_qobject(status):
+            if ok:
+                status.setStyleSheet("color: #2E7D32;")
+                status.setText(f"保存しました → {msg}")
+            else:
+                status.setStyleSheet("color: #C62828;")
+                status.setText(f"保存失敗: {msg}")
+        if ok:
+            self._train_log(f"コイン桁学習用保存: {msg}")
+            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                self.log_view.append(f"コイン桁学習用保存: {msg}")
+        else:
+            self._train_log(f"コイン桁学習用保存失敗: {msg}")
+        self._refresh_video_tool_coin_digit_preview()
 
     def _on_video_tool_scene_save_clicked(self) -> None:
         """右列・画像保存: 停止中フレームを PNG で書き出す（train/val は自動）。"""
@@ -1664,7 +1852,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dlg)
         layout.addWidget(QLabel("coin_gain 切り抜きの正解コイン数を入力してください。"))
         spin = QSpinBox()
-        spin.setRange(100, 999_999)
+        spin.setRange(100, 9_999_999)
         if initial is not None and plausible_coin_value(initial):
             spin.setValue(int(initial))
         layout.addWidget(spin)
@@ -1703,15 +1891,15 @@ class MainWindow(QMainWindow):
                 if read_val is not None and plausible_coin_value(read_val):
                     crop_val = int(read_val)
             if crop_val is not None:
-                info = QLabel(f"OCR読取: {crop_val:,} (coin確定)")
+                info = QLabel(f"読取: {crop_val:,} (coin確定)")
             else:
-                info = QLabel("OCR読取: 読み取れませんでした (coin確定)")
+                info = QLabel("読取: 読み取れませんでした (coin確定)")
             info.setWordWrap(True)
             layout.addWidget(info)
             value_row = QHBoxLayout()
             value_row.addWidget(QLabel("正解値（学習用）"))
             value_spin = QSpinBox()
-            value_spin.setRange(100, 999_999)
+            value_spin.setRange(100, 9_999_999)
             value_spin.setSingleStep(1)
             spin_initial = crop_val
             if spin_initial is None and coin_value is not None and plausible_coin_value(coin_value):
@@ -1728,7 +1916,7 @@ class MainWindow(QMainWindow):
             save_hint.setWordWrap(True)
             save_hint.setStyleSheet("color: #444;")
             layout.addWidget(save_hint)
-            crop_title = QLabel("coin_gain 切り抜き（OCR範囲）")
+            crop_title = QLabel("coin_gain 切り抜き（読取範囲）")
             crop_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(crop_title)
             crop_img = QLabel()
@@ -1763,9 +1951,9 @@ class MainWindow(QMainWindow):
                 if ok and plausible_coin_value(label):
                     nonlocal coin_value
                     coin_value = label
-                    ocr_part = f"OCR読取: {crop_val:,} → " if crop_val is not None else ""
+                    read_part = f"読取: {crop_val:,} → " if crop_val is not None else ""
                     info.setText(
-                        f"{ocr_part}正解値 {coin_value:,} を学習用に保存しました"
+                        f"{read_part}正解値 {coin_value:,} を学習用に保存しました"
                     )
                     tn, vn = count_saved_crops(self.project_root / "app/assets/images")
                     save_hint.setText(
@@ -2747,9 +2935,76 @@ class MainWindow(QMainWindow):
                 sv.addWidget(self._video_tool_scene_status)
                 sv.addStretch(1)
 
+                coin_page = QWidget()
+                cv = QVBoxLayout(coin_page)
+                cv.setContentsMargins(0, 0, 0, 0)
+                cv.setSpacing(8)
+                coin_title = QLabel("獲得コイン学習")
+                coin_title.setStyleSheet("font-weight: bold; font-size: 14px;")
+                cv.addWidget(coin_title)
+                coin_hint = QLabel(
+                    "スライダー・コマ送りで coin 画面へ移動し、「読取」で CNN 結果を確認します。\n"
+                    "間違いのときだけ正解値を直して「学習用に保存」。"
+                    "保存先: app/assets/images/coin_digits/\n"
+                    "十分貯まったら学習タブの「コイン桁 CNN だけ保存」。"
+                )
+                coin_hint.setWordWrap(True)
+                coin_hint.setStyleSheet("color: #444;")
+                cv.addWidget(coin_hint)
+
+                self._video_tool_coin_read_label = QLabel("読取: 未実行")
+                self._video_tool_coin_read_label.setWordWrap(True)
+                cv.addWidget(self._video_tool_coin_read_label)
+
+                self._video_tool_coin_read_btn = QPushButton("読取")
+                self._video_tool_coin_read_btn.setToolTip(
+                    "現在フレームの coin_gain を CNN で読取（手動実行）"
+                )
+                self._video_tool_coin_read_btn.clicked.connect(self._on_video_tool_coin_digit_read_clicked)
+                cv.addWidget(self._video_tool_coin_read_btn)
+
+                value_row = QFrame()
+                value_row_layout = QHBoxLayout(value_row)
+                value_row_layout.setContentsMargins(0, 0, 0, 0)
+                value_row_layout.setSpacing(8)
+                value_row_layout.addWidget(QLabel("正解値"))
+                self._video_tool_coin_value_spin = QSpinBox()
+                self._video_tool_coin_value_spin.setRange(100, 9_999_999)
+                self._video_tool_coin_value_spin.setMinimumWidth(120)
+                value_row_layout.addWidget(self._video_tool_coin_value_spin, 1)
+                cv.addWidget(value_row)
+
+                self._video_tool_coin_save_btn = QPushButton("学習用に保存")
+                self._video_tool_coin_save_btn.setToolTip(
+                    "coin_gain 切り抜きを正解ラベル付きで coin_digits/train|val へ保存"
+                )
+                self._video_tool_coin_save_btn.clicked.connect(self._on_video_tool_coin_digit_save_clicked)
+                cv.addWidget(self._video_tool_coin_save_btn)
+
+                self._video_tool_coin_count_label = QLabel("保存済み: train=0 val=0")
+                self._video_tool_coin_count_label.setStyleSheet("color: #555;")
+                cv.addWidget(self._video_tool_coin_count_label)
+
+                self._video_tool_coin_preview_label = QLabel("プレビューなし")
+                self._video_tool_coin_preview_label.setFixedSize(300, 120)
+                self._video_tool_coin_preview_label.setStyleSheet(
+                    "border:1px solid #888; background:#111; color:#DDD;"
+                )
+                self._video_tool_coin_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cv.addWidget(self._video_tool_coin_preview_label)
+
+                self._video_tool_coin_status = QLabel(
+                    "左の「3」で表示。coin_gain 範囲は動画ツール1で設定済みであること。"
+                )
+                self._video_tool_coin_status.setWordWrap(True)
+                self._video_tool_coin_status.setStyleSheet("color: #555;")
+                cv.addWidget(self._video_tool_coin_status)
+                cv.addStretch(1)
+
                 self._video_tool_right_stack = QStackedWidget()
                 self._video_tool_right_stack.addWidget(trim_page)
                 self._video_tool_right_stack.addWidget(scene_page)
+                self._video_tool_right_stack.addWidget(coin_page)
                 self.right_layout.addWidget(self._video_tool_right_stack)
                 self._on_crop_target_selection_changed()
             elif feature_id not in (3,):
@@ -2784,6 +3039,8 @@ class MainWindow(QMainWindow):
                     btn.setToolTip("右列: トリミング・位置保存など")
                 elif i == 1:
                     btn.setToolTip("右列: シーン画像・スキル発動画像の保存")
+                elif i == 2:
+                    btn.setToolTip("右列: 獲得コイン学習（読取確認・学習用保存）")
                 else:
                     btn.setToolTip("右列を空にする（未割当）")
                 btn_row_layout.addWidget(btn)
@@ -3495,6 +3752,8 @@ class MainWindow(QMainWindow):
         if img is not None and not img.isNull():
             self._cv_push_frame(img)
         self._update_playback_indicators(self._cv_position_ms)
+        if self._is_video_tool_coin_digit_mode():
+            self._refresh_video_tool_coin_digit_preview(reset_read=True)
 
     def _cv_timer_tick(self) -> None:
         if not getattr(self, "use_opencv_for_video", False) or not self._cv_playing:
@@ -3622,6 +3881,8 @@ class MainWindow(QMainWindow):
 
     def _on_player_position_changed(self, position_ms: int) -> None:
         self._update_playback_indicators(position_ms)
+        if self._is_video_tool_coin_digit_mode() and self._is_player_paused():
+            self._refresh_video_tool_coin_digit_preview(reset_read=True)
         if hasattr(self, "counter_progress_label") and _is_alive_qobject(self.counter_progress_label):
             if self.analysis_running:
                 if position_ms - self._analysis_progress_ui_last_ms < 500:
@@ -3707,6 +3968,8 @@ class MainWindow(QMainWindow):
             self._cv_seek_and_show(target)
         else:
             self.player.setPosition(target)
+            if self._is_video_tool_coin_digit_mode():
+                QTimer.singleShot(0, lambda: self._refresh_video_tool_coin_digit_preview(reset_read=True))
 
     def _step_backward(self, frames: int) -> None:
         if not self._is_player_paused():
@@ -3717,6 +3980,8 @@ class MainWindow(QMainWindow):
             self._cv_seek_and_show(target)
         else:
             self.player.setPosition(target)
+            if self._is_video_tool_coin_digit_mode():
+                QTimer.singleShot(0, lambda: self._refresh_video_tool_coin_digit_preview(reset_read=True))
 
     def _read_frame_at_ms(self, ms: int) -> Optional[QImage]:
         if getattr(self, "use_opencv_for_video", False):
@@ -5020,21 +5285,9 @@ class MainWindow(QMainWindow):
                 continue
 
             if key == "coin_gain":
-                label = self._ask_coin_gain_training_value()
-                if label is None:
-                    self._train_log("保存スキップ: coin_gain の正解値が未入力です。")
-                    continue
-                ok, msg = save_labeled_crop(
-                    roi,
-                    label,
-                    assets_root=self.project_root / "app/assets/images",
-                    frame_index=frame_index,
+                self._train_log(
+                    "保存スキップ: 獲得コインは動画ツール3（獲得コイン学習）を使ってください。"
                 )
-                if ok:
-                    saved += 1
-                    self._train_log(f"コイン桁学習用保存: {msg}")
-                else:
-                    self._train_log(f"コイン桁学習用保存失敗: {msg}")
                 continue
 
             split = self._choose_train_val_split(key)
