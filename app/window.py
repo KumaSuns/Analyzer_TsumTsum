@@ -1020,7 +1020,7 @@ class MainWindow(QMainWindow):
         if not plausible_coin_value(label):
             if status is not None and _is_alive_qobject(status):
                 status.setStyleSheet("color: #C62828;")
-                status.setText("正解値は 100〜999999 の範囲で入力してください。")
+                status.setText("正解値は 1〜9999999（1〜7桁）の範囲で入力してください。")
             return
 
         frame_index = int(
@@ -1852,7 +1852,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dlg)
         layout.addWidget(QLabel("coin_gain 切り抜きの正解コイン数を入力してください。"))
         spin = QSpinBox()
-        spin.setRange(100, 9_999_999)
+        spin.setRange(1, 9_999_999)
         if initial is not None and plausible_coin_value(initial):
             spin.setValue(int(initial))
         layout.addWidget(spin)
@@ -1899,7 +1899,7 @@ class MainWindow(QMainWindow):
             value_row = QHBoxLayout()
             value_row.addWidget(QLabel("正解値（学習用）"))
             value_spin = QSpinBox()
-            value_spin.setRange(100, 9_999_999)
+            value_spin.setRange(1, 9_999_999)
             value_spin.setSingleStep(1)
             spin_initial = crop_val
             if spin_initial is None and coin_value is not None and plausible_coin_value(coin_value):
@@ -2969,7 +2969,7 @@ class MainWindow(QMainWindow):
                 value_row_layout.setSpacing(8)
                 value_row_layout.addWidget(QLabel("正解値"))
                 self._video_tool_coin_value_spin = QSpinBox()
-                self._video_tool_coin_value_spin.setRange(100, 9_999_999)
+                self._video_tool_coin_value_spin.setRange(1, 9_999_999)
                 self._video_tool_coin_value_spin.setMinimumWidth(120)
                 value_row_layout.addWidget(self._video_tool_coin_value_spin, 1)
                 cv.addWidget(value_row)

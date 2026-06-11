@@ -105,8 +105,6 @@ if _TORCH_OK:
 
 def _augment_patch(patch: np.ndarray, rng: random.Random) -> np.ndarray:
     out = _normalize_digit_patch(patch)
-    if rng.random() < 0.5:
-        out = cv2.flip(out, 1)
     if rng.random() < 0.7:
         scale = rng.uniform(0.85, 1.15)
         nh = max(8, int(DIGIT_H * scale))
@@ -262,6 +260,7 @@ def build_digit_training_samples(
     *,
     per_digit: int = 320,
     seed: int = 42,
+    assets_root: Optional[Path] = None,
     log: Optional[Callable[[str], None]] = None,
 ) -> Tuple[List[Tuple[np.ndarray, int]], List[Tuple[np.ndarray, int]]]:
     from app.services.coin_digit_dataset import (
@@ -275,12 +274,13 @@ def build_digit_training_samples(
             log(msg)
 
     rng = random.Random(seed)
-    saved_train, saved_val = build_saved_crop_training_samples()
-    train_n, val_n = count_saved_crops()
-    usable = sum(1 for _ in iter_saved_labeled_crops())
+    saved_train, saved_val = build_saved_crop_training_samples(assets_root, log=_log)
+    train_n, val_n = count_saved_crops(assets_root)
+    usable = sum(1 for _ in iter_saved_labeled_crops(assets_root))
+    raw_patch_n = len(saved_train) + len(saved_val)
     _log(
         f"コイン桁 保存 crop: train={train_n} val={val_n}枚 "
-        f"(桁パッチ化 {len(saved_train) + len(saved_val)} 件)"
+        f"(桁パッチ化 {raw_patch_n} 件)"
     )
     if usable == 0:
         _log(
@@ -288,7 +288,10 @@ def build_digit_training_samples(
             " 獲得コイン確定ダイアログまたは動画ツール3で切り抜きを保存してください。"
         )
 
-    train: List[Tuple[np.ndarray, int]] = list(saved_train)
+    train: List[Tuple[np.ndarray, int]] = []
+    for patch, digit in saved_train:
+        train.append((patch, digit))
+        train.append((_augment_patch(patch, rng), digit))
     val: List[Tuple[np.ndarray, int]] = list(saved_val)
 
     ref_path = _assets_root() / "images" / "coin_hud_ref_5395.png"
@@ -299,13 +302,21 @@ def build_digit_training_samples(
         else {}
     )
 
-    synth_train = max(40, per_digit // 3) if usable >= 3 else per_digit
-    synth_val = max(12, per_digit // 10) if usable >= 3 else max(20, per_digit // 5)
+    if usable == 0:
+        target_train_per_digit = per_digit
+        target_val_per_digit = max(20, per_digit // 5)
+    elif usable < 10:
+        target_train_per_digit = max(24, per_digit // 3)
+        target_val_per_digit = max(8, per_digit // 10)
+    else:
+        target_train_per_digit = max(12, per_digit // 16)
+        target_val_per_digit = max(4, per_digit // 24)
+
     for digit in range(10):
         refs = ref_patches.get(digit, []) + wide_patches.get(digit, [])
         have_train = sum(1 for _, d in train if d == digit)
         have_val = sum(1 for _, d in val if d == digit)
-        for i in range(max(0, synth_train - have_train)):
+        for i in range(max(0, target_train_per_digit - have_train)):
             if refs and i % 3 != 2:
                 base = refs[i % len(refs)]
                 patch = (
@@ -316,7 +327,7 @@ def build_digit_training_samples(
             else:
                 patch = _synthetic_digit_patch(digit, rng, hud_style=(i % 2 == 0))
             train.append((patch, digit))
-        for i in range(max(0, synth_val - have_val)):
+        for i in range(max(0, target_val_per_digit - have_val)):
             if refs and i % 2 == 0:
                 patch = _augment_patch(refs[i % len(refs)], rng)
             else:
@@ -324,6 +335,11 @@ def build_digit_training_samples(
             val.append((patch, digit))
     rng.shuffle(train)
     rng.shuffle(val)
+    real_n = raw_patch_n + sum(1 for _ in saved_train)
+    _log(
+        f"コイン桁 学習構成: train={len(train)} val={len(val)} "
+        f"(実機由来≈{real_n / max(1, len(train)):.0%} of train)"
+    )
     return train, val
 
 

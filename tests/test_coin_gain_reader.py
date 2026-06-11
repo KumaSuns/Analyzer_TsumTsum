@@ -93,11 +93,14 @@ def test_bonus_coin_hud_rect_prefers_coin_bonus() -> None:
     assert rect == tuple(custom)
 
 
-def test_plausible_rejects_short_reads() -> None:
-    assert not plausible_coin_value(51)
-    assert not plausible_coin_value(99)
+def test_plausible_accepts_one_to_seven_digits() -> None:
+    assert plausible_coin_value(1)
+    assert plausible_coin_value(51)
+    assert plausible_coin_value(859)
     assert plausible_coin_value(5395)
-    assert plausible_coin_value(7205)
+    assert plausible_coin_value(9_999_999)
+    assert not plausible_coin_value(0)
+    assert not plausible_coin_value(10_000_000)
 
 
 def test_consensus_prefers_repeated_value() -> None:

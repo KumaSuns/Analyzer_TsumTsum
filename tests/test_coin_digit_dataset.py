@@ -25,7 +25,8 @@ def _bgr_to_qimage(bgr: np.ndarray) -> QImage:
 
 def test_parse_crop_label() -> None:
     assert parse_crop_label(Path("coin_gain_3065_20260101_123.png")) == 3065
-    assert parse_crop_label(Path("coin_gain_99_x.png")) is None
+    assert parse_crop_label(Path("coin_gain_859_x.png")) == 859
+    assert parse_crop_label(Path("coin_gain_0_x.png")) is None
 
 
 def test_save_and_build_training_samples(tmp_path: Path) -> None:

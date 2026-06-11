@@ -23,10 +23,10 @@ _SLOT_MATCH_MAX_MEAN = 118.0
 _MIN_DIGIT_HEIGHT_RATIO = 0.35
 _MAX_DIGIT_HEIGHT_RATIO = 1.05
 _MIN_DIGIT_WIDTH_RATIO = 0.28
-_MIN_DIGITS = 4
+_MIN_DIGITS = 1
 _MAX_DIGITS = 7
 _MAX_COIN_VALUE = 9_999_999
-_PREFERRED_DIGITS = (4, 5, 6, 7)
+_PREFERRED_DIGITS = tuple(range(_MIN_DIGITS, _MAX_DIGITS + 1))
 _MAX_ACCEPTABLE_ERR = 72.0
 _MAX_HUD_ACCEPTABLE_ERR = 80.0
 _MIN_HUD_CONSENSUS_READS = 2
@@ -37,7 +37,7 @@ _BOX_OVER_SLOT_MARGIN = 22.0
 _AMBIGUOUS_RANK_GAP = 10.0
 _FIVE_DIGIT_EXTRA_ERR = 18.0
 _SLOT_LOW_BOX_PENALTY = 24.0
-_MIN_COIN_VALUE = 100
+_MIN_COIN_VALUE = 1
 
 
 def bonus_coin_hud_rect(positions: dict) -> tuple[float, float, float, float]:
@@ -1619,7 +1619,7 @@ def _hud_split_four_digit_variants(row: np.ndarray) -> List[tuple[List[np.ndarra
 
 
 def _hud_split_n_digits_valley(row: np.ndarray, n: int) -> Optional[List[np.ndarray]]:
-    if n < 4 or n > _MAX_DIGITS:
+    if n < _MIN_DIGITS or n > _MAX_DIGITS:
         return None
     span = _hud_trimmed_ink_span(row)
     if span is None:
@@ -1632,7 +1632,7 @@ def _hud_split_n_digits_valley(row: np.ndarray, n: int) -> Optional[List[np.ndar
 
 
 def _hud_split_n_digits_ratio(row: np.ndarray, n: int) -> Optional[List[np.ndarray]]:
-    if n < 4 or n > _MAX_DIGITS:
+    if n < _MIN_DIGITS or n > _MAX_DIGITS:
         return None
     span = _hud_trimmed_ink_span(row)
     if span is None:
@@ -1922,7 +1922,7 @@ def _coin_digit_cnn_ready() -> bool:
 
 
 def _try_hud_digit_decode(gray: np.ndarray) -> Optional[Tuple[int, float, str]]:
-    """実機 HUD 向け: 4〜7 桁分割 + coin_digit CNN。"""
+    """実機 HUD 向け: 1〜7 桁分割 + coin_digit CNN。"""
     if not _coin_digit_cnn_ready():
         return None
     row = _hud_digit_row_gray(gray)
