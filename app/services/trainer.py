@@ -38,6 +38,8 @@ class SimpleTrainer:
         self.scene_model = SceneCentroidModel()
         self.coin_digit_cnn = None
         self.coin_digit_val_accuracy = 0.0
+        self.result_digit_cnn = None
+        self.result_digit_val_accuracy = 0.0
         self.val_accuracy = 0.0
         self.last_fever_metrics: dict[str, int] = {}
         self.scene_backend = "none"
@@ -218,6 +220,64 @@ class SimpleTrainer:
         active_marker.write_text(version, encoding="utf-8")
         log(f"アクティブ版を更新: {active_marker} -> {version}")
         return out_coin_digit
+
+    def train_result_digit_cnn(self, log: Callable[[str], None]) -> bool:
+        """リザルト桁 CNN（UI 保存 crop 優先）を学習。"""
+        if not torch_available():
+            log("結果桁 CNN: PyTorch 未導入のためスキップします。")
+            return False
+        from app.services.result_digit_cnn import (
+            build_result_digit_training_samples,
+            default_result_digit_model_path,
+            evaluate_saved_result_crop_reads,
+        )
+        from app.services.coin_digit_cnn import CoinDigitCnnClassifier
+
+        log("結果桁 CNN を学習します…")
+        try:
+            train_samples, val_samples = build_result_digit_training_samples(log=log)
+            clf = CoinDigitCnnClassifier()
+            acc = clf.train_from_samples(
+                train_samples,
+                val_samples,
+                epochs=48,
+                log=log,
+                evaluate_fn=evaluate_saved_result_crop_reads,
+                init_model_path=default_result_digit_model_path,
+                log_tag="result_digit",
+            )
+            self.result_digit_cnn = clf
+            self.result_digit_val_accuracy = acc
+            log(f"結果桁 CNN 桁パッチ検証精度: {acc:.3f}")
+            evaluate_saved_result_crop_reads(clf, log=log)
+            return True
+        except Exception as exc:
+            log(f"結果桁 CNN 学習失敗: {exc}")
+            return False
+
+    def save_result_digit_only(
+        self, log: Callable[[str], None], version: str = "version_1"
+    ) -> Path:
+        """シーン CNN を触らず result_digit.pt だけ学習・保存。"""
+        if not torch_available():
+            raise RuntimeError("PyTorch 未導入です。pip install torch torchvision を実行してください。")
+        out_dir = self.model_root / version
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if not self.train_result_digit_cnn(log):
+            raise RuntimeError("結果桁 CNN の学習に失敗しました。")
+        if self.result_digit_cnn is None or not self.result_digit_cnn.is_loaded():
+            raise RuntimeError("結果桁 CNN が未学習です。")
+        out_path = out_dir / "result_digit.pt"
+        log("result_digit.pt を書き込み中…")
+        self.result_digit_cnn.save(out_path)
+        log(
+            f"結果桁 CNN 保存: {out_path} "
+            f"(val={self.result_digit_val_accuracy:.3f})"
+        )
+        active_marker = self.model_root / "ACTIVE_VERSION"
+        active_marker.write_text(version, encoding="utf-8")
+        log(f"アクティブ版を更新: {active_marker} -> {version}")
+        return out_path
 
     def save(self, log: Callable[[str], None], version: str = "version_1") -> Path:
         self.summarize_dataset()

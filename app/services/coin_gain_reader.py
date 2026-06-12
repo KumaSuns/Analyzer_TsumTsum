@@ -464,6 +464,22 @@ def _match_digit_template(
     return best_digit, best_err
 
 
+_digit_classifier_factory = None
+
+
+def set_digit_classifier_factory(factory) -> None:
+    global _digit_classifier_factory
+    _digit_classifier_factory = factory
+
+
+def _get_active_digit_classifier():
+    if _digit_classifier_factory is not None:
+        return _digit_classifier_factory()
+    from app.services.coin_digit_cnn import get_coin_digit_classifier
+
+    return get_coin_digit_classifier()
+
+
 def _match_digit(
     patch: np.ndarray, max_mean: float = _DIGIT_MATCH_MAX_MEAN
 ) -> Tuple[Optional[int], float]:
@@ -472,9 +488,7 @@ def _match_digit(
     if not _coin_digit_cnn_ready():
         return None, 1e9
     try:
-        from app.services.coin_digit_cnn import get_coin_digit_classifier
-
-        cnn = get_coin_digit_classifier()
+        cnn = _get_active_digit_classifier()
         if cnn.is_loaded():
             return cnn.match_digit(patch, max_mean=max_mean)
     except Exception:
@@ -1152,9 +1166,7 @@ def _patch_digit_errors(patch: np.ndarray) -> List[float]:
     cnn_conf: Optional[float] = None
     if _coin_digit_cnn_ready():
         try:
-            from app.services.coin_digit_cnn import get_coin_digit_classifier
-
-            cnn = get_coin_digit_classifier()
+            cnn = _get_active_digit_classifier()
             if cnn.is_loaded():
                 probs = cnn.predict_probs(patch)
                 if probs is not None:
@@ -1895,9 +1907,7 @@ def _decode_hud_greedy_cnn(
     """各パッチの CNN argmax をそのまま採用（分割が合っていれば最も安定）。"""
     if not _coin_digit_cnn_ready():
         return None
-    from app.services.coin_digit_cnn import get_coin_digit_classifier
-
-    cnn = get_coin_digit_classifier()
+    cnn = _get_active_digit_classifier()
     if not cnn.is_loaded():
         return None
     n = len(parts)
@@ -1961,9 +1971,7 @@ def _hud_decode_rank(item: Tuple[int, float, str], *, prefer_ref_split: bool) ->
 
 def _coin_digit_cnn_ready() -> bool:
     try:
-        from app.services.coin_digit_cnn import coin_digit_cnn_available
-
-        return coin_digit_cnn_available()
+        return _get_active_digit_classifier().is_loaded()
     except Exception:
         return False
 

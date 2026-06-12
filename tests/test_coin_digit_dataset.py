@@ -9,6 +9,7 @@ from app.services.coin_digit_dataset import (
     build_saved_crop_training_samples,
     parse_crop_label,
     save_labeled_crop,
+    save_labeled_score_crop,
 )
 
 
@@ -27,6 +28,8 @@ def test_parse_crop_label() -> None:
     assert parse_crop_label(Path("coin_gain_3065_20260101_123.png")) == 3065
     assert parse_crop_label(Path("coin_gain_859_x.png")) == 859
     assert parse_crop_label(Path("coin_gain_0_x.png")) is None
+    assert parse_crop_label(Path("score_gain_12345678_20260101_123.png")) == 12345678
+    assert parse_crop_label(Path("score_gain_0_x.png")) is None
 
 
 def test_save_and_build_training_samples(tmp_path: Path) -> None:

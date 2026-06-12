@@ -285,7 +285,7 @@ def build_digit_training_samples(
     if usable == 0:
         _log(
             "コイン桁: UI 保存データなし。"
-            " 獲得コイン確定ダイアログまたは動画ツール3で切り抜きを保存してください。"
+            " 動画ツール3で coin_gain / score_gain の切り抜きを保存してください。"
         )
 
     train: List[Tuple[np.ndarray, int]] = []
@@ -403,6 +403,9 @@ class CoinDigitCnnClassifier:
         lr: float = 1e-3,
         finetune: bool = True,
         log: Optional[Callable[[str], None]] = None,
+        evaluate_fn: Optional[Callable] = None,
+        init_model_path: Optional[Callable[[], Path]] = None,
+        log_tag: str = "coin_digit",
     ) -> float:
         if not _TORCH_OK:
             raise RuntimeError("PyTorch が未インストールです。")
@@ -421,6 +424,8 @@ class CoinDigitCnnClassifier:
             DataLoader(val_ds, batch_size=batch_size, shuffle=False) if val_ds else None
         )
 
+        crop_eval = evaluate_fn or evaluate_saved_crop_reads
+        path_fn = init_model_path or default_coin_digit_model_path
         net = SmallDigitCNN(NUM_CLASSES).to(self.device)
         init_loaded = False
         if finetune:
@@ -428,7 +433,7 @@ class CoinDigitCnnClassifier:
                 net.load_state_dict(self.model.state_dict())
                 init_loaded = True
             else:
-                init_path = default_coin_digit_model_path()
+                init_path = path_fn()
                 if init_path.exists():
                     tmp = CoinDigitCnnClassifier()
                     if tmp.load(init_path):
@@ -436,7 +441,7 @@ class CoinDigitCnnClassifier:
                         init_loaded = True
         train_lr = min(lr, 2e-4) if init_loaded else lr
         if init_loaded:
-            _log(f"コイン桁 CNN: 既存モデルから fine-tune (lr={train_lr:g})")
+            _log(f"{log_tag}: 既存モデルから fine-tune (lr={train_lr:g})")
         opt = torch.optim.Adam(net.parameters(), lr=train_lr, weight_decay=1e-4)
         loss_fn = nn.CrossEntropyLoss()
         best_acc = 0.0
@@ -478,7 +483,7 @@ class CoinDigitCnnClassifier:
                     }
             if epoch == epochs or epoch % 8 == 0:
                 self.model = net.eval()
-                ok, total = evaluate_saved_crop_reads(self, log=None)
+                ok, total = crop_eval(self, log=None)
                 real_acc = ok / max(1, total)
                 if real_acc > best_real_acc:
                     best_real_acc = real_acc
@@ -486,7 +491,7 @@ class CoinDigitCnnClassifier:
                         k: v.detach().cpu().clone() for k, v in net.state_dict().items()
                     }
             _log(
-                f"coin_digit epoch {epoch}/{epochs} loss={total_loss / max(1, n_batches):.4f}"
+                f"{log_tag} epoch {epoch}/{epochs} loss={total_loss / max(1, n_batches):.4f}"
                 + (f" val_acc={val_acc:.3f}" if val_loader else "")
                 + (
                     f" crop_acc={best_real_acc:.0%}"
@@ -497,7 +502,7 @@ class CoinDigitCnnClassifier:
 
         if best_real_state is not None and best_real_acc > 0:
             net.load_state_dict(best_real_state)
-            _log(f"コイン桁 CNN: 保存 crop 一致率最高 checkpoint を採用 ({best_real_acc:.0%})")
+            _log(f"{log_tag}: 保存 crop 一致率最高 checkpoint を採用 ({best_real_acc:.0%})")
         elif best_state is not None:
             net.load_state_dict(best_state)
         net.eval()

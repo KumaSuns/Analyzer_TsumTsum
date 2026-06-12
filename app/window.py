@@ -88,7 +88,31 @@ from app.services.coin_gain_reader import (
     read_coin_gain_crop,
 )
 from app.services.coin_digit_cnn import coin_digit_cnn_available
-from app.services.coin_digit_dataset import count_saved_crops, save_labeled_crop
+from app.services.coin_digit_dataset import (
+    count_saved_crops,
+    save_labeled_crop,
+    save_labeled_score_crop,
+)
+from app.services.result_digit_cnn import result_digit_cnn_available
+from app.services.result_digit_dataset import (
+    count_saved_crops as count_saved_result_crops,
+    save_labeled_result_gain_crop,
+)
+from app.services.result_gain_reader import (
+    RESULT_GAIN_FIELDS,
+    RESULT_GAIN_FIELD_KEYS,
+    consensus_result_gain,
+    read_result_gain_crop,
+    result_gain_confirmed,
+)
+from app.services.score_gain_reader import (
+    consensus_score_gain,
+    plausible_score_value,
+    read_score_gain_crop,
+    score_gain_confirmed,
+)
+
+_RESULT_GAIN_CROP_KEYS = frozenset(RESULT_GAIN_FIELD_KEYS)
 from app.services.remaining_time_reader import read_remaining_seconds
 from app.services.file_video import FileVideoSource, is_file_video_available
 
@@ -96,7 +120,7 @@ from app.services.file_video import FileVideoSource, is_file_video_available
 _ANALYSIS_SCENE_CONFIRM_LABELS = tuple(c for c in SimpleTrainer.CLASSES if c != "none")
 # 初回起動時に確認モーダルを ON にするシーン
 _SCENE_CONFIRM_DEFAULT_ON = frozenset({"ready", "go", "fever", "timeup", "bonus", "coin", "result"})
-_APP_VERSION = "Version_002_2026_06_08"
+_APP_VERSION = "Version_002_2026_06_12"
 # いまは timeup 精度改善に集中するため解析中の fever 検知を止める（True で復帰）
 _ANALYSIS_FEVER_ENABLED = False
 # IN_GAME: 弱い fever は連続2サンプル（1サンプルだけの誤検知を出さない）
@@ -191,6 +215,25 @@ _SCENE_CONFIRM_PREVIEW_MAX_W = 560
 _SCENE_CONFIRM_PREVIEW_MAX_H = 315
 _COIN_GAIN_CROP_PREVIEW_MAX_W = 480
 _COIN_GAIN_CROP_PREVIEW_MAX_H = 200
+# 動画ツール左列モード（内部 ID は 1〜6 のまま）
+_VIDEO_TOOL_MODE_LABELS: tuple[str, ...] = (
+    "トリム",
+    "シーン",
+    "コイン",
+    "結果",
+    "—",
+    "—",
+)
+_VIDEO_TOOL_MODE_TRIM = 1
+_VIDEO_TOOL_MODE_SCENE = 2
+_VIDEO_TOOL_MODE_COIN = 3
+_VIDEO_TOOL_MODE_RESULT = 4
+
+
+def _video_tool_mode_label(mode_id: int) -> str:
+    if 1 <= mode_id <= len(_VIDEO_TOOL_MODE_LABELS):
+        return _VIDEO_TOOL_MODE_LABELS[mode_id - 1]
+    return str(mode_id)
 
 
 def _preview_pixmap_for_scene_modal(frame_image, max_w: int, max_h: int) -> QPixmap:
@@ -669,6 +712,11 @@ class MainWindow(QMainWindow):
             ("残り時間", "remaining_time"),
             ("UseTsum", "use_tsum"),
             ("獲得コイン", "coin_gain"),
+            ("獲得スコア", "score_gain"),
+            ("最終獲得スコア", "result_score_gain"),
+            ("スコアボーナス", "score_bonus_gain"),
+            ("獲得経験値", "result_exp_gain"),
+            ("最終獲得コイン", "result_coin_gain"),
         ]
         self.crop_target_display = {key: display for display, key in self.crop_targets}
         self._coin_gain_best: Optional[int] = None
@@ -676,6 +724,19 @@ class MainWindow(QMainWindow):
         self._gain_coin_reads: list[tuple[int, float, str]] = []
         self._coin_gain_last_debug = ""
         self._coin_gain_last_capture_frame: Optional[QImage] = None
+        self._score_gain_best: Optional[int] = None
+        self._score_gain_reads: list[tuple[int, float, str]] = []
+        self._score_gain_last_debug = ""
+        self._score_gain_last_capture_frame: Optional[QImage] = None
+        self._result_gain_best: dict[str, Optional[int]] = {
+            k: None for k in RESULT_GAIN_FIELD_KEYS
+        }
+        self._result_gain_reads: dict[str, list[tuple[int, float, str]]] = {
+            k: [] for k in RESULT_GAIN_FIELD_KEYS
+        }
+        self._result_gain_last_debug: dict[str, str] = {k: "" for k in RESULT_GAIN_FIELD_KEYS}
+        self._result_gain_last_capture_frame: Optional[QImage] = None
+        self._video_tool_result_fields: dict[str, dict] = {}
         self._last_completed_round: Optional[dict] = None
         self.trainer = SimpleTrainer(
             images_root=self.project_root / "app/assets/images",
@@ -839,7 +900,7 @@ class MainWindow(QMainWindow):
         self._render_feature_ui(feature_id)
 
     def _on_video_tool_quick_mode_clicked(self, mode_id: int) -> None:
-        """動画ツール: 1=トリミング、2=シーン保存、3=獲得コイン学習、4〜6=未割当。"""
+        """動画ツール: トリム/シーン/コイン/結果（内部 ID 1〜4）、5〜6=未割当。"""
         if self.button_group.checkedId() != 2:
             return
         stack = getattr(self, "_video_tool_right_stack", None)
@@ -861,6 +922,11 @@ class MainWindow(QMainWindow):
             stack.setVisible(True)
             self._hide_trim_overlay_on_video()
             self._refresh_video_tool_coin_digit_preview(reset_read=True)
+        elif mode_id == 4:
+            stack.setCurrentIndex(3)
+            stack.setVisible(True)
+            self._hide_trim_overlay_on_video()
+            self._refresh_video_tool_result_digit_preview(reset_read=True)
         else:
             stack.setVisible(False)
             self._hide_trim_overlay_on_video()
@@ -873,8 +939,18 @@ class MainWindow(QMainWindow):
             return False
         return group.checkedId() == 3
 
-    def _video_tool_coin_digit_frame_image(self) -> Optional[QImage]:
-        if self._is_video_tool_coin_digit_mode() and self._is_player_paused():
+    def _is_video_tool_result_digit_mode(self) -> bool:
+        if self.button_group.checkedId() != 2:
+            return False
+        group = getattr(self, "_video_tool_mode_group", None)
+        if group is None or not _is_alive_qobject(group):
+            return False
+        return group.checkedId() == 4
+
+    def _video_tool_digit_frame_image(self) -> Optional[QImage]:
+        if (
+            self._is_video_tool_coin_digit_mode() or self._is_video_tool_result_digit_mode()
+        ) and self._is_player_paused():
             ms = self._playback_position_ms()
             img = self._read_frame_at_ms(ms)
             if img is not None and not img.isNull():
@@ -884,6 +960,184 @@ class MainWindow(QMainWindow):
         if image is not None and not image.isNull():
             return image
         return None
+
+    def _video_tool_coin_digit_frame_image(self) -> Optional[QImage]:
+        return self._video_tool_digit_frame_image()
+
+    def _refresh_video_tool_result_field_preview(
+        self,
+        field_key: str,
+        frame_image=None,
+        positions: Optional[dict] = None,
+        *,
+        reset_read: bool = False,
+    ) -> None:
+        widgets = self._video_tool_result_fields.get(field_key)
+        if not widgets:
+            return
+        preview = widgets.get("preview")
+        read_label = widgets.get("read_label")
+        if preview is None or not _is_alive_qobject(preview):
+            return
+        spec = next((f for f in RESULT_GAIN_FIELDS if f.key == field_key), None)
+        if reset_read and read_label is not None and _is_alive_qobject(read_label):
+            read_label.setText(f"{spec.label if spec else field_key}読取: 未実行")
+        if frame_image is None:
+            frame_image = self._video_tool_digit_frame_image()
+        if positions is None:
+            positions = self._load_crop_positions()
+        if frame_image is None or not self._crop_rect_defined(positions, field_key):
+            preview.setText(
+                f"{field_key} 範囲未設定"
+                if not self._crop_rect_defined(positions, field_key)
+                else "フレームなし"
+            )
+            preview.setPixmap(QPixmap())
+            return
+        crop = self._crop_frame_roi_from_positions(frame_image, positions, field_key)
+        if crop is None or crop.isNull():
+            preview.setText("切り抜き失敗")
+            preview.setPixmap(QPixmap())
+            return
+        pix = QPixmap.fromImage(crop)
+        if pix.isNull():
+            preview.setText("プレビューなし")
+            preview.setPixmap(QPixmap())
+        else:
+            preview.setText("")
+            preview.setPixmap(
+                pix.scaled(
+                    preview.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
+    def _refresh_video_tool_result_digit_preview(self, *, reset_read: bool = False) -> None:
+        count_label = getattr(self, "_video_tool_result_count_label", None)
+        assets = self.project_root / "app/assets/images"
+        train_n, val_n = count_saved_result_crops(assets)
+        if count_label is not None and _is_alive_qobject(count_label):
+            count_label.setText(f"保存済み: train={train_n} val={val_n}")
+        frame_image = self._video_tool_digit_frame_image()
+        positions = self._load_crop_positions()
+        for field_key in RESULT_GAIN_FIELD_KEYS:
+            self._refresh_video_tool_result_field_preview(
+                field_key,
+                frame_image,
+                positions,
+                reset_read=reset_read,
+            )
+
+    def _on_video_tool_result_digit_read_clicked(self) -> None:
+        status = getattr(self, "_video_tool_result_status", None)
+        if self.button_group.checkedId() != 2:
+            return
+        if not self._is_player_paused():
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("一時停止してから読取してください。")
+            return
+        frame_image = self._video_tool_digit_frame_image()
+        if frame_image is None:
+            if status is not None and _is_alive_qobject(status):
+                status.setText("フレームがありません。")
+            return
+        if not opencv_available() or not result_digit_cnn_available():
+            if status is not None and _is_alive_qobject(status):
+                status.setText("opencv または result_digit 未準備です。")
+            return
+        positions = self._load_crop_positions()
+        any_ok = False
+        for spec in RESULT_GAIN_FIELDS:
+            widgets = self._video_tool_result_fields.get(spec.key, {})
+            read_label = widgets.get("read_label")
+            value_spin = widgets.get("value_spin")
+            if not self._crop_rect_defined(positions, spec.key):
+                if read_label is not None and _is_alive_qobject(read_label):
+                    read_label.setText(f"{spec.label}読取: 範囲未設定")
+                continue
+            crop = self._crop_frame_roi_from_positions(frame_image, positions, spec.key)
+            if crop is None or crop.isNull():
+                if read_label is not None and _is_alive_qobject(read_label):
+                    read_label.setText(f"{spec.label}読取: 切り抜き失敗")
+                continue
+            val, _err, dbg = read_result_gain_crop(crop, field_key=spec.key)
+            if val is not None and spec.plausible(val):
+                any_ok = True
+                if read_label is not None and _is_alive_qobject(read_label):
+                    read_label.setText(f"{spec.label}読取: {int(val):,}")
+                if value_spin is not None and _is_alive_qobject(value_spin):
+                    value_spin.blockSignals(True)
+                    value_spin.setValue(int(val))
+                    value_spin.blockSignals(False)
+            elif read_label is not None and _is_alive_qobject(read_label):
+                read_label.setText(f"{spec.label}読取: 失敗 ({dbg})")
+        if status is not None and _is_alive_qobject(status):
+            if any_ok:
+                status.setStyleSheet("color: #555;")
+                status.setText("読取完了。見た目と照合してください。")
+            else:
+                status.setStyleSheet("color: #C62828;")
+                status.setText("読取失敗。正解値を手入力して保存できます。")
+
+    def _on_video_tool_result_field_save_clicked(self, field_key: str) -> None:
+        status = getattr(self, "_video_tool_result_status", None)
+        widgets = self._video_tool_result_fields.get(field_key, {})
+        value_spin = widgets.get("value_spin")
+        spec = next((f for f in RESULT_GAIN_FIELDS if f.key == field_key), None)
+        if (
+            self.button_group.checkedId() != 2
+            or value_spin is None
+            or not _is_alive_qobject(value_spin)
+            or spec is None
+        ):
+            return
+        if not self._is_player_paused():
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("一時停止してから保存してください。")
+            return
+        frame_image = self._video_tool_digit_frame_image()
+        if frame_image is None:
+            if status is not None and _is_alive_qobject(status):
+                status.setText("フレームがありません。")
+            return
+        positions = self._load_crop_positions()
+        if not self._crop_rect_defined(positions, field_key):
+            if status is not None and _is_alive_qobject(status):
+                status.setText(f"{spec.label}: 範囲未設定")
+            return
+        crop = self._crop_frame_roi_from_positions(frame_image, positions, field_key)
+        if crop is None or crop.isNull():
+            if status is not None and _is_alive_qobject(status):
+                status.setText(f"{spec.label}: 切り抜き失敗")
+            return
+        label = int(value_spin.value())
+        if not spec.plausible(label):
+            if status is not None and _is_alive_qobject(status):
+                status.setText(f"{spec.label}: 正解値が範囲外です。")
+            return
+        frame_index = int(
+            (max(self._playback_position_ms(), 0) / 1000.0) * float(self.estimated_fps or 30.0)
+        )
+        ok, msg = save_labeled_result_gain_crop(
+            crop,
+            label,
+            field_key,
+            assets_root=self.project_root / "app/assets/images",
+            frame_index=frame_index,
+        )
+        if status is not None and _is_alive_qobject(status):
+            if ok:
+                status.setStyleSheet("color: #2E7D32;")
+                status.setText(f"{spec.label} 保存 → {msg}")
+            else:
+                status.setStyleSheet("color: #C62828;")
+                status.setText(f"保存失敗: {msg}")
+        if ok:
+            self._train_log(f"リザルト桁学習用保存({spec.label}): {msg}")
+        self._refresh_video_tool_result_digit_preview()
 
     def _refresh_video_tool_coin_digit_preview(self, *, reset_read: bool = False) -> None:
         """切り抜きプレビューと保存枚数のみ更新（CNN 読取は行わない）。"""
@@ -899,7 +1153,7 @@ class MainWindow(QMainWindow):
             count_label.setText(f"保存済み: train={train_n} val={val_n}")
 
         if reset_read and read_label is not None and _is_alive_qobject(read_label):
-            read_label.setText("読取: 未実行")
+            read_label.setText("コイン読取: 未実行")
 
         frame_image = self._video_tool_coin_digit_frame_image()
         if frame_image is None:
@@ -914,7 +1168,7 @@ class MainWindow(QMainWindow):
             preview.setText("coin_gain 範囲未設定")
             preview.setPixmap(QPixmap())
             if reset_read and read_label is not None and _is_alive_qobject(read_label):
-                read_label.setText("読取: 動画ツール1で獲得コイン範囲を保存してください")
+                read_label.setText("読取: 「トリム」で獲得コイン範囲を保存してください")
             return
 
         crop = self._crop_frame_roi(frame_image, "coin_gain")
@@ -925,6 +1179,58 @@ class MainWindow(QMainWindow):
                 read_label.setText("読取: 切り抜きできませんでした")
             return
 
+        pix = QPixmap.fromImage(crop)
+        if pix.isNull():
+            preview.setText("プレビューなし")
+            preview.setPixmap(QPixmap())
+        else:
+            preview.setText("")
+            preview.setPixmap(
+                pix.scaled(
+                    preview.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        self._refresh_video_tool_score_digit_preview(
+            frame_image, positions, reset_read=reset_read
+        )
+
+    def _refresh_video_tool_score_digit_preview(
+        self,
+        frame_image=None,
+        positions: Optional[dict] = None,
+        *,
+        reset_read: bool = False,
+    ) -> None:
+        preview = getattr(self, "_video_tool_score_preview_label", None)
+        read_label = getattr(self, "_video_tool_score_read_label", None)
+        if preview is None or not _is_alive_qobject(preview):
+            return
+        if reset_read and read_label is not None and _is_alive_qobject(read_label):
+            read_label.setText("スコア読取: 未実行")
+        if frame_image is None:
+            frame_image = self._video_tool_coin_digit_frame_image()
+        if positions is None:
+            positions = self._load_crop_positions()
+        if frame_image is None or not self._crop_rect_defined(positions, "score_gain"):
+            preview.setText(
+                "score_gain 範囲未設定"
+                if not self._crop_rect_defined(positions, "score_gain")
+                else "フレームなし"
+            )
+            preview.setPixmap(QPixmap())
+            if reset_read and read_label is not None and _is_alive_qobject(read_label):
+                if not self._crop_rect_defined(positions, "score_gain"):
+                    read_label.setText(
+                        "スコア読取: 「トリム」で獲得スコア範囲を保存してください"
+                    )
+            return
+        crop = self._crop_frame_roi_from_positions(frame_image, positions, "score_gain")
+        if crop is None or crop.isNull():
+            preview.setText("切り抜き失敗")
+            preview.setPixmap(QPixmap())
+            return
         pix = QPixmap.fromImage(crop)
         if pix.isNull():
             preview.setText("プレビューなし")
@@ -974,20 +1280,50 @@ class MainWindow(QMainWindow):
             return
 
         crop_val, _err, dbg = read_coin_gain_crop(crop)
-        if crop_val is not None and plausible_coin_value(crop_val):
+        coin_ok = crop_val is not None and plausible_coin_value(crop_val)
+        if coin_ok:
             if read_label is not None and _is_alive_qobject(read_label):
-                read_label.setText(f"読取: {int(crop_val):,}")
+                read_label.setText(f"コイン読取: {int(crop_val):,}")
             if value_spin is not None and _is_alive_qobject(value_spin):
                 value_spin.blockSignals(True)
                 value_spin.setValue(int(crop_val))
                 value_spin.blockSignals(False)
-            if status is not None and _is_alive_qobject(status):
-                status.setStyleSheet("color: #555;")
-                status.setText("読取完了。見た目と照合してください。")
         else:
             if read_label is not None and _is_alive_qobject(read_label):
-                read_label.setText(f"読取: 読み取れませんでした ({dbg})")
-            if status is not None and _is_alive_qobject(status):
+                read_label.setText(f"コイン読取: 読み取れませんでした ({dbg})")
+
+        score_read_label = getattr(self, "_video_tool_score_read_label", None)
+        positions = self._load_crop_positions()
+        score_ok = False
+        if self._crop_rect_defined(positions, "score_gain"):
+            score_crop = self._crop_frame_roi_from_positions(
+                frame_image, positions, "score_gain"
+            )
+            if score_crop is not None and not score_crop.isNull():
+                score_val, _s_err, s_dbg = read_score_gain_crop(score_crop)
+                score_ok = score_val is not None and plausible_score_value(score_val)
+                if score_read_label is not None and _is_alive_qobject(score_read_label):
+                    if score_ok:
+                        score_read_label.setText(f"スコア読取: {int(score_val):,}")
+                        score_spin = getattr(self, "_video_tool_score_value_spin", None)
+                        if score_spin is not None and _is_alive_qobject(score_spin):
+                            score_spin.blockSignals(True)
+                            score_spin.setValue(int(score_val))
+                            score_spin.blockSignals(False)
+                    else:
+                        score_read_label.setText(
+                            f"スコア読取: 読み取れませんでした ({s_dbg})"
+                        )
+        elif score_read_label is not None and _is_alive_qobject(score_read_label):
+            score_read_label.setText(
+                "スコア読取: 「トリム」で獲得スコア範囲を保存してください"
+            )
+
+        if status is not None and _is_alive_qobject(status):
+            if coin_ok or score_ok:
+                status.setStyleSheet("color: #555;")
+                status.setText("読取完了。見た目と照合してください。")
+            else:
                 status.setStyleSheet("color: #C62828;")
                 status.setText("読取失敗。正解値を手入力して保存できます。")
 
@@ -1046,6 +1382,70 @@ class MainWindow(QMainWindow):
                 self.log_view.append(f"コイン桁学習用保存: {msg}")
         else:
             self._train_log(f"コイン桁学習用保存失敗: {msg}")
+        self._refresh_video_tool_coin_digit_preview()
+
+    def _on_video_tool_score_digit_save_clicked(self) -> None:
+        """動画ツール3: 獲得スコア切り抜きを正解ラベル付きで学習用保存。"""
+        status = getattr(self, "_video_tool_coin_status", None)
+        value_spin = getattr(self, "_video_tool_score_value_spin", None)
+        if self.button_group.checkedId() != 2 or value_spin is None or not _is_alive_qobject(value_spin):
+            return
+        if not self._is_player_paused():
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("一時停止してから保存してください。")
+            return
+
+        frame_image = self._video_tool_coin_digit_frame_image()
+        if frame_image is None:
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("フレームがありません。動画を止めてから保存してください。")
+            return
+
+        positions = self._load_crop_positions()
+        if not self._crop_rect_defined(positions, "score_gain"):
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("score_gain 範囲が未設定です。「トリム」で設定してください。")
+            return
+
+        crop = self._crop_frame_roi_from_positions(frame_image, positions, "score_gain")
+        if crop is None or crop.isNull():
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("score_gain 切り抜きに失敗しました。")
+            return
+
+        label = int(value_spin.value())
+        if not plausible_score_value(label):
+            if status is not None and _is_alive_qobject(status):
+                status.setStyleSheet("color: #C62828;")
+                status.setText("正解値は 1〜9999999999（1〜10桁）の範囲で入力してください。")
+            return
+
+        frame_index = int(
+            (max(self._playback_position_ms(), 0) / 1000.0) * float(self.estimated_fps or 30.0)
+        )
+        ok, msg = save_labeled_score_crop(
+            crop,
+            label,
+            assets_root=self.project_root / "app/assets/images",
+            frame_index=frame_index,
+        )
+        if status is not None and _is_alive_qobject(status):
+            if ok:
+                status.setStyleSheet("color: #2E7D32;")
+                status.setText(f"スコア保存しました → {msg}")
+            else:
+                status.setStyleSheet("color: #C62828;")
+                status.setText(f"スコア保存失敗: {msg}")
+        if ok:
+            self._train_log(f"スコア桁学習用保存: {msg}")
+            if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+                self.log_view.append(f"スコア桁学習用保存: {msg}")
+        else:
+            self._train_log(f"スコア桁学習用保存失敗: {msg}")
         self._refresh_video_tool_coin_digit_preview()
 
     def _on_video_tool_scene_save_clicked(self) -> None:
@@ -1749,6 +2149,22 @@ class MainWindow(QMainWindow):
         self._coin_gain_last_debug = ""
         self._coin_gain_last_capture_frame = None
         self._refresh_coin_gain_label()
+        self._reset_score_gain_capture()
+        self._reset_result_gain_capture()
+
+    def _reset_score_gain_capture(self) -> None:
+        self._score_gain_best = None
+        self._score_gain_reads = []
+        self._score_gain_last_debug = ""
+        self._score_gain_last_capture_frame = None
+        self._refresh_score_gain_label()
+
+    def _reset_result_gain_capture(self) -> None:
+        self._result_gain_best = {k: None for k in RESULT_GAIN_FIELD_KEYS}
+        self._result_gain_reads = {k: [] for k in RESULT_GAIN_FIELD_KEYS}
+        self._result_gain_last_debug = {k: "" for k in RESULT_GAIN_FIELD_KEYS}
+        self._result_gain_last_capture_frame = None
+        self._refresh_result_gain_labels()
 
     @staticmethod
     def _unreliable_slot_coin_read(dbg: str) -> bool:
@@ -1783,6 +2199,11 @@ class MainWindow(QMainWindow):
             "use_tsum": self.locked_use_tsum,
             "item_targets": list(self.locked_item_targets),
             "coin_gain": self._coin_gain_best,
+            "score_gain": self._score_gain_best,
+            "result_score": self._result_gain_best.get("result_score_gain"),
+            "score_bonus": self._result_gain_best.get("score_bonus_gain"),
+            "result_exp": self._result_gain_best.get("result_exp_gain"),
+            "result_coin": self._result_gain_best.get("result_coin_gain"),
             "fever_count": self._fever_count,
             "skill_count": self._skill_count,
         }
@@ -1798,6 +2219,37 @@ class MainWindow(QMainWindow):
             label.setText(f"獲得コイン: {coin_gain:,}")
         else:
             label.setText("獲得コイン: --")
+
+    def _refresh_score_gain_label(self) -> None:
+        label = getattr(self, "counter_score_gain_label", None)
+        if label is None or not _is_alive_qobject(label):
+            return
+        score_gain = self._score_gain_best
+        if score_gain is None and self._last_completed_round:
+            score_gain = self._last_completed_round.get("score_gain")
+        if score_gain is not None:
+            label.setText(f"獲得スコア: {score_gain:,}")
+        else:
+            label.setText("獲得スコア: --")
+
+    def _refresh_result_gain_labels(self) -> None:
+        mapping = (
+            ("counter_result_score_label", "result_score_gain", "result_score", "最終スコア"),
+            ("counter_score_bonus_label", "score_bonus_gain", "score_bonus", "スコアボーナス"),
+            ("counter_result_exp_label", "result_exp_gain", "result_exp", "獲得EXP"),
+            ("counter_result_coin_label", "result_coin_gain", "result_coin", "最終コイン"),
+        )
+        for attr, state_key, snap_key, title in mapping:
+            label = getattr(self, attr, None)
+            if label is None or not _is_alive_qobject(label):
+                continue
+            value = self._result_gain_best.get(state_key)
+            if value is None and self._last_completed_round:
+                value = self._last_completed_round.get(snap_key)
+            if value is not None:
+                label.setText(f"{title}: {value:,}")
+            else:
+                label.setText(f"{title}: --")
 
     def _refresh_fever_skill_counter_labels(self) -> None:
         fever = self._fever_count
@@ -1869,7 +2321,7 @@ class MainWindow(QMainWindow):
         return value if plausible_coin_value(value) else None
 
     def _show_coin_gain_crop_confirm_dialog(
-        self, frame_image, coin_value: Optional[int]
+        self, frame_image, coin_value: Optional[int], score_value: Optional[int] = None
     ) -> None:
         if frame_image is None or frame_image.isNull():
             return
@@ -1882,7 +2334,7 @@ class MainWindow(QMainWindow):
                 self.player.pause()
         try:
             dlg = QDialog(self)
-            dlg.setWindowTitle("獲得コイン確定")
+            dlg.setWindowTitle("コイン・スコア確定")
             dlg.setModal(True)
             layout = QVBoxLayout(dlg)
             crop = self._crop_frame_roi(frame_image, "coin_gain")
@@ -1892,11 +2344,27 @@ class MainWindow(QMainWindow):
                 if read_val is not None and plausible_coin_value(read_val):
                     crop_val = int(read_val)
             if crop_val is not None:
-                info = QLabel(f"読取: {crop_val:,} (coin確定)")
+                info = QLabel(f"コイン読取: {crop_val:,} (coin確定)")
             else:
-                info = QLabel("読取: 読み取れませんでした (coin確定)")
+                info = QLabel("コイン読取: 読み取れませんでした (coin確定)")
             info.setWordWrap(True)
             layout.addWidget(info)
+            positions = self.crop_positions_for_analysis or self._load_crop_positions()
+            if self._crop_rect_defined(positions, "score_gain"):
+                score_crop = self._crop_frame_roi(frame_image, "score_gain")
+                score_crop_val: Optional[int] = None
+                if score_crop is not None and not score_crop.isNull():
+                    score_read, _s_err, _s_dbg = read_score_gain_crop(score_crop)
+                    if score_read is not None and plausible_score_value(score_read):
+                        score_crop_val = int(score_read)
+                if score_crop_val is not None:
+                    score_info = QLabel(f"スコア読取: {score_crop_val:,} (coin確定)")
+                elif score_value is not None and plausible_score_value(score_value):
+                    score_info = QLabel(f"スコア読取: {score_value:,} (coin確定)")
+                else:
+                    score_info = QLabel("スコア読取: 読み取れませんでした (coin確定)")
+                score_info.setWordWrap(True)
+                layout.addWidget(score_info)
             value_row = QHBoxLayout()
             value_row.addWidget(QLabel("正解値（学習用）"))
             value_spin = QSpinBox()
@@ -2118,6 +2586,7 @@ class MainWindow(QMainWindow):
         scene = self._coin_effective_capture_scene(scene)
         if not self._coin_capture_scene_allowed(scene):
             return
+        self._update_score_gain_capture(frame_image)
         if not opencv_available():
             self._coin_gain_last_debug = "opencv未導入"
             self._refresh_coin_gain_label()
@@ -2159,6 +2628,43 @@ class MainWindow(QMainWindow):
         self._refresh_coin_gain_label()
         self._maybe_finalize_coin_confirmation()
 
+    def _recompute_score_gain_best(self) -> None:
+        pick = consensus_score_gain(
+            [(v, e) for v, e, _d in self._score_gain_reads]
+        )
+        if pick is not None:
+            self._score_gain_best = pick
+
+    def _update_score_gain_capture(self, frame_image) -> None:
+        if frame_image is None or frame_image.isNull():
+            return
+        positions = self.crop_positions_for_analysis or self._load_crop_positions()
+        if not self._crop_rect_defined(positions, "score_gain"):
+            return
+        if not opencv_available():
+            self._score_gain_last_debug = "opencv未導入"
+            self._refresh_score_gain_label()
+            return
+        if not coin_digit_cnn_available():
+            self._score_gain_last_debug = "coin_digit未学習（学習タブでモデル保存）"
+            self._refresh_score_gain_label()
+            return
+        crop = self._crop_frame_roi_from_positions(frame_image, positions, "score_gain")
+        if crop is None or crop.isNull():
+            self._score_gain_last_debug = "範囲未設定"
+            self._refresh_score_gain_label()
+            return
+        value, err, dbg = read_score_gain_crop(crop)
+        if value is None or not plausible_score_value(value):
+            self._score_gain_last_debug = dbg
+            self._refresh_score_gain_label()
+            return
+        self._score_gain_last_debug = dbg
+        self._score_gain_last_capture_frame = frame_image.copy()
+        self._score_gain_reads.append((value, err, dbg))
+        self._recompute_score_gain_best()
+        self._refresh_score_gain_label()
+
     def _log_coin_gain_capture(self, note: str = "") -> None:
         if not hasattr(self, "log_view") or not _is_alive_qobject(self.log_view):
             return
@@ -2170,6 +2676,22 @@ class MainWindow(QMainWindow):
         else:
             self.log_view.append(
                 f"獲得コイン: 読み取れませんでした ({self._coin_gain_last_debug}){suffix}"
+            )
+
+    def _log_score_gain_capture(self, note: str = "") -> None:
+        if not hasattr(self, "log_view") or not _is_alive_qobject(self.log_view):
+            return
+        positions = self.crop_positions_for_analysis or self._load_crop_positions()
+        if not self._crop_rect_defined(positions, "score_gain"):
+            return
+        suffix = f" ({note})" if note else ""
+        if self._score_gain_best is not None:
+            self.log_view.append(
+                f"獲得スコア: {self._score_gain_best:,}{suffix} [{self._score_gain_last_debug}]"
+            )
+        else:
+            self.log_view.append(
+                f"獲得スコア: 読み取れませんでした ({self._score_gain_last_debug}){suffix}"
             )
 
     def _confirm_bonus_detection(self) -> None:
@@ -2276,6 +2798,92 @@ class MainWindow(QMainWindow):
             return None, 1e9, "cropなし"
         return read_coin_gain_crop(crop)
 
+    def _read_score_gain_crop(self, frame_image) -> tuple[Optional[int], float, str]:
+        crop = self._crop_frame_roi(frame_image, "score_gain")
+        if crop is None or crop.isNull():
+            return None, 1e9, "cropなし"
+        return read_score_gain_crop(crop)
+
+    def _finalize_score_gain_at_coin(self, frame_image) -> None:
+        positions = self.crop_positions_for_analysis or self._load_crop_positions()
+        if not self._crop_rect_defined(positions, "score_gain"):
+            return
+        if score_gain_confirmed(self._score_gain_reads):
+            if frame_image is not None and not frame_image.isNull():
+                crop_val, crop_err, crop_dbg = self._read_score_gain_crop(frame_image)
+                if crop_val is not None and plausible_score_value(crop_val):
+                    if crop_err <= _MAX_HUD_ACCEPTABLE_ERR:
+                        self._score_gain_best = crop_val
+                        self._score_gain_last_debug = crop_dbg
+        self._log_score_gain_capture("coin確定")
+        self._refresh_score_gain_label()
+
+    def _update_result_gain_capture(self, frame_image) -> None:
+        if frame_image is None or frame_image.isNull():
+            return
+        if self.flow_phase != "WAIT_RESULT" or self._result_confirmed_this_game:
+            return
+        positions = self.crop_positions_for_analysis or self._load_crop_positions()
+        if not opencv_available() or not result_digit_cnn_available():
+            return
+        any_read = False
+        for spec in RESULT_GAIN_FIELDS:
+            if not self._crop_rect_defined(positions, spec.key):
+                continue
+            crop = self._crop_frame_roi_from_positions(frame_image, positions, spec.key)
+            if crop is None or crop.isNull():
+                continue
+            value, err, dbg = read_result_gain_crop(crop, field_key=spec.key)
+            if value is None or not spec.plausible(value):
+                self._result_gain_last_debug[spec.key] = dbg
+                continue
+            any_read = True
+            self._result_gain_last_debug[spec.key] = dbg
+            self._result_gain_reads[spec.key].append((value, err, dbg))
+            pick = consensus_result_gain(
+                [(v, e) for v, e, _d in self._result_gain_reads[spec.key]],
+                field_key=spec.key,
+            )
+            if pick is not None:
+                self._result_gain_best[spec.key] = pick
+        if any_read:
+            self._result_gain_last_capture_frame = frame_image.copy()
+        self._refresh_result_gain_labels()
+
+    def _finalize_result_gain_capture(self, frame_image) -> None:
+        positions = self.crop_positions_for_analysis or self._load_crop_positions()
+        for spec in RESULT_GAIN_FIELDS:
+            if not self._crop_rect_defined(positions, spec.key):
+                continue
+            if not result_gain_confirmed(
+                self._result_gain_reads[spec.key], field_key=spec.key
+            ):
+                continue
+            if frame_image is not None and not frame_image.isNull():
+                crop = self._crop_frame_roi_from_positions(
+                    frame_image, positions, spec.key
+                )
+                if crop is not None and not crop.isNull():
+                    crop_val, crop_err, crop_dbg = read_result_gain_crop(
+                        crop, field_key=spec.key
+                    )
+                    if crop_val is not None and spec.plausible(crop_val):
+                        if crop_err <= _MAX_HUD_ACCEPTABLE_ERR:
+                            self._result_gain_best[spec.key] = crop_val
+                            self._result_gain_last_debug[spec.key] = crop_dbg
+        if hasattr(self, "log_view") and _is_alive_qobject(self.log_view):
+            parts = []
+            for spec in RESULT_GAIN_FIELDS:
+                val = self._result_gain_best.get(spec.key)
+                dbg = self._result_gain_last_debug.get(spec.key, "")
+                if val is not None:
+                    parts.append(f"{spec.label}={val:,}")
+                elif self._crop_rect_defined(positions, spec.key):
+                    parts.append(f"{spec.label}=--({dbg})")
+            if parts:
+                self.log_view.append("リザルト確定: " + " | ".join(parts))
+        self._refresh_result_gain_labels()
+
     def _finalize_coin_confirmation(self) -> None:
         if self._coin_confirmed_this_game:
             return
@@ -2290,12 +2898,14 @@ class MainWindow(QMainWindow):
                 if crop_err <= _MAX_HUD_ACCEPTABLE_ERR or "dl n=4" in crop_dbg or "n=4" in crop_dbg:
                     self._coin_gain_best = crop_val
                     self._coin_gain_last_debug = crop_dbg
+        self._finalize_score_gain_at_coin(frame)
         self._coin_confirmed_this_game = True
         self._log_coin_gain_capture("coin確定")
         if self._analysis_scene_confirm_enabled("coin"):
             self._show_coin_gain_crop_confirm_dialog(
                 self._coin_gain_last_capture_frame,
                 self._coin_gain_best,
+                self._score_gain_best,
             )
         self.flow_phase = "WAIT_RESULT"
         if hasattr(self, "counter_analysis_state_label") and _is_alive_qobject(
@@ -2473,7 +3083,9 @@ class MainWindow(QMainWindow):
         self._refresh_item_counter_labels()
         self._refresh_fever_skill_counter_labels()
 
-    def _confirm_result_detection(self, position_ms: int = 0) -> None:
+    def _confirm_result_detection(
+        self, position_ms: int = 0, frame_image=None
+    ) -> None:
         if self._result_confirmed_this_game:
             return
         elapsed = self._elapsed_sec_since_go(position_ms)
@@ -2481,6 +3093,10 @@ class MainWindow(QMainWindow):
             self._go_to_result_sec = elapsed
             self._log_go_elapsed("result", position_ms, elapsed)
             self._refresh_round_timing_label()
+        frame = frame_image
+        if frame is None or frame.isNull():
+            frame = self._result_gain_last_capture_frame
+        self._finalize_result_gain_capture(frame)
         self._snapshot_completed_round()
         self._result_confirmed_this_game = True
         self._advance_after_result_confirmed()
@@ -2587,6 +3203,11 @@ class MainWindow(QMainWindow):
             "counter_fever_count_label",
             "counter_skill_count_label",
             "counter_coin_gain_label",
+            "counter_score_gain_label",
+            "counter_result_score_label",
+            "counter_score_bonus_label",
+            "counter_result_exp_label",
+            "counter_result_coin_label",
             "counter_round_timing_label",
             "counter_analysis_state_label",
             "counter_progress_label",
@@ -2928,7 +3549,7 @@ class MainWindow(QMainWindow):
                 sv.addWidget(self._video_tool_skill_save_btn)
 
                 self._video_tool_scene_status = QLabel(
-                    "左の「2」で表示。シーンはクラスを選んで「画像を保存」。"
+                    "左の「シーン」で表示。クラスを選んで「画像を保存」。"
                     "スキルはツム・種類を選んで「スキル発動画像を保存」。"
                 )
                 self._video_tool_scene_status.setWordWrap(True)
@@ -2940,26 +3561,31 @@ class MainWindow(QMainWindow):
                 cv = QVBoxLayout(coin_page)
                 cv.setContentsMargins(0, 0, 0, 0)
                 cv.setSpacing(8)
-                coin_title = QLabel("獲得コイン学習")
+                coin_title = QLabel("獲得コイン・スコア")
                 coin_title.setStyleSheet("font-weight: bold; font-size: 14px;")
                 cv.addWidget(coin_title)
                 coin_hint = QLabel(
                     "スライダー・コマ送りで coin 画面へ移動し、「読取」で CNN 結果を確認します。\n"
-                    "間違いのときだけ正解値を直して「学習用に保存」。"
-                    "保存先: app/assets/images/coin_digits/\n"
+                    "範囲は「トリム」で coin_gain / score_gain をそれぞれ設定。\n"
+                    "読取が間違うときは正解値を直して「学習用に保存」"
+                    "（coin / score とも app/assets/images/coin_digits/）。\n"
                     "十分貯まったら学習タブの「コイン桁 CNN だけ保存」。"
+                    "（coin 画面専用・result とは別モデル）"
                 )
                 coin_hint.setWordWrap(True)
                 coin_hint.setStyleSheet("color: #444;")
                 cv.addWidget(coin_hint)
 
-                self._video_tool_coin_read_label = QLabel("読取: 未実行")
+                self._video_tool_coin_read_label = QLabel("コイン読取: 未実行")
                 self._video_tool_coin_read_label.setWordWrap(True)
                 cv.addWidget(self._video_tool_coin_read_label)
+                self._video_tool_score_read_label = QLabel("スコア読取: 未実行")
+                self._video_tool_score_read_label.setWordWrap(True)
+                cv.addWidget(self._video_tool_score_read_label)
 
                 self._video_tool_coin_read_btn = QPushButton("読取")
                 self._video_tool_coin_read_btn.setToolTip(
-                    "現在フレームの coin_gain を CNN で読取（手動実行）"
+                    "現在フレームの coin_gain / score_gain を CNN で読取（手動実行）"
                 )
                 self._video_tool_coin_read_btn.clicked.connect(self._on_video_tool_coin_digit_read_clicked)
                 cv.addWidget(self._video_tool_coin_read_btn)
@@ -2968,44 +3594,147 @@ class MainWindow(QMainWindow):
                 value_row_layout = QHBoxLayout(value_row)
                 value_row_layout.setContentsMargins(0, 0, 0, 0)
                 value_row_layout.setSpacing(8)
-                value_row_layout.addWidget(QLabel("正解値"))
+                value_row_layout.addWidget(QLabel("コイン正解値"))
                 self._video_tool_coin_value_spin = QSpinBox()
                 self._video_tool_coin_value_spin.setRange(1, 9_999_999)
                 self._video_tool_coin_value_spin.setMinimumWidth(120)
                 value_row_layout.addWidget(self._video_tool_coin_value_spin, 1)
                 cv.addWidget(value_row)
 
-                self._video_tool_coin_save_btn = QPushButton("学習用に保存")
+                self._video_tool_coin_save_btn = QPushButton("コイン学習用に保存")
                 self._video_tool_coin_save_btn.setToolTip(
                     "coin_gain 切り抜きを正解ラベル付きで coin_digits/train|val へ保存"
                 )
                 self._video_tool_coin_save_btn.clicked.connect(self._on_video_tool_coin_digit_save_clicked)
                 cv.addWidget(self._video_tool_coin_save_btn)
 
+                score_value_row = QFrame()
+                score_value_row_layout = QHBoxLayout(score_value_row)
+                score_value_row_layout.setContentsMargins(0, 0, 0, 0)
+                score_value_row_layout.setSpacing(8)
+                score_value_row_layout.addWidget(QLabel("スコア正解値"))
+                self._video_tool_score_value_spin = QSpinBox()
+                self._video_tool_score_value_spin.setRange(1, 2_147_483_647)
+                self._video_tool_score_value_spin.setMinimumWidth(120)
+                score_value_row_layout.addWidget(self._video_tool_score_value_spin, 1)
+                cv.addWidget(score_value_row)
+
+                self._video_tool_score_save_btn = QPushButton("スコア学習用に保存")
+                self._video_tool_score_save_btn.setToolTip(
+                    "score_gain 切り抜きを正解ラベル付きで coin_digits/train|val へ保存"
+                )
+                self._video_tool_score_save_btn.clicked.connect(
+                    self._on_video_tool_score_digit_save_clicked
+                )
+                cv.addWidget(self._video_tool_score_save_btn)
+
                 self._video_tool_coin_count_label = QLabel("保存済み: train=0 val=0")
                 self._video_tool_coin_count_label.setStyleSheet("color: #555;")
                 cv.addWidget(self._video_tool_coin_count_label)
 
+                coin_preview_title = QLabel("coin_gain プレビュー")
+                coin_preview_title.setStyleSheet("color: #555;")
+                cv.addWidget(coin_preview_title)
                 self._video_tool_coin_preview_label = QLabel("プレビューなし")
-                self._video_tool_coin_preview_label.setFixedSize(300, 120)
+                self._video_tool_coin_preview_label.setFixedSize(300, 100)
                 self._video_tool_coin_preview_label.setStyleSheet(
                     "border:1px solid #888; background:#111; color:#DDD;"
                 )
                 self._video_tool_coin_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 cv.addWidget(self._video_tool_coin_preview_label)
 
+                score_preview_title = QLabel("score_gain プレビュー")
+                score_preview_title.setStyleSheet("color: #555;")
+                cv.addWidget(score_preview_title)
+                self._video_tool_score_preview_label = QLabel("プレビューなし")
+                self._video_tool_score_preview_label.setFixedSize(300, 100)
+                self._video_tool_score_preview_label.setStyleSheet(
+                    "border:1px solid #888; background:#111; color:#DDD;"
+                )
+                self._video_tool_score_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cv.addWidget(self._video_tool_score_preview_label)
+
                 self._video_tool_coin_status = QLabel(
-                    "左の「3」で表示。coin_gain 範囲は動画ツール1で設定済みであること。"
+                    "左の「コイン」で表示。範囲は「トリム」で設定。"
                 )
                 self._video_tool_coin_status.setWordWrap(True)
                 self._video_tool_coin_status.setStyleSheet("color: #555;")
                 cv.addWidget(self._video_tool_coin_status)
                 cv.addStretch(1)
 
+                result_page = QWidget()
+                rv = QVBoxLayout(result_page)
+                rv.setContentsMargins(0, 0, 0, 0)
+                rv.setSpacing(6)
+                result_title = QLabel("リザルト4項目")
+                result_title.setStyleSheet("font-weight: bold; font-size: 14px;")
+                rv.addWidget(result_title)
+                result_hint = QLabel(
+                    "result 画面で4箇所の切り抜きを「トリム」で設定し、"
+                    "「読取」で確認。間違いは正解値を直して各「学習用に保存」。"
+                    "保存先: app/assets/images/result_digits/。"
+                    "学習タブの「結果桁 CNN だけ保存」。解析時は result確定で記録。"
+                )
+                result_hint.setWordWrap(True)
+                result_hint.setStyleSheet("color: #444;")
+                rv.addWidget(result_hint)
+                self._video_tool_result_read_btn = QPushButton("読取")
+                self._video_tool_result_read_btn.clicked.connect(
+                    self._on_video_tool_result_digit_read_clicked
+                )
+                rv.addWidget(self._video_tool_result_read_btn)
+                self._video_tool_result_count_label = QLabel("保存済み: train=0 val=0")
+                self._video_tool_result_count_label.setStyleSheet("color: #555;")
+                rv.addWidget(self._video_tool_result_count_label)
+                self._video_tool_result_fields = {}
+                for spec in RESULT_GAIN_FIELDS:
+                    read_lbl = QLabel(f"{spec.label}読取: 未実行")
+                    read_lbl.setWordWrap(True)
+                    rv.addWidget(read_lbl)
+                    row = QHBoxLayout()
+                    row_w = QWidget()
+                    row_w.setLayout(row)
+                    spin = QSpinBox()
+                    spin.setRange(
+                        1,
+                        9_999_999 if spec.max_digits <= 7 else 2_147_483_647,
+                    )
+                    row.addWidget(QLabel("正解値"))
+                    row.addWidget(spin, 1)
+                    save_btn = QPushButton("学習用に保存")
+                    save_btn.clicked.connect(
+                        lambda _c=False, k=spec.key: self._on_video_tool_result_field_save_clicked(
+                            k
+                        )
+                    )
+                    row.addWidget(save_btn)
+                    rv.addWidget(row_w)
+                    preview = QLabel("プレビューなし")
+                    preview.setFixedSize(280, 72)
+                    preview.setStyleSheet(
+                        "border:1px solid #888; background:#111; color:#DDD;"
+                    )
+                    preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    rv.addWidget(preview)
+                    self._video_tool_result_fields[spec.key] = {
+                        "read_label": read_lbl,
+                        "value_spin": spin,
+                        "preview": preview,
+                        "save_btn": save_btn,
+                    }
+                self._video_tool_result_status = QLabel(
+                    "左の「結果」で表示。4項目の範囲は「トリム」で設定。"
+                )
+                self._video_tool_result_status.setWordWrap(True)
+                self._video_tool_result_status.setStyleSheet("color: #555;")
+                rv.addWidget(self._video_tool_result_status)
+                rv.addStretch(1)
+
                 self._video_tool_right_stack = QStackedWidget()
                 self._video_tool_right_stack.addWidget(trim_page)
                 self._video_tool_right_stack.addWidget(scene_page)
                 self._video_tool_right_stack.addWidget(coin_page)
+                self._video_tool_right_stack.addWidget(result_page)
                 self.right_layout.addWidget(self._video_tool_right_stack)
                 self._on_crop_target_selection_changed()
             elif feature_id not in (3,):
@@ -3025,27 +3754,32 @@ class MainWindow(QMainWindow):
             video_tool_btn_row = QFrame()
             video_tool_btn_row.setStyleSheet("background: transparent;")
             # 縦ボタン列が左列いっぱいに伸びないよう幅を抑える。
-            video_tool_btn_row.setMaximumWidth(88)
+            video_tool_btn_row.setMaximumWidth(108)
             btn_row_layout = QVBoxLayout(video_tool_btn_row)
             btn_row_layout.setContentsMargins(4, 4, 4, 4)
             btn_row_layout.setSpacing(4)
             self._video_tool_mode_group = QButtonGroup(self)
             self._video_tool_mode_group.setExclusive(True)
             for i in range(6):
-                btn = QPushButton(str(i + 1))
+                mode_id = i + 1
+                label = _VIDEO_TOOL_MODE_LABELS[i]
+                btn = QPushButton(label)
                 btn.setCheckable(True)
                 btn.setFixedHeight(28)
                 btn.setStyleSheet(video_tool_btn_style)
-                if i == 0:
-                    btn.setToolTip("右列: トリミング・位置保存など")
-                elif i == 1:
+                if mode_id == _VIDEO_TOOL_MODE_TRIM:
+                    btn.setToolTip("右列: 切り抜き範囲の指定・位置保存")
+                elif mode_id == _VIDEO_TOOL_MODE_SCENE:
                     btn.setToolTip("右列: シーン画像・スキル発動画像の保存")
-                elif i == 2:
-                    btn.setToolTip("右列: 獲得コイン学習（読取確認・学習用保存）")
+                elif mode_id == _VIDEO_TOOL_MODE_COIN:
+                    btn.setToolTip("右列: coin画面の獲得コイン・獲得スコア（読取・学習用保存）")
+                elif mode_id == _VIDEO_TOOL_MODE_RESULT:
+                    btn.setToolTip("右列: result画面の4項目（読取・学習用保存）")
                 else:
-                    btn.setToolTip("右列を空にする（未割当）")
+                    btn.setEnabled(False)
+                    btn.setToolTip("未割当")
                 btn_row_layout.addWidget(btn)
-                self._video_tool_mode_group.addButton(btn, i + 1)
+                self._video_tool_mode_group.addButton(btn, mode_id)
             self._video_tool_mode_group.idClicked.connect(self._on_video_tool_quick_mode_clicked)
             first_mode = self._video_tool_mode_group.button(1)
             if first_mode is not None:
@@ -3065,7 +3799,7 @@ class MainWindow(QMainWindow):
             if doc is not None and hasattr(doc, "setMaximumBlockCount"):
                 doc.setMaximumBlockCount(12000)
             self.counter_frame = QFrame()
-            self.counter_frame.setFixedHeight(102)
+            self.counter_frame.setFixedHeight(178)
             self.counter_frame.setStyleSheet("border: none; background: transparent;")
             counter_layout = QVBoxLayout(self.counter_frame)
             counter_layout.setContentsMargins(0, 0, 0, 0)
@@ -3075,6 +3809,11 @@ class MainWindow(QMainWindow):
             self.counter_fever_count_label = QLabel("fever回数: 0")
             self.counter_skill_count_label = QLabel("スキル回数: 0")
             self.counter_coin_gain_label = QLabel("獲得コイン: --")
+            self.counter_score_gain_label = QLabel("獲得スコア: --")
+            self.counter_result_score_label = QLabel("最終スコア: --")
+            self.counter_score_bonus_label = QLabel("スコアボーナス: --")
+            self.counter_result_exp_label = QLabel("獲得EXP: --")
+            self.counter_result_coin_label = QLabel("最終コイン: --")
             self.counter_round_timing_label = QLabel("go→timeup -- / go→result --")
             self.counter_analysis_state_label = QLabel("解析状態: 停止")
             self.counter_progress_label = QLabel("進行: --")
@@ -3083,6 +3822,11 @@ class MainWindow(QMainWindow):
             counter_layout.addWidget(self.counter_fever_count_label)
             counter_layout.addWidget(self.counter_skill_count_label)
             counter_layout.addWidget(self.counter_coin_gain_label)
+            counter_layout.addWidget(self.counter_score_gain_label)
+            counter_layout.addWidget(self.counter_result_score_label)
+            counter_layout.addWidget(self.counter_score_bonus_label)
+            counter_layout.addWidget(self.counter_result_exp_label)
+            counter_layout.addWidget(self.counter_result_coin_label)
             counter_layout.addWidget(self.counter_round_timing_label)
             counter_layout.addWidget(self.counter_analysis_state_label)
             counter_layout.addWidget(self.counter_progress_label)
@@ -3494,6 +4238,14 @@ class MainWindow(QMainWindow):
                 self._on_train_save_coin_digit_only_clicked
             )
             train_page_layout.addWidget(self.train_coin_digit_save_button)
+            self.train_result_digit_save_button = QPushButton("結果桁 CNN だけ保存")
+            self.train_result_digit_save_button.setToolTip(
+                "シーン CNN を再学習せず result_digit.pt のみ作成（リザルト4項目 DL 用）"
+            )
+            self.train_result_digit_save_button.clicked.connect(
+                self._on_train_save_result_digit_only_clicked
+            )
+            train_page_layout.addWidget(self.train_result_digit_save_button)
             skill_save_only_btn = QPushButton("スキル・使用ツムだけ再学習")
             skill_save_only_btn.setToolTip("シーンを触らず use_tsum / skill モデルだけ更新")
             skill_save_only_btn.clicked.connect(self._on_train_skill_only_clicked)
@@ -5287,9 +6039,9 @@ class MainWindow(QMainWindow):
                 self._train_log(f"保存スキップ: {key} 切り抜き画像が空です。")
                 continue
 
-            if key == "coin_gain":
+            if key in {"coin_gain", "score_gain", *_RESULT_GAIN_CROP_KEYS}:
                 self._train_log(
-                    "保存スキップ: 獲得コインは動画ツール3（獲得コイン学習）を使ってください。"
+                    "保存スキップ: 数値読取は「コイン」「結果」で学習用保存してください。"
                 )
                 continue
 
@@ -5819,6 +6571,13 @@ class MainWindow(QMainWindow):
                 and not frame_image.isNull()
             ):
                 self._update_coin_gain_capture(frame_image, scene=coin_ocr_scene)
+            if (
+                self.flow_phase == "WAIT_RESULT"
+                and not self._result_confirmed_this_game
+                and frame_image is not None
+                and not frame_image.isNull()
+            ):
+                self._update_result_gain_capture(frame_image)
             skill_tsum_dir = (
                 self._resolve_tsum_dir(self.locked_use_tsum) if self.locked_item_fixed else use_tsum_dir
             )
@@ -6743,7 +7502,7 @@ class MainWindow(QMainWindow):
             if result_detected and self._can_detect_scene_once_per_game("result", phase):
                 scene = "result"
                 if not self._analysis_scene_confirm_enabled("result"):
-                    self._confirm_result_detection(position_ms)
+                    self._confirm_result_detection(position_ms, frame_image)
 
         if hasattr(self, "counter_analysis_state_label"):
             self.counter_analysis_state_label.setText(f"解析状態: G{self.flow_game_index} {self.flow_phase}")
@@ -6939,7 +7698,7 @@ class MainWindow(QMainWindow):
         elif confirm_label == "coin":
             self._acknowledge_coin_scene(frame_image)
         elif confirm_label == "result":
-            self._confirm_result_detection(position_ms)
+            self._confirm_result_detection(position_ms, frame_image)
         elif confirm_label == "fever":
             self._register_fever_count(position_ms)
         elif confirm_label == "item":
@@ -7420,7 +8179,14 @@ class MainWindow(QMainWindow):
         for target, rect in positions.items():
             if not isinstance(rect, list) or len(rect) != 4:
                 continue
-            if target in {"use_tsum", "skill", "coin_gain", "remaining_time"}:
+            if target in {
+                "use_tsum",
+                "skill",
+                "coin_gain",
+                "score_gain",
+                "remaining_time",
+                *_RESULT_GAIN_CROP_KEYS,
+            }:
                 continue
             try:
                 nx, ny, nw, nh = float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])
@@ -7897,6 +8663,41 @@ class MainWindow(QMainWindow):
         self.train_thread = threading.Thread(target=run_coin_save, daemon=True)
         self.train_thread.start()
 
+    def _on_train_save_result_digit_only_clicked(self) -> None:
+        if self.train_busy:
+            self._train_log("学習・保存処理中です。完了後に実行してください。")
+            return
+        self.train_busy = True
+        self._train_busy_task = "result_digit"
+        self.train_started_at = time.time()
+        self._set_train_ui_state(status_text="状態: 結果桁 CNN 学習・保存中...")
+        bar = getattr(self, "train_progress_bar", None)
+        if bar is not None and _is_alive_qobject(bar):
+            bar.setStyleSheet("")
+            bar.setRange(0, 0)
+            bar.setFormat("結果桁 CNN 学習・保存中…")
+            bar.setVisible(True)
+        self._train_log("結果桁 CNN の学習・保存を開始します…")
+        self.train_poll_timer.start()
+        model_version = self._selected_analysis_model_version()
+
+        def run_result_save() -> None:
+            q = self.train_message_queue
+            emit = lambda msg: q.put(msg)
+            try:
+                self.trainer.save_result_digit_only(emit, version=model_version)
+                from app.services.result_digit_cnn import reload_result_digit_classifier
+
+                reload_result_digit_classifier()
+                acc = float(getattr(self.trainer, "result_digit_val_accuracy", 0.0))
+                emit(f"結果桁 CNN を解析に反映しました（検証精度 {acc:.1%}）。")
+                q.put("__SAVE_DONE__")
+            except Exception as exc:
+                q.put(f"__SAVE_ERROR__:{exc}")
+
+        self.train_thread = threading.Thread(target=run_result_save, daemon=True)
+        self.train_thread.start()
+
     def _flash_train_save_complete(self, label: str = "保存完了") -> None:
         """保存成功をプログレスバーで明示してから消す。"""
         bar = getattr(self, "train_progress_bar", None)
@@ -7992,6 +8793,16 @@ class MainWindow(QMainWindow):
                         status_text=f"状態: コイン桁 CNN 保存完了 ({elapsed}s)"
                     )
                     self._flash_train_save_complete("コイン桁 CNN 保存完了")
+                elif task == "result_digit":
+                    acc = float(getattr(self.trainer, "result_digit_val_accuracy", 0.0))
+                    self._train_log(
+                        f"=== 結果桁 CNN の学習・保存が完了しました === "
+                        f"所要 {elapsed}s / 検証精度 {acc:.1%}"
+                    )
+                    self._set_train_ui_state(
+                        status_text=f"状態: 結果桁 CNN 保存完了 ({elapsed}s)"
+                    )
+                    self._flash_train_save_complete("結果桁 CNN 保存完了")
                 else:
                     self._train_log(f"モデル保存が完了しました。所要時間: {elapsed}s")
                     self._set_train_ui_state(status_text=f"状態: モデル保存完了 ({elapsed}s)")
@@ -8007,6 +8818,9 @@ class MainWindow(QMainWindow):
                 if task == "coin_digit":
                     self._train_log(f"コイン桁 CNN 保存エラー: {err}")
                     self._set_train_ui_state(status_text="状態: コイン桁 CNN 保存失敗")
+                elif task == "result_digit":
+                    self._train_log(f"結果桁 CNN 保存エラー: {err}")
+                    self._set_train_ui_state(status_text="状態: 結果桁 CNN 保存失敗")
                 else:
                     self._train_log(f"モデル保存エラー: {err}")
                     self._set_train_ui_state(status_text="状態: 保存失敗")
