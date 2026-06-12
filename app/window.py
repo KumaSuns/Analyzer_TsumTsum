@@ -698,6 +698,7 @@ class MainWindow(QMainWindow):
         self.train_message_queue: queue.Queue[str] = queue.Queue()
         self.train_thread: Optional[threading.Thread] = None
         self.train_busy = False
+        self._train_busy_task = ""
         self._scene_refit_busy = False
         self.train_started_at = 0.0
         self._trainer_scene_dirty = False
@@ -3485,12 +3486,14 @@ class MainWindow(QMainWindow):
             skill_train_hint.setWordWrap(True)
             skill_train_hint.setStyleSheet("color: #444;")
             train_page_layout.addWidget(skill_train_hint)
-            coin_digit_save_btn = QPushButton("コイン桁 CNN だけ保存")
-            coin_digit_save_btn.setToolTip(
+            self.train_coin_digit_save_button = QPushButton("コイン桁 CNN だけ保存")
+            self.train_coin_digit_save_button.setToolTip(
                 "シーン CNN を再学習せず coin_digit.pt のみ作成（獲得コイン DL 用）"
             )
-            coin_digit_save_btn.clicked.connect(self._on_train_save_coin_digit_only_clicked)
-            train_page_layout.addWidget(coin_digit_save_btn)
+            self.train_coin_digit_save_button.clicked.connect(
+                self._on_train_save_coin_digit_only_clicked
+            )
+            train_page_layout.addWidget(self.train_coin_digit_save_button)
             skill_save_only_btn = QPushButton("スキル・使用ツムだけ再学習")
             skill_save_only_btn.setToolTip("シーンを触らず use_tsum / skill モデルだけ更新")
             skill_save_only_btn.clicked.connect(self._on_train_skill_only_clicked)
@@ -7805,13 +7808,14 @@ class MainWindow(QMainWindow):
             return
 
         self.train_busy = True
+        self._train_busy_task = "model_save"
         self.train_started_at = time.time()
         self._set_train_ui_state(status_text="状態: モデル保存中...")
         bar = getattr(self, "train_progress_bar", None)
         if bar is not None and _is_alive_qobject(bar):
             bar.setStyleSheet("")
             bar.setRange(0, 0)
-            bar.setFormat("保存中…")
+            bar.setFormat("モデル保存中…")
             bar.setVisible(True)
         self._train_log("モデル保存をバックグラウンドで開始します…")
         self.train_poll_timer.start()
@@ -7863,13 +7867,14 @@ class MainWindow(QMainWindow):
             self._train_log("学習・保存処理中です。完了後に実行してください。")
             return
         self.train_busy = True
+        self._train_busy_task = "coin_digit"
         self.train_started_at = time.time()
-        self._set_train_ui_state(status_text="状態: コイン桁保存中...")
+        self._set_train_ui_state(status_text="状態: コイン桁 CNN 学習・保存中...")
         bar = getattr(self, "train_progress_bar", None)
         if bar is not None and _is_alive_qobject(bar):
             bar.setStyleSheet("")
             bar.setRange(0, 0)
-            bar.setFormat("コイン桁保存中…")
+            bar.setFormat("コイン桁 CNN 学習・保存中…")
             bar.setVisible(True)
         self._train_log("コイン桁 CNN の学習・保存を開始します…")
         self.train_poll_timer.start()
@@ -7883,7 +7888,8 @@ class MainWindow(QMainWindow):
                 from app.services.coin_digit_cnn import reload_coin_digit_classifier
 
                 reload_coin_digit_classifier()
-                emit("コイン桁 CNN を解析に反映しました。")
+                acc = float(getattr(self.trainer, "coin_digit_val_accuracy", 0.0))
+                emit(f"コイン桁 CNN を解析に反映しました（検証精度 {acc:.1%}）。")
                 q.put("__SAVE_DONE__")
             except Exception as exc:
                 q.put(f"__SAVE_ERROR__:{exc}")
@@ -7891,13 +7897,13 @@ class MainWindow(QMainWindow):
         self.train_thread = threading.Thread(target=run_coin_save, daemon=True)
         self.train_thread.start()
 
-    def _flash_train_save_complete(self) -> None:
+    def _flash_train_save_complete(self, label: str = "保存完了") -> None:
         """保存成功をプログレスバーで明示してから消す。"""
         bar = getattr(self, "train_progress_bar", None)
         if bar is not None and _is_alive_qobject(bar):
             bar.setRange(0, 100)
             bar.setValue(100)
-            bar.setFormat("保存完了")
+            bar.setFormat(label)
             bar.setStyleSheet("QProgressBar::chunk { background-color: #66BB6A; }")
             bar.setVisible(True)
         QTimer.singleShot(3200, self._reset_train_progress_bar)
@@ -7974,17 +7980,36 @@ class MainWindow(QMainWindow):
                 self.train_busy = False
                 self.train_poll_timer.stop()
                 elapsed = int(max(0.0, time.time() - self.train_started_at))
-                self._train_log(f"モデル保存が完了しました。所要時間: {elapsed}s")
-                self._set_train_ui_state(status_text=f"状態: モデル保存完了 ({elapsed}s)")
-                self._flash_train_save_complete()
+                task = getattr(self, "_train_busy_task", "")
+                self._train_busy_task = ""
+                if task == "coin_digit":
+                    acc = float(getattr(self.trainer, "coin_digit_val_accuracy", 0.0))
+                    self._train_log(
+                        f"=== コイン桁 CNN の学習・保存が完了しました === "
+                        f"所要 {elapsed}s / 検証精度 {acc:.1%}"
+                    )
+                    self._set_train_ui_state(
+                        status_text=f"状態: コイン桁 CNN 保存完了 ({elapsed}s)"
+                    )
+                    self._flash_train_save_complete("コイン桁 CNN 保存完了")
+                else:
+                    self._train_log(f"モデル保存が完了しました。所要時間: {elapsed}s")
+                    self._set_train_ui_state(status_text=f"状態: モデル保存完了 ({elapsed}s)")
+                    self._flash_train_save_complete("モデル保存完了")
                 self._refresh_train_dataset_advice()
                 continue
             if msg.startswith("__SAVE_ERROR__:"):
                 self.train_busy = False
                 self.train_poll_timer.stop()
                 err = msg.split(":", 1)[1] if ":" in msg else msg
-                self._train_log(f"モデル保存エラー: {err}")
-                self._set_train_ui_state(status_text="状態: 保存失敗")
+                task = getattr(self, "_train_busy_task", "")
+                self._train_busy_task = ""
+                if task == "coin_digit":
+                    self._train_log(f"コイン桁 CNN 保存エラー: {err}")
+                    self._set_train_ui_state(status_text="状態: コイン桁 CNN 保存失敗")
+                else:
+                    self._train_log(f"モデル保存エラー: {err}")
+                    self._set_train_ui_state(status_text="状態: 保存失敗")
                 self._reset_train_progress_bar()
                 continue
             if msg == "__DEDUP_DONE__":
@@ -8035,6 +8060,8 @@ class MainWindow(QMainWindow):
             self.train_stop_button.setEnabled(self.train_busy)
         if hasattr(self, "train_dedup_button"):
             self.train_dedup_button.setEnabled(not self.train_busy)
+        if hasattr(self, "train_coin_digit_save_button"):
+            self.train_coin_digit_save_button.setEnabled(not self.train_busy)
         if hasattr(self, "train_status_label"):
             if status_text is not None:
                 self.train_status_label.setText(status_text)
@@ -8044,7 +8071,12 @@ class MainWindow(QMainWindow):
         if bar is not None and _is_alive_qobject(bar) and self.train_busy:
             bar.setRange(0, 0)
             status = self.train_status_label.text() if hasattr(self, "train_status_label") else ""
-            bar.setFormat("保存中…" if "保存" in status else "学習処理中…")
+            if "コイン桁" in status:
+                bar.setFormat("コイン桁 CNN 学習・保存中…")
+            elif "保存" in status:
+                bar.setFormat("保存中…")
+            else:
+                bar.setFormat("学習処理中…")
             bar.setVisible(True)
 
     def _on_create_use_tsum_clicked(self) -> None:

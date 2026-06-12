@@ -145,16 +145,20 @@ class SimpleTrainer:
         from app.services.coin_digit_cnn import (
             CoinDigitCnnClassifier,
             build_digit_training_samples,
+            evaluate_saved_crop_reads,
         )
 
         log("コイン桁 CNN を学習します…")
         try:
             train_samples, val_samples = build_digit_training_samples(log=log)
             clf = CoinDigitCnnClassifier()
-            acc = clf.train_from_samples(train_samples, val_samples, log=log)
+            acc = clf.train_from_samples(
+                train_samples, val_samples, epochs=48, log=log
+            )
             self.coin_digit_cnn = clf
             self.coin_digit_val_accuracy = acc
-            log(f"コイン桁 CNN 検証精度: {acc:.3f}")
+            log(f"コイン桁 CNN 桁パッチ検証精度: {acc:.3f}")
+            evaluate_saved_crop_reads(clf, log=log)
             return True
         except Exception as exc:
             log(f"コイン桁 CNN 学習失敗: {exc}")

@@ -289,10 +289,14 @@ def build_digit_training_samples(
         )
 
     train: List[Tuple[np.ndarray, int]] = []
-    for patch, digit in saved_train:
-        train.append((patch, digit))
-        train.append((_augment_patch(patch, rng), digit))
-    val: List[Tuple[np.ndarray, int]] = list(saved_val)
+    real_patches = saved_train + saved_val
+    for patch, digit in real_patches:
+        for _ in range(6):
+            train.append(
+                (patch, digit) if _ == 0 else (_augment_patch(patch, rng), digit)
+            )
+    # 早期終了用 val は合成のみ（実機 val パッチだと精度が不安定になりやすい）
+    val: List[Tuple[np.ndarray, int]] = []
 
     ref_path = _assets_root() / "images" / "coin_hud_ref_5395.png"
     ref_patches = _extract_ref_digit_patches(ref_path) if ref_path.exists() else {}
@@ -306,11 +310,11 @@ def build_digit_training_samples(
         target_train_per_digit = per_digit
         target_val_per_digit = max(20, per_digit // 5)
     elif usable < 10:
-        target_train_per_digit = max(24, per_digit // 3)
-        target_val_per_digit = max(8, per_digit // 10)
+        target_train_per_digit = max(32, per_digit // 2)
+        target_val_per_digit = max(16, per_digit // 8)
     else:
-        target_train_per_digit = max(12, per_digit // 16)
-        target_val_per_digit = max(4, per_digit // 24)
+        target_train_per_digit = max(32, per_digit // 8)
+        target_val_per_digit = max(24, per_digit // 8)
 
     for digit in range(10):
         refs = ref_patches.get(digit, []) + wide_patches.get(digit, [])
@@ -335,12 +339,49 @@ def build_digit_training_samples(
             val.append((patch, digit))
     rng.shuffle(train)
     rng.shuffle(val)
-    real_n = raw_patch_n + sum(1 for _ in saved_train)
+    real_n = len(real_patches) * 6
     _log(
         f"コイン桁 学習構成: train={len(train)} val={len(val)} "
-        f"(実機由来≈{real_n / max(1, len(train)):.0%} of train)"
+        f"(実機由来~{real_n / max(1, len(train)):.0%} of train, val=合成のみ)"
     )
     return train, val
+
+
+def evaluate_saved_crop_reads(
+    clf: "CoinDigitCnnClassifier",
+    *,
+    assets_root: Optional[Path] = None,
+    log: Optional[Callable[[str], None]] = None,
+) -> tuple[int, int]:
+    """保存 crop の桁パッチ分類一致数（学習直後の in-memory モデル向け）。"""
+    from app.services.coin_digit_dataset import (
+        extract_digit_patches_from_crop,
+        iter_saved_labeled_crops,
+    )
+
+    def _log(msg: str) -> None:
+        if log:
+            log(msg)
+
+    if not clf.is_loaded():
+        return 0, 0
+    ok = total = 0
+    for _split, path, label in iter_saved_labeled_crops(assets_root):
+        patches = extract_digit_patches_from_crop(path, label)
+        if not patches:
+            continue
+        total += 1
+        match = True
+        for patch, digit in patches:
+            probs = clf.predict_probs(patch)
+            if probs is None or int(probs.argmax()) != digit:
+                match = False
+                break
+        if match:
+            ok += 1
+    if total:
+        _log(f"コイン桁 保存 crop 桁一致: {ok}/{total} ({ok / total:.0%})")
+    return ok, total
 
 
 class CoinDigitCnnClassifier:
@@ -360,6 +401,7 @@ class CoinDigitCnnClassifier:
         epochs: int = 24,
         batch_size: int = 64,
         lr: float = 1e-3,
+        finetune: bool = True,
         log: Optional[Callable[[str], None]] = None,
     ) -> float:
         if not _TORCH_OK:
@@ -380,10 +422,27 @@ class CoinDigitCnnClassifier:
         )
 
         net = SmallDigitCNN(NUM_CLASSES).to(self.device)
-        opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
+        init_loaded = False
+        if finetune:
+            if self.is_loaded() and self.model is not None:
+                net.load_state_dict(self.model.state_dict())
+                init_loaded = True
+            else:
+                init_path = default_coin_digit_model_path()
+                if init_path.exists():
+                    tmp = CoinDigitCnnClassifier()
+                    if tmp.load(init_path):
+                        net.load_state_dict(tmp.model.state_dict())  # type: ignore[union-attr]
+                        init_loaded = True
+        train_lr = min(lr, 2e-4) if init_loaded else lr
+        if init_loaded:
+            _log(f"コイン桁 CNN: 既存モデルから fine-tune (lr={train_lr:g})")
+        opt = torch.optim.Adam(net.parameters(), lr=train_lr, weight_decay=1e-4)
         loss_fn = nn.CrossEntropyLoss()
         best_acc = 0.0
         best_state = None
+        best_real_acc = -1.0
+        best_real_state = None
 
         for epoch in range(1, epochs + 1):
             net.train()
@@ -414,13 +473,32 @@ class CoinDigitCnnClassifier:
                 val_acc = correct / max(1, total)
                 if val_acc >= best_acc:
                     best_acc = val_acc
-                    best_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+                    best_state = {
+                        k: v.detach().cpu().clone() for k, v in net.state_dict().items()
+                    }
+            if epoch == epochs or epoch % 8 == 0:
+                self.model = net.eval()
+                ok, total = evaluate_saved_crop_reads(self, log=None)
+                real_acc = ok / max(1, total)
+                if real_acc > best_real_acc:
+                    best_real_acc = real_acc
+                    best_real_state = {
+                        k: v.detach().cpu().clone() for k, v in net.state_dict().items()
+                    }
             _log(
                 f"coin_digit epoch {epoch}/{epochs} loss={total_loss / max(1, n_batches):.4f}"
                 + (f" val_acc={val_acc:.3f}" if val_loader else "")
+                + (
+                    f" crop_acc={best_real_acc:.0%}"
+                    if best_real_acc >= 0
+                    else ""
+                )
             )
 
-        if best_state is not None:
+        if best_real_state is not None and best_real_acc > 0:
+            net.load_state_dict(best_real_state)
+            _log(f"コイン桁 CNN: 保存 crop 一致率最高 checkpoint を採用 ({best_real_acc:.0%})")
+        elif best_state is not None:
             net.load_state_dict(best_state)
         net.eval()
         self.model = net

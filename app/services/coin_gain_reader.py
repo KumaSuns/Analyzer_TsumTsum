@@ -1149,18 +1149,24 @@ def _game_hud_ref_templates() -> dict[int, List[np.ndarray]]:
 def _patch_digit_errors(patch: np.ndarray) -> List[float]:
     """各桁 0-9 の DL 分類誤差（coin_digit CNN + HUD テンプレ補助）。"""
     cnn_errs: Optional[List[float]] = None
+    cnn_conf: Optional[float] = None
     if _coin_digit_cnn_ready():
         try:
             from app.services.coin_digit_cnn import get_coin_digit_classifier
 
             cnn = get_coin_digit_classifier()
             if cnn.is_loaded():
-                cnn_errs = cnn.digit_errors(patch)
+                probs = cnn.predict_probs(patch)
+                if probs is not None:
+                    cnn_errs = cnn.digit_errors(patch)
+                    cnn_conf = float(probs.max())
         except Exception:
             pass
     synth_errs = _synth_digit_errors(patch)
     if cnn_errs is None:
         return synth_errs
+    if cnn_conf is not None and cnn_conf >= 0.42:
+        return cnn_errs
     out: List[float] = []
     for digit in range(10):
         cnn_e = cnn_errs[digit]
@@ -1883,6 +1889,47 @@ def _hud_digit_row_gray(gray: np.ndarray) -> Optional[np.ndarray]:
     return row[:, x0:x1]
 
 
+def _decode_hud_greedy_cnn(
+    parts: List[np.ndarray], tag: str
+) -> Optional[Tuple[int, float, str]]:
+    """各パッチの CNN argmax をそのまま採用（分割が合っていれば最も安定）。"""
+    if not _coin_digit_cnn_ready():
+        return None
+    from app.services.coin_digit_cnn import get_coin_digit_classifier
+
+    cnn = get_coin_digit_classifier()
+    if not cnn.is_loaded():
+        return None
+    n = len(parts)
+    if n < _MIN_DIGITS or n > _MAX_DIGITS:
+        return None
+    digits: List[int] = []
+    err_sum = 0.0
+    min_conf = 1.0
+    for part in parts:
+        probs = cnn.predict_probs(part)
+        if probs is None:
+            return None
+        d = int(probs.argmax())
+        conf = float(probs[d])
+        if conf < 0.22:
+            return None
+        min_conf = min(min_conf, conf)
+        digits.append(d)
+        err_sum += 1.0 - conf
+    value = _digits_to_value(digits)
+    if not plausible_coin_value(value) or _suspicious_coin_value(value):
+        return None
+    if len(str(value)) != n:
+        return None
+    mean_err = (err_sum / float(n)) * 100.0
+    if mean_err > 78.0:
+        return None
+    bonus = 28.0 if tag == "comma" and n in (4, 5) else 18.0 if n == 4 else 10.0
+    bonus += min_conf * 12.0
+    return value, mean_err - bonus, f"greedy n={n} {tag}"
+
+
 def _decode_hud_n_parts_cnn(
     parts: List[np.ndarray], tag: str
 ) -> Optional[Tuple[int, float, str]]:
@@ -1936,6 +1983,9 @@ def _try_hud_digit_decode(gray: np.ndarray) -> Optional[Tuple[int, float, str]]:
     decoded_list: List[Tuple[int, float, str]] = []
     for n in try_ns:
         for parts, tag in _hud_split_n_digit_variants(row, n):
+            greedy = _decode_hud_greedy_cnn(parts, tag)
+            if greedy is not None:
+                decoded_list.append(greedy)
             decoded = _decode_hud_n_parts_cnn(parts, tag)
             if decoded is None:
                 continue
@@ -1944,9 +1994,15 @@ def _try_hud_digit_decode(gray: np.ndarray) -> Optional[Tuple[int, float, str]]:
         return None
 
     def _pick_key(item: Tuple[int, float, str]) -> tuple:
-        tag = item[2].rsplit(" ", 1)[-1] if item[2] else ""
-        tag_order = {"comma": 0, "valley": 1, "ratio": 2, "ref": 3}.get(tag, 9)
-        return (item[1], tag_order, -len(str(item[0])), item[0])
+        val, err, dbg = item
+        n = len(str(val))
+        tag = dbg.rsplit(" ", 1)[-1] if dbg else ""
+        is_greedy = dbg.startswith("greedy")
+        tag_order = {"comma": 0, "ref": 1, "valley": 2, "ratio": 3}.get(tag, 9)
+        if is_greedy:
+            tag_order = 0
+        digit_pref = 0.0 if 4 <= n <= 6 else 6.0
+        return (err + digit_pref, tag_order, -n, -val)
 
     return min(decoded_list, key=_pick_key)
 
@@ -2005,19 +2061,35 @@ def read_coin_gain_crop(roi: QImage) -> Tuple[Optional[int], float, str]:
         return None, 1e9, "gray失敗"
     bgr = qimage_to_bgr(roi)
     candidates: List[Tuple[int, float, str]] = []
-    strip_hud = _try_hud_digit_decode(_coin_gain_strip_for_hud(gray, bgr))
-    if strip_hud is not None:
-        _append_decode_candidate(
-            candidates, strip_hud[0], strip_hud[1], f"crop {strip_hud[2]}", bonus=-32.0
-        )
     row_hud = _try_hud_digit_decode(gray)
     if row_hud is not None:
         _append_decode_candidate(
-            candidates, row_hud[0], row_hud[1], f"crop {row_hud[2]}", bonus=-30.0
+            candidates, row_hud[0], row_hud[1], f"crop {row_hud[2]}", bonus=-36.0
+        )
+    prepared_full, _ = _upscale_gray_for_hud(gray, bgr)
+    full_hud = _try_hud_digit_decode(prepared_full)
+    if full_hud is not None:
+        _append_decode_candidate(
+            candidates, full_hud[0], full_hud[1], f"crop {full_hud[2]}", bonus=-34.0
+        )
+    strip_hud = _try_hud_digit_decode(_coin_gain_strip_for_hud(gray, bgr))
+    if strip_hud is not None:
+        _append_decode_candidate(
+            candidates, strip_hud[0], strip_hud[1], f"crop {strip_hud[2]}", bonus=-26.0
         )
     if not candidates:
         return None, 1e9, "crop_dl失敗"
     ranked = sorted(candidates, key=_candidate_rank_item)
+    if len(ranked) >= 2:
+        top_val, top_err, top_dbg = ranked[0]
+        alt_val, alt_err, alt_dbg = ranked[1]
+        if (
+            str(top_val).startswith("6")
+            and not str(alt_val).startswith("6")
+            and len(str(top_val)) == len(str(alt_val))
+            and alt_err <= top_err + 18.0
+        ):
+            ranked = [ranked[1], ranked[0]] + ranked[2:]
     acceptable = [
         cand
         for cand in ranked
