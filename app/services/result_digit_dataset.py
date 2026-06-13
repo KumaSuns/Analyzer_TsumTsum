@@ -165,8 +165,10 @@ def _patches_from_gray_source(
 def extract_digit_patches_from_crop(
     crop_path: Path, value: int
 ) -> List[Tuple[np.ndarray, int]] | None:
-    from app.services.coin_gain_reader import _coin_gain_strip_for_hud
-    from app.services.result_gain_reader import patches_decode_context_for_value
+    from app.services.result_gain_reader import (
+        _result_gray_sources,
+        patches_decode_context_for_value,
+    )
 
     if not any(spec.plausible(value) for spec in RESULT_GAIN_FIELDS):
         return None
@@ -176,14 +178,10 @@ def extract_digit_patches_from_crop(
     bgr = _imread_crop(crop_path, cv2.IMREAD_COLOR)
     candidates: List[tuple[List[Tuple[np.ndarray, int]], float]] = []
     with patches_decode_context_for_value(value):
-        strip = _coin_gain_strip_for_hud(gray, bgr)
-        if strip is not None and strip.size > 0:
-            patches, score = _patches_from_gray_source(strip, value)
+        for src in _result_gray_sources(gray, bgr):
+            patches, score = _patches_from_gray_source(src, value)
             if patches is not None:
                 candidates.append((patches, score))
-        patches, score = _patches_from_gray_source(gray, value)
-        if patches is not None:
-            candidates.append((patches, score))
     if not candidates:
         return None
     return min(candidates, key=lambda item: item[1])[0]

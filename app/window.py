@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QLabel,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLineEdit,
@@ -594,6 +595,31 @@ class AspectFitVideoContainer(QWidget):
         return QRect(x, y, w, h)
 
 
+_TRAIN_ACTION_META: dict[str, dict[str, str]] = {
+    "coin_digit": {
+        "title": "コイン桁 CNN だけ保存",
+        "subtitle": "獲得コイン・獲得スコアの数字読取 → coin_digit.pt",
+        "tooltip": "シーン CNN を再学習せず coin_digit.pt のみ作成（獲得コイン DL 用）",
+        "progress": "コイン桁 CNN 学習・保存中…",
+        "bar_color": "#FFB300",
+    },
+    "result_digit": {
+        "title": "結果桁 CNN だけ保存",
+        "subtitle": "リザルト4項目（最終スコア・ボーナス・経験値・コイン）→ result_digit.pt",
+        "tooltip": "シーン CNN を再学習せず result_digit.pt のみ作成（リザルト4項目 DL 用）",
+        "progress": "結果桁 CNN 学習・保存中…",
+        "bar_color": "#42A5F5",
+    },
+    "skill": {
+        "title": "スキル・使用ツムだけ再学習",
+        "subtitle": "スキル発動判定・使用ツム判定（シーン CNN は触らない）",
+        "tooltip": "シーンを触らず use_tsum / skill モデルだけ更新",
+        "progress": "スキル・使用ツム 再学習中…",
+        "bar_color": "#66BB6A",
+    },
+}
+
+
 class MainWindow(QMainWindow):
     def __init__(self, os_name: str = "", compute_status: str = "") -> None:
         super().__init__()
@@ -947,6 +973,12 @@ class MainWindow(QMainWindow):
             return False
         return group.checkedId() == 4
 
+    def _refresh_video_tool_digit_preview_if_active(self, *, reset_read: bool = False) -> None:
+        if self._is_video_tool_coin_digit_mode():
+            self._refresh_video_tool_coin_digit_preview(reset_read=reset_read)
+        elif self._is_video_tool_result_digit_mode():
+            self._refresh_video_tool_result_digit_preview(reset_read=reset_read)
+
     def _video_tool_digit_frame_image(self) -> Optional[QImage]:
         if (
             self._is_video_tool_coin_digit_mode() or self._is_video_tool_result_digit_mode()
@@ -1053,6 +1085,7 @@ class MainWindow(QMainWindow):
             widgets = self._video_tool_result_fields.get(spec.key, {})
             read_label = widgets.get("read_label")
             value_spin = widgets.get("value_spin")
+            preview = widgets.get("preview")
             if not self._crop_rect_defined(positions, spec.key):
                 if read_label is not None and _is_alive_qobject(read_label):
                     read_label.setText(f"{spec.label}読取: 範囲未設定")
@@ -1062,6 +1095,20 @@ class MainWindow(QMainWindow):
                 if read_label is not None and _is_alive_qobject(read_label):
                     read_label.setText(f"{spec.label}読取: 切り抜き失敗")
                 continue
+            if preview is not None and _is_alive_qobject(preview):
+                pix = QPixmap.fromImage(crop)
+                if pix.isNull():
+                    preview.setText("プレビューなし")
+                    preview.setPixmap(QPixmap())
+                else:
+                    preview.setText("")
+                    preview.setPixmap(
+                        pix.scaled(
+                            preview.size(),
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    )
             val, _err, dbg = read_result_gain_crop(crop, field_key=spec.key)
             if val is not None and spec.plausible(val):
                 any_ok = True
@@ -1079,7 +1126,10 @@ class MainWindow(QMainWindow):
                 status.setText("読取完了。見た目と照合してください。")
             else:
                 status.setStyleSheet("color: #C62828;")
-                status.setText("読取失敗。正解値を手入力して保存できます。")
+                status.setText(
+                    "読取失敗。正解値を手入力→「学習用に保存」→"
+                    "学習タブ「結果桁 CNN だけ保存」で再学習してください。"
+                )
 
     def _on_video_tool_result_field_save_clicked(self, field_key: str) -> None:
         status = getattr(self, "_video_tool_result_status", None)
@@ -3383,20 +3433,26 @@ class MainWindow(QMainWindow):
                 inner_layout.addWidget(QLabel("対象(複数選択)"))
                 self.crop_target_buttons = {}
                 target_grid = QFrame()
-                target_grid_layout = QHBoxLayout(target_grid)
+                target_grid_layout = QGridLayout(target_grid)
                 target_grid_layout.setContentsMargins(0, 0, 0, 0)
-                target_grid_layout.setSpacing(2)
-                for display, key in self.crop_targets:
+                target_grid_layout.setHorizontalSpacing(4)
+                target_grid_layout.setVerticalSpacing(4)
+                cols_per_row = 8
+                for index, (display, key) in enumerate(self.crop_targets):
                     btn = QPushButton(display)
                     btn.setCheckable(True)
-                    btn.setFixedHeight(22)
+                    btn.setFixedHeight(24)
+                    btn.setMinimumWidth(btn.fontMetrics().horizontalAdvance(display) + 14)
+                    btn.setToolTip(display)
                     btn.setStyleSheet(
                         "QPushButton { border:1px solid #888; background:#F5F5F5; padding:0 6px; }"
                         "QPushButton:checked { background:#FFD54F; border:1px solid #C9A227; }"
                     )
                     btn.toggled.connect(self._on_crop_target_selection_changed)
                     self.crop_target_buttons[key] = btn
-                    target_grid_layout.addWidget(btn)
+                    target_grid_layout.addWidget(
+                        btn, index // cols_per_row, index % cols_per_row
+                    )
                 inner_layout.addWidget(target_grid)
                 # Default selection to avoid "saved but no target selected" confusion.
                 if "score" in self.crop_target_buttons:
@@ -4112,146 +4168,145 @@ class MainWindow(QMainWindow):
             self.left_layout.addWidget(QLabel("保存先: app/models/main_model/version_1"))
             self.left_layout.addStretch(1)
 
-            train_page = QFrame()
-            train_page_layout = QVBoxLayout(train_page)
-            train_page_layout.setContentsMargins(12, 12, 12, 12)
-            train_page_layout.setSpacing(8)
-            train_page_layout.addWidget(QLabel("学習ページ (button3)"))
-            data_check_button = QPushButton("データ確認")
-            data_check_button.clicked.connect(self._on_train_data_check_clicked)
-            train_page_layout.addWidget(data_check_button)
+            train_page_content = QWidget()
+            train_page_layout = QVBoxLayout(train_page_content)
+            train_page_layout.setContentsMargins(8, 6, 8, 6)
+            train_page_layout.setSpacing(4)
 
+            data_check_button = QPushButton("データ確認")
+            data_check_button.setFixedHeight(28)
+            data_check_button.clicked.connect(self._on_train_data_check_clicked)
             self.train_shortage_button = QPushButton("不足画像を確認")
+            self.train_shortage_button.setFixedHeight(28)
             self.train_shortage_button.setToolTip(
                 "各シーンクラスの train/val 枚数を見て、"
-                "足りない画像の種類と追加目安を表示します。"
+                "足りない画像の種類と追加目安を右の学習ログに表示します。"
             )
             self.train_shortage_button.clicked.connect(self._on_train_shortage_check_clicked)
-            train_page_layout.addWidget(self.train_shortage_button)
+            data_row = QHBoxLayout()
+            data_row.setSpacing(4)
+            data_row.addWidget(data_check_button, 1)
+            data_row.addWidget(self.train_shortage_button, 1)
+            data_row_w = QWidget()
+            data_row_w.setLayout(data_row)
+            train_page_layout.addWidget(data_row_w)
 
             self.train_data_advice_status = QLabel("データ状況: 未確認")
             self.train_data_advice_status.setWordWrap(True)
-            self.train_data_advice_status.setStyleSheet("color: #333; font-size: 11px;")
+            self.train_data_advice_status.setStyleSheet(
+                "color: #333; font-size: 11px; padding: 4px 6px;"
+                "background: #FAFAFA; border: 1px solid #E0E0E0; border-radius: 4px;"
+            )
             train_page_layout.addWidget(self.train_data_advice_status)
 
-            train_page_layout.addWidget(QLabel("データ状況（不足案内）※下の枠に表示"))
-            self.train_data_advice_view = QTextEdit()
-            self.train_data_advice_view.setReadOnly(True)
-            self.train_data_advice_view.setMinimumHeight(200)
-            self.train_data_advice_view.setPlaceholderText(
-                "ボタンを押すと、この枠と右の学習ログに結果が出ます。"
-            )
-            self.train_data_advice_view.setStyleSheet(
-                "QTextEdit { font-size: 11px; color: #222; background: #FAFAFA; }"
-            )
-            train_page_layout.addWidget(self.train_data_advice_view, 1)
-
             dedup_preview_button = QPushButton("重複確認")
+            dedup_preview_button.setFixedHeight(28)
             dedup_preview_button.setToolTip(
                 "train/val 全体でバイト完全一致の重複を検出します（削除はしません）。"
             )
             dedup_preview_button.clicked.connect(self._on_train_dedup_preview_clicked)
-            train_page_layout.addWidget(dedup_preview_button)
-
             dedup_button = QPushButton("重複削除")
+            dedup_button.setFixedHeight(28)
             dedup_button.setToolTip(
                 "train/val の完全同一画像を1枚にまとめます。"
                 "残す優先: ファイル名とクラス一致 → train → 先に保存した枚。"
             )
             dedup_button.clicked.connect(self._on_train_dedup_clicked)
             self.train_dedup_button = dedup_button
-            train_page_layout.addWidget(dedup_button)
-
-            dataset_review_button = QPushButton("画像レビュー（削除）")
+            dataset_review_button = QPushButton("画像レビュー")
+            dataset_review_button.setFixedHeight(28)
             dataset_review_button.setToolTip(
                 "train/val のシーン画像を1枚ずつ表示し、不要な画像を削除します。"
                 " ← → で移動、Del で削除。CNN 読込時は top1 も表示。"
             )
             dataset_review_button.clicked.connect(self._on_train_dataset_review_clicked)
-            train_page_layout.addWidget(dataset_review_button)
+            tool_row = QHBoxLayout()
+            tool_row.setSpacing(4)
+            tool_row.addWidget(dedup_preview_button, 1)
+            tool_row.addWidget(dedup_button, 1)
+            tool_row.addWidget(dataset_review_button, 1)
+            tool_row_w = QWidget()
+            tool_row_w.setLayout(tool_row)
+            train_page_layout.addWidget(tool_row_w)
 
             train_start_button = QPushButton("学習開始")
+            train_start_button.setFixedHeight(28)
             train_start_button.clicked.connect(self._on_train_start_clicked)
             self.train_start_button = train_start_button
-            train_page_layout.addWidget(train_start_button)
-
             train_stop_button = QPushButton("学習停止")
+            train_stop_button.setFixedHeight(28)
             train_stop_button.clicked.connect(self._on_train_stop_clicked)
             self.train_stop_button = train_stop_button
-            train_page_layout.addWidget(train_stop_button)
-
             train_save_button = QPushButton("モデル保存")
+            train_save_button.setFixedHeight(28)
             train_save_button.clicked.connect(self._on_train_save_clicked)
             self.train_save_button = train_save_button
-            train_page_layout.addWidget(train_save_button)
+            train_row = QHBoxLayout()
+            train_row.setSpacing(4)
+            train_row.addWidget(train_start_button, 1)
+            train_row.addWidget(train_stop_button, 1)
+            train_row.addWidget(train_save_button, 1)
+            train_row_w = QWidget()
+            train_row_w.setLayout(train_row)
+            train_page_layout.addWidget(train_row_w)
+
+            status_row = QHBoxLayout()
+            status_row.setSpacing(6)
             self.train_status_label = QLabel("状態: 待機中")
-            train_page_layout.addWidget(self.train_status_label)
+            status_row.addWidget(self.train_status_label, 1)
             self.train_progress_bar = QProgressBar()
-            self.train_progress_bar.setFixedHeight(14)
+            self.train_progress_bar.setFixedHeight(12)
             self.train_progress_bar.setRange(0, 100)
             self.train_progress_bar.setValue(0)
             self.train_progress_bar.setTextVisible(True)
             self.train_progress_bar.setFormat("")
             self.train_progress_bar.setVisible(False)
-            train_page_layout.addWidget(self.train_progress_bar)
+            status_row.addWidget(self.train_progress_bar, 2)
+            status_row_w = QWidget()
+            status_row_w.setLayout(status_row)
+            train_page_layout.addWidget(status_row_w)
 
-            train_page_layout.addWidget(QLabel("使用ツム登録"))
-            use_tsum_row_1 = QFrame()
-            use_tsum_row_1_layout = QHBoxLayout(use_tsum_row_1)
-            use_tsum_row_1_layout.setContentsMargins(0, 0, 0, 0)
-            use_tsum_row_1_layout.setSpacing(6)
-            use_tsum_row_1_layout.addWidget(QLabel("表示名"))
+            use_tsum_row = QHBoxLayout()
+            use_tsum_row.setSpacing(4)
+            use_tsum_row.addWidget(QLabel("表示名"))
             self.use_tsum_name_input = QLineEdit()
-            self.use_tsum_name_input.setPlaceholderText("例: ナミネ")
-            use_tsum_row_1_layout.addWidget(self.use_tsum_name_input, 1)
-            train_page_layout.addWidget(use_tsum_row_1)
-
-            use_tsum_row_2 = QFrame()
-            use_tsum_row_2_layout = QHBoxLayout(use_tsum_row_2)
-            use_tsum_row_2_layout.setContentsMargins(0, 0, 0, 0)
-            use_tsum_row_2_layout.setSpacing(6)
-            use_tsum_row_2_layout.addWidget(QLabel("dir名"))
+            self.use_tsum_name_input.setPlaceholderText("ナミネ")
+            self.use_tsum_name_input.setFixedHeight(26)
+            use_tsum_row.addWidget(self.use_tsum_name_input, 1)
+            use_tsum_row.addWidget(QLabel("dir"))
             self.use_tsum_dir_input = QLineEdit()
-            self.use_tsum_dir_input.setPlaceholderText("例: namine")
-            use_tsum_row_2_layout.addWidget(self.use_tsum_dir_input, 1)
-            train_page_layout.addWidget(use_tsum_row_2)
-
-            create_use_tsum_button = QPushButton("使用ツム追加")
+            self.use_tsum_dir_input.setPlaceholderText("namine")
+            self.use_tsum_dir_input.setFixedHeight(26)
+            use_tsum_row.addWidget(self.use_tsum_dir_input, 1)
+            create_use_tsum_button = QPushButton("ツム追加")
+            create_use_tsum_button.setFixedHeight(28)
+            create_use_tsum_button.setToolTip(
+                "使用ツムのモデル用フォルダと app/assets/images/use_tsums/<dir>/ を作成"
+            )
             create_use_tsum_button.clicked.connect(self._on_create_use_tsum_clicked)
-            train_page_layout.addWidget(create_use_tsum_button)
+            use_tsum_row.addWidget(create_use_tsum_button)
+            use_tsum_row_w = QWidget()
+            use_tsum_row_w.setLayout(use_tsum_row)
+            train_page_layout.addWidget(use_tsum_row_w)
 
-            train_page_layout.addWidget(QLabel("スキル発動モデル（ツム別）"))
-            skill_train_hint = QLabel(
-                "画像: app/assets/images/skills/<dir>/activation/\n"
-                "「モデル保存」でシーン・コイン桁・使用ツム・スキルをまとめて保存します。"
-                "コイン桁は獲得コイン確定ダイアログの「学習用に保存」で crop を貯めてから"
-                "「コイン桁 CNN だけ保存」（学習開始不要）。"
-            )
-            skill_train_hint.setWordWrap(True)
-            skill_train_hint.setStyleSheet("color: #444;")
-            train_page_layout.addWidget(skill_train_hint)
-            self.train_coin_digit_save_button = QPushButton("コイン桁 CNN だけ保存")
-            self.train_coin_digit_save_button.setToolTip(
-                "シーン CNN を再学習せず coin_digit.pt のみ作成（獲得コイン DL 用）"
-            )
-            self.train_coin_digit_save_button.clicked.connect(
-                self._on_train_save_coin_digit_only_clicked
+            train_models_label = QLabel("個別モデル更新")
+            train_models_label.setStyleSheet("font-weight: bold; font-size: 12px; margin-top: 2px;")
+            train_page_layout.addWidget(train_models_label)
+            self.train_coin_digit_save_button = self._make_train_action_button(
+                "coin_digit", self._on_train_save_coin_digit_only_clicked
             )
             train_page_layout.addWidget(self.train_coin_digit_save_button)
-            self.train_result_digit_save_button = QPushButton("結果桁 CNN だけ保存")
-            self.train_result_digit_save_button.setToolTip(
-                "シーン CNN を再学習せず result_digit.pt のみ作成（リザルト4項目 DL 用）"
-            )
-            self.train_result_digit_save_button.clicked.connect(
-                self._on_train_save_result_digit_only_clicked
+            self.train_result_digit_save_button = self._make_train_action_button(
+                "result_digit", self._on_train_save_result_digit_only_clicked
             )
             train_page_layout.addWidget(self.train_result_digit_save_button)
-            skill_save_only_btn = QPushButton("スキル・使用ツムだけ再学習")
-            skill_save_only_btn.setToolTip("シーンを触らず use_tsum / skill モデルだけ更新")
-            skill_save_only_btn.clicked.connect(self._on_train_skill_only_clicked)
-            train_page_layout.addWidget(skill_save_only_btn)
+            self.train_skill_only_button = self._make_train_action_button(
+                "skill", self._on_train_skill_only_clicked
+            )
+            train_page_layout.addWidget(self.train_skill_only_button)
+            train_page_layout.addStretch(1)
 
-            self.center_layout.addWidget(train_page, 1)
+            self.center_layout.addWidget(train_page_content, 1)
             self._set_train_ui_state()
             self._refresh_train_dataset_advice()
 
@@ -4507,8 +4562,7 @@ class MainWindow(QMainWindow):
         if img is not None and not img.isNull():
             self._cv_push_frame(img)
         self._update_playback_indicators(self._cv_position_ms)
-        if self._is_video_tool_coin_digit_mode():
-            self._refresh_video_tool_coin_digit_preview(reset_read=True)
+        self._refresh_video_tool_digit_preview_if_active(reset_read=True)
 
     def _cv_timer_tick(self) -> None:
         if not getattr(self, "use_opencv_for_video", False) or not self._cv_playing:
@@ -4723,8 +4777,10 @@ class MainWindow(QMainWindow):
             self._cv_seek_and_show(target)
         else:
             self.player.setPosition(target)
-            if self._is_video_tool_coin_digit_mode():
-                QTimer.singleShot(0, lambda: self._refresh_video_tool_coin_digit_preview(reset_read=True))
+            if self._is_video_tool_coin_digit_mode() or self._is_video_tool_result_digit_mode():
+                QTimer.singleShot(
+                    0, lambda: self._refresh_video_tool_digit_preview_if_active(reset_read=True)
+                )
 
     def _step_backward(self, frames: int) -> None:
         if not self._is_player_paused():
@@ -4735,8 +4791,10 @@ class MainWindow(QMainWindow):
             self._cv_seek_and_show(target)
         else:
             self.player.setPosition(target)
-            if self._is_video_tool_coin_digit_mode():
-                QTimer.singleShot(0, lambda: self._refresh_video_tool_coin_digit_preview(reset_read=True))
+            if self._is_video_tool_coin_digit_mode() or self._is_video_tool_result_digit_mode():
+                QTimer.singleShot(
+                    0, lambda: self._refresh_video_tool_digit_preview_if_active(reset_read=True)
+                )
 
     def _read_frame_at_ms(self, ms: int) -> Optional[QImage]:
         if getattr(self, "use_opencv_for_video", False):
@@ -7666,13 +7724,39 @@ class MainWindow(QMainWindow):
 
     def _on_train_skill_only_clicked(self) -> None:
         if self.train_busy:
-            self._train_log("学習中は実行できません。")
+            self._train_log("学習・保存処理中です。完了後に実行してください。")
             return
-        self._train_use_tsum_models()
-        self._train_skill_models()
-        self.skill_classifier_pool.reload()
-        self.video_analyzer.item_skill_classifier.reload()
-        self._train_log("スキル・使用ツムモデルの再学習が完了しました。")
+        self.train_busy = True
+        self._train_busy_task = "skill"
+        self.train_started_at = time.time()
+        self._set_train_ui_state(status_text="状態: スキル・使用ツム 再学習中...")
+        bar = getattr(self, "train_progress_bar", None)
+        if bar is not None and _is_alive_qobject(bar):
+            bar.setStyleSheet(
+                "QProgressBar::chunk { background-color: #66BB6A; }"
+            )
+            bar.setRange(0, 0)
+            bar.setFormat("スキル・使用ツム 再学習中…")
+            bar.setVisible(True)
+        self._train_log("スキル・使用ツムモデルの再学習を開始します…")
+        self.train_poll_timer.start()
+
+        def run_skill() -> None:
+            q = self.train_message_queue
+            emit = lambda msg: q.put(msg)
+            try:
+                emit("使用ツムモデルを更新中…")
+                self._train_use_tsum_models(log=emit)
+                emit("スキルモデルを更新中…")
+                self._train_skill_models(log=emit)
+                self.skill_classifier_pool.reload()
+                self.video_analyzer.item_skill_classifier.reload()
+                q.put("__SKILL_DONE__")
+            except Exception as exc:
+                q.put(f"__SKILL_ERROR__:{exc}")
+
+        self.train_thread = threading.Thread(target=run_skill, daemon=True)
+        self.train_thread.start()
 
     def _clear_analysis_confirm_edge_prefix(self, prefix: str) -> None:
         key = getattr(self, "_analysis_confirm_edge_key", "")
@@ -8365,11 +8449,11 @@ class MainWindow(QMainWindow):
     def _refresh_train_dataset_advice(
         self, *, log_result: bool = False
     ) -> tuple[bool, object, object]:
-        """データ状況パネルを更新。 (成功, summary, report) を返す。"""
+        """データ状況ラベルを更新。詳細は右の学習ログへ。 (成功, summary, report) を返す。"""
         empty_summary = None
         empty_report = None
-        if not hasattr(self, "train_data_advice_view") or not _is_alive_qobject(
-            self.train_data_advice_view
+        if not hasattr(self, "train_data_advice_status") or not _is_alive_qobject(
+            self.train_data_advice_status
         ):
             return False, empty_summary, empty_report
         summary = self.trainer.summarize_dataset()
@@ -8387,37 +8471,30 @@ class MainWindow(QMainWindow):
             else:
                 text += "各ツム 10 枚以上あります。"
         scanned = datetime.now().strftime("%H:%M:%S")
-        header = f"[更新 {scanned}]\n"
-        self.train_data_advice_view.setPlainText(header + text)
-        cursor = self.train_data_advice_view.textCursor()
-        cursor.movePosition(cursor.MoveOperation.Start)
-        self.train_data_advice_view.setTextCursor(cursor)
         if report.has_critical:
-            self.train_data_advice_view.setStyleSheet(
-                "QTextEdit { font-size: 11px; color: #222; background: #FFEBEE; }"
-            )
+            status_bg = "#FFEBEE"
             level = "要対応"
         elif report.shortages:
-            self.train_data_advice_view.setStyleSheet(
-                "QTextEdit { font-size: 11px; color: #222; background: #FFF8E1; }"
-            )
+            status_bg = "#FFF8E1"
             level = "追加推奨あり"
         else:
-            self.train_data_advice_view.setStyleSheet(
-                "QTextEdit { font-size: 11px; color: #222; background: #E8F5E9; }"
-            )
+            status_bg = "#E8F5E9"
             level = "良好"
         n_warn = len([s for s in report.shortages if s.cls != "_balance"])
-        if hasattr(self, "train_data_advice_status") and _is_alive_qobject(
-            self.train_data_advice_status
-        ):
-            self.train_data_advice_status.setText(
-                f"データ状況: {level}（{scanned} 更新）"
-                f" train={summary.train_total} val={summary.val_total}"
-                f" 注意={n_warn}クラス → 下の枠を確認"
-            )
+        self.train_data_advice_status.setStyleSheet(
+            f"color: #333; font-size: 11px; padding: 4px 6px;"
+            f"background: {status_bg}; border: 1px solid #E0E0E0; border-radius: 4px;"
+        )
+        self.train_data_advice_status.setText(
+            f"データ状況: {level}（{scanned}）"
+            f" train={summary.train_total} val={summary.val_total}"
+            f" 注意={n_warn}クラス → 詳細は右の学習ログ"
+        )
         if log_result:
-            self._train_log(f"データ状況パネルを更新しました（{scanned}）。")
+            self._train_log(f"--- データ状況 ({scanned}) ---")
+            for line in text.splitlines():
+                if line.strip():
+                    self._train_log(line)
         return True, summary, report
 
     def _on_train_data_check_clicked(self) -> None:
@@ -8638,7 +8715,9 @@ class MainWindow(QMainWindow):
         self._set_train_ui_state(status_text="状態: コイン桁 CNN 学習・保存中...")
         bar = getattr(self, "train_progress_bar", None)
         if bar is not None and _is_alive_qobject(bar):
-            bar.setStyleSheet("")
+            bar.setStyleSheet(
+                "QProgressBar::chunk { background-color: #FFB300; }"
+            )
             bar.setRange(0, 0)
             bar.setFormat("コイン桁 CNN 学習・保存中…")
             bar.setVisible(True)
@@ -8673,7 +8752,9 @@ class MainWindow(QMainWindow):
         self._set_train_ui_state(status_text="状態: 結果桁 CNN 学習・保存中...")
         bar = getattr(self, "train_progress_bar", None)
         if bar is not None and _is_alive_qobject(bar):
-            bar.setStyleSheet("")
+            bar.setStyleSheet(
+                "QProgressBar::chunk { background-color: #42A5F5; }"
+            )
             bar.setRange(0, 0)
             bar.setFormat("結果桁 CNN 学習・保存中…")
             bar.setVisible(True)
@@ -8826,6 +8907,28 @@ class MainWindow(QMainWindow):
                     self._set_train_ui_state(status_text="状態: 保存失敗")
                 self._reset_train_progress_bar()
                 continue
+            if msg == "__SKILL_DONE__":
+                self.train_busy = False
+                self.train_poll_timer.stop()
+                elapsed = int(max(0.0, time.time() - self.train_started_at))
+                self._train_busy_task = ""
+                self._train_log(
+                    f"=== スキル・使用ツムモデルの再学習が完了しました === 所要 {elapsed}s"
+                )
+                self._set_train_ui_state(
+                    status_text=f"状態: スキル・使用ツム 再学習完了 ({elapsed}s)"
+                )
+                self._flash_train_save_complete("スキル・使用ツム 再学習完了")
+                continue
+            if msg.startswith("__SKILL_ERROR__:"):
+                self.train_busy = False
+                self.train_poll_timer.stop()
+                err = msg.split(":", 1)[1] if ":" in msg else msg
+                self._train_busy_task = ""
+                self._train_log(f"スキル・使用ツム 再学習エラー: {err}")
+                self._set_train_ui_state(status_text="状態: スキル・使用ツム 再学習失敗")
+                self._reset_train_progress_bar()
+                continue
             if msg == "__DEDUP_DONE__":
                 self.train_busy = False
                 self.train_poll_timer.stop()
@@ -8865,6 +8968,86 @@ class MainWindow(QMainWindow):
                 continue
             self._train_log(msg)
 
+    def _make_train_action_button(self, kind: str, handler: Callable[[], None]) -> QPushButton:
+        meta = _TRAIN_ACTION_META[kind]
+        btn = QPushButton(meta["title"])
+        btn.setProperty("train_action_kind", kind)
+        btn.setToolTip(f"{meta['tooltip']}\n{meta['subtitle']}")
+        btn.setFixedHeight(34)
+        btn.clicked.connect(handler)
+        return btn
+
+    def _train_action_button_text(self, kind: str, *, active: bool) -> str:
+        meta = _TRAIN_ACTION_META[kind]
+        if active:
+            return f"{meta['title']}  ▶"
+        return meta["title"]
+
+    def _train_action_button_style(self, kind: str, *, active: bool, enabled: bool) -> str:
+        palettes = {
+            "coin_digit": ("#FFF8E1", "#FFB300", "#E65100", "#FFE082"),
+            "result_digit": ("#E3F2FD", "#42A5F5", "#0D47A1", "#90CAF9"),
+            "skill": ("#E8F5E9", "#66BB6A", "#1B5E20", "#A5D6A7"),
+        }
+        bg, border, text, active_bg = palettes[kind]
+        base = (
+            " padding: 4px 10px; text-align: left;"
+            " border-radius: 4px; font-size: 12px;"
+        )
+        if active:
+            return (
+                f"QPushButton {{"
+                f" background: {active_bg}; color: {text};"
+                f" border: 1px solid {border}; border-left: 5px solid {border};"
+                f" font-weight: bold;{base}"
+                f"}}"
+                f"QPushButton:disabled {{"
+                f" background: {active_bg}; color: {text};"
+                f" border: 1px solid {border}; border-left: 5px solid {border};"
+                f"}}"
+            )
+        if not enabled:
+            return (
+                "QPushButton {"
+                " background: #F5F5F5; color: #9E9E9E; border: 1px solid #E0E0E0;"
+                f"{base}"
+                "}"
+            )
+        hover_bg = {
+            "coin_digit": "#FFECB3",
+            "result_digit": "#BBDEFB",
+            "skill": "#C8E6C9",
+        }[kind]
+        return (
+            f"QPushButton {{"
+            f" background: {bg}; color: {text}; border: 1px solid {border};"
+            f"{base}"
+            f"}}"
+            f"QPushButton:hover {{"
+            f" background: {hover_bg}; border: 2px solid {border};"
+            f" padding: 3px 9px;"
+            f"}}"
+        )
+
+    def _refresh_train_action_buttons(self) -> None:
+        task = getattr(self, "_train_busy_task", "")
+        buttons = (
+            ("coin_digit", getattr(self, "train_coin_digit_save_button", None)),
+            ("result_digit", getattr(self, "train_result_digit_save_button", None)),
+            ("skill", getattr(self, "train_skill_only_button", None)),
+        )
+        for kind, btn in buttons:
+            if btn is None or not _is_alive_qobject(btn):
+                continue
+            active = self.train_busy and task == kind
+            btn.setEnabled(not self.train_busy)
+            btn.setText(self._train_action_button_text(kind, active=active))
+            btn.setStyleSheet(
+                self._train_action_button_style(
+                    kind, active=active, enabled=not self.train_busy
+                )
+            )
+
     def _set_train_ui_state(self, status_text: Optional[str] = None) -> None:
         if hasattr(self, "train_start_button"):
             self.train_start_button.setEnabled(not self.train_busy)
@@ -8874,23 +9057,39 @@ class MainWindow(QMainWindow):
             self.train_stop_button.setEnabled(self.train_busy)
         if hasattr(self, "train_dedup_button"):
             self.train_dedup_button.setEnabled(not self.train_busy)
-        if hasattr(self, "train_coin_digit_save_button"):
-            self.train_coin_digit_save_button.setEnabled(not self.train_busy)
         if hasattr(self, "train_status_label"):
             if status_text is not None:
                 self.train_status_label.setText(status_text)
             else:
                 self.train_status_label.setText("状態: 学習中..." if self.train_busy else "状態: 待機中")
+            if self.train_busy:
+                self.train_status_label.setStyleSheet("color: #1565C0; font-weight: bold;")
+            else:
+                self.train_status_label.setStyleSheet("")
+        self._refresh_train_action_buttons()
         bar = getattr(self, "train_progress_bar", None)
         if bar is not None and _is_alive_qobject(bar) and self.train_busy:
             bar.setRange(0, 0)
             status = self.train_status_label.text() if hasattr(self, "train_status_label") else ""
-            if "コイン桁" in status:
+            task = getattr(self, "_train_busy_task", "")
+            meta = _TRAIN_ACTION_META.get(task)
+            if meta is not None:
+                bar.setFormat(meta["progress"])
+                bar.setStyleSheet(
+                    f"QProgressBar::chunk {{ background-color: {meta['bar_color']}; }}"
+                )
+            elif "コイン桁" in status:
                 bar.setFormat("コイン桁 CNN 学習・保存中…")
+                bar.setStyleSheet("QProgressBar::chunk { background-color: #FFB300; }")
+            elif "結果桁" in status:
+                bar.setFormat("結果桁 CNN 学習・保存中…")
+                bar.setStyleSheet("QProgressBar::chunk { background-color: #42A5F5; }")
             elif "保存" in status:
                 bar.setFormat("保存中…")
+                bar.setStyleSheet("")
             else:
                 bar.setFormat("学習処理中…")
+                bar.setStyleSheet("")
             bar.setVisible(True)
 
     def _on_create_use_tsum_clicked(self) -> None:
