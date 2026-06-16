@@ -605,9 +605,9 @@ _TRAIN_ACTION_META: dict[str, dict[str, str]] = {
     },
     "result_digit": {
         "title": "結果桁 CNN だけ保存",
-        "subtitle": "リザルト4項目（最終スコア・ボーナス・経験値・コイン）→ result_digit.pt",
-        "tooltip": "シーン CNN を再学習せず result_digit.pt のみ作成（リザルト4項目 DL 用）",
-        "progress": "結果桁 CNN 学習・保存中…",
+        "subtitle": "最終獲得コイン（result_coin_gain）→ result_digit.pt",
+        "tooltip": "シーン CNN を再学習せず result_digit.pt のみ作成（最終獲得コイン DL 用）",
+        "progress": "結果コイン CNN 学習・保存中…",
         "bar_color": "#42A5F5",
     },
     "skill": {
@@ -3726,8 +3726,8 @@ class MainWindow(QMainWindow):
                 result_title.setStyleSheet("font-weight: bold; font-size: 14px;")
                 rv.addWidget(result_title)
                 result_hint = QLabel(
-                    "result 画面で4箇所の切り抜きを「トリム」で設定し、"
-                    "「読取」で確認。間違いは正解値を直して各「学習用に保存」。"
+                    "まず最終獲得コインから。result 画面で切り抜きを「トリム」で設定し、"
+                    "「読取」で確認。間違いは正解値を直して「学習用に保存」。"
                     "保存先: app/assets/images/result_digits/。"
                     "学習タブの「結果桁 CNN だけ保存」。解析時は result確定で記録。"
                 )

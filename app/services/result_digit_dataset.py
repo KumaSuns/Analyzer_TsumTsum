@@ -13,6 +13,8 @@ from PySide6.QtGui import QImage
 from app.services.image_save import save_training_png
 from app.services.result_gain_reader import RESULT_GAIN_FIELDS, field_spec_for_key
 
+RESULT_COIN_GAIN_PREFIX = "result_coin_gain"
+
 _LABEL_RES = tuple(
     (
         spec.file_prefix,
@@ -38,6 +40,10 @@ def _imread_crop(path: Path, flags: int) -> np.ndarray | None:
 def result_digits_root(assets_root: Path | None = None) -> Path:
     base = assets_root or (Path(__file__).resolve().parents[1] / "assets" / "images")
     return base / "result_digits"
+
+
+def is_result_coin_crop(path: Path) -> bool:
+    return path.name.startswith(f"{RESULT_COIN_GAIN_PREFIX}_")
 
 
 def _iter_png_files(directory: Path) -> Iterator[Path]:
@@ -80,6 +86,13 @@ def count_saved_crops(root: Path | None = None) -> tuple[int, int]:
     return train_n, val_n
 
 
+def count_result_coin_crops(root: Path | None = None) -> tuple[int, int]:
+    base = result_digits_root(root)
+    train_n = sum(1 for p in _iter_png_files(base / "train") if is_result_coin_crop(p))
+    val_n = sum(1 for p in _iter_png_files(base / "val") if is_result_coin_crop(p))
+    return train_n, val_n
+
+
 def iter_saved_labeled_crops(
     root: Path | None = None,
 ) -> Iterator[Tuple[str, Path, int]]:
@@ -89,6 +102,14 @@ def iter_saved_labeled_crops(
             label = parse_crop_label(path)
             if label is not None:
                 yield split, path, label
+
+
+def iter_saved_result_coin_crops(
+    root: Path | None = None,
+) -> Iterator[Tuple[str, Path, int]]:
+    for split, path, label in iter_saved_labeled_crops(root):
+        if is_result_coin_crop(path):
+            yield split, path, label
 
 
 def save_labeled_result_gain_crop(
@@ -118,8 +139,48 @@ def save_labeled_result_gain_crop(
     return True, f"{split}/{out_path.name}"
 
 
+def _result_coin_gray_sources(
+    gray: np.ndarray, bgr: np.ndarray | None
+) -> List[np.ndarray]:
+    """最終獲得コイン向け: coin_gain と同じ前処理経路。"""
+    from app.services.coin_gain_reader import _coin_gain_strip_for_hud, _upscale_gray_for_hud
+
+    sources: List[np.ndarray] = []
+    seen: set[tuple[int, int]] = set()
+
+    def _add(src: np.ndarray | None) -> None:
+        if src is None or src.size == 0:
+            return
+        key = src.shape[:2]
+        if key in seen:
+            return
+        seen.add(key)
+        sources.append(src)
+
+    strip = _coin_gain_strip_for_hud(gray, bgr)
+    _add(strip)
+    prepared, _ = _upscale_gray_for_hud(gray, bgr)
+    _add(prepared)
+    _add(gray)
+    return sources
+
+
+def _patch_score_acceptable(
+    n: int, score: float, *, decoded_match: bool, relaxed: bool
+) -> bool:
+    if decoded_match:
+        return True
+    strict = max(2.5, 0.45 * n + 1.0)
+    if not relaxed:
+        return score <= strict
+    return score <= max(8.5, 0.75 * n + 3.5)
+
+
 def _patches_from_gray_source(
-    gray: np.ndarray, value: int
+    gray: np.ndarray,
+    value: int,
+    *,
+    relaxed: bool = False,
 ) -> tuple[List[Tuple[np.ndarray, int]] | None, float]:
     from app.services.coin_digit_cnn import _normalize_digit_patch
     from app.services.coin_gain_reader import (
@@ -151,8 +212,9 @@ def _patches_from_gray_source(
                 best_score = score
                 best_parts = parts
                 best_decoded_match = decoded_match
-    threshold = max(2.5, 0.45 * n + 1.0)
-    if best_parts is None or best_score > threshold:
+    if best_parts is None or not _patch_score_acceptable(
+        n, best_score, decoded_match=best_decoded_match, relaxed=relaxed
+    ):
         return None, best_score
     out: List[Tuple[np.ndarray, int]] = []
     for digit, part in zip(digits, best_parts):
@@ -176,10 +238,18 @@ def extract_digit_patches_from_crop(
     if gray is None:
         return None
     bgr = _imread_crop(crop_path, cv2.IMREAD_COLOR)
+    coin_crop = is_result_coin_crop(crop_path)
     candidates: List[tuple[List[Tuple[np.ndarray, int]], float]] = []
     with patches_decode_context_for_value(value):
-        for src in _result_gray_sources(gray, bgr):
-            patches, score = _patches_from_gray_source(src, value)
+        sources = (
+            _result_coin_gray_sources(gray, bgr)
+            if coin_crop
+            else _result_gray_sources(gray, bgr)
+        )
+        for src in sources:
+            patches, score = _patches_from_gray_source(
+                src, value, relaxed=coin_crop
+            )
             if patches is not None:
                 candidates.append((patches, score))
     if not candidates:
@@ -199,18 +269,27 @@ def build_saved_crop_training_samples(
         train: List[Tuple[np.ndarray, int]] = []
         val: List[Tuple[np.ndarray, int]] = []
         failed: List[str] = []
+        skipped = 0
         for split, path, value in iter_saved_labeled_crops(root):
+            if not is_result_coin_crop(path):
+                skipped += 1
+                continue
             patches = extract_digit_patches_from_crop(path, value)
             if not patches:
                 failed.append(path.name)
                 continue
             bucket = train if split == "train" else val
             bucket.extend(patches)
-        if log and failed:
-            preview = ", ".join(failed[:5])
-            if len(failed) > 5:
-                preview += " …"
-            log(f"結果桁 パッチ化失敗 {len(failed)}枚: {preview}")
+        if log:
+            if skipped:
+                log(
+                    f"結果コイン学習: 最終獲得コイン以外 {skipped}枚はスキップ"
+                )
+            if failed:
+                preview = ", ".join(failed[:5])
+                if len(failed) > 5:
+                    preview += " …"
+                log(f"結果コイン パッチ化失敗 {len(failed)}枚: {preview}")
         return train, val
     finally:
         set_digit_classifier_factory(None)

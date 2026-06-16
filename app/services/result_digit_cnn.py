@@ -37,8 +37,8 @@ def build_result_digit_training_samples(
 ) -> Tuple[List[Tuple[np.ndarray, int]], List[Tuple[np.ndarray, int]]]:
     from app.services.result_digit_dataset import (
         build_saved_crop_training_samples,
-        count_saved_crops,
-        iter_saved_labeled_crops,
+        count_result_coin_crops,
+        iter_saved_result_coin_crops,
     )
 
     def _log(msg: str) -> None:
@@ -47,17 +47,17 @@ def build_result_digit_training_samples(
 
     rng = random.Random(seed)
     saved_train, saved_val = build_saved_crop_training_samples(assets_root, log=_log)
-    train_n, val_n = count_saved_crops(assets_root)
-    usable = sum(1 for _ in iter_saved_labeled_crops(assets_root))
+    train_n, val_n = count_result_coin_crops(assets_root)
+    usable = sum(1 for _ in iter_saved_result_coin_crops(assets_root))
     raw_patch_n = len(saved_train) + len(saved_val)
     _log(
-        f"結果桁 保存 crop: train={train_n} val={val_n}枚 "
+        f"結果コイン 保存 crop: train={train_n} val={val_n}枚 "
         f"(桁パッチ化 {raw_patch_n} 件)"
     )
     if usable == 0:
         _log(
-            "結果桁: UI 保存データなし。"
-            " 動画ツール「結果」で4項目の切り抜きを保存してください。"
+            "結果コイン: UI 保存データなし。"
+            " 動画ツール「結果」で最終獲得コインの切り抜きを保存してください。"
         )
 
     train: List[Tuple[np.ndarray, int]] = []
@@ -89,7 +89,7 @@ def build_result_digit_training_samples(
     rng.shuffle(train)
     rng.shuffle(val)
     _log(
-        f"結果桁 学習構成: train={len(train)} val={len(val)} "
+        f"結果コイン 学習構成: train={len(train)} val={len(val)} "
         f"(実機由来~{len(real_patches) * 6 / max(1, len(train)):.0%} of train)"
     )
     return train, val
@@ -104,7 +104,7 @@ def evaluate_saved_result_crop_reads(
     from app.services.coin_gain_reader import set_digit_classifier_factory
     from app.services.result_digit_dataset import (
         extract_digit_patches_from_crop,
-        iter_saved_labeled_crops,
+        iter_saved_result_coin_crops,
     )
 
     def _log(msg: str) -> None:
@@ -116,7 +116,7 @@ def evaluate_saved_result_crop_reads(
     set_digit_classifier_factory(get_result_digit_classifier)
     try:
         ok = total = 0
-        for _split, path, label in iter_saved_labeled_crops(assets_root):
+        for _split, path, label in iter_saved_result_coin_crops(assets_root):
             patches = extract_digit_patches_from_crop(path, label)
             if not patches:
                 continue
@@ -130,7 +130,7 @@ def evaluate_saved_result_crop_reads(
             if match:
                 ok += 1
         if total:
-            _log(f"結果桁 保存 crop 桁一致: {ok}/{total} ({ok / total:.0%})")
+            _log(f"結果コイン 保存 crop 桁一致: {ok}/{total} ({ok / total:.0%})")
         return ok, total
     finally:
         set_digit_classifier_factory(None)

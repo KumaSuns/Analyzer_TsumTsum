@@ -233,7 +233,7 @@ class SimpleTrainer:
         )
         from app.services.coin_digit_cnn import CoinDigitCnnClassifier
 
-        log("結果桁 CNN を学習します…")
+        log("結果コイン CNN を学習します…")
         try:
             train_samples, val_samples = build_result_digit_training_samples(log=log)
             clf = CoinDigitCnnClassifier()

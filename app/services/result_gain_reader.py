@@ -410,6 +410,14 @@ def read_result_gain_crop(roi: QImage, *, field_key: str) -> Tuple[Optional[int]
         return None, 1e9, "opencv未導入"
     if roi is None or roi.isNull() or roi.width() < 12 or roi.height() < 6:
         return None, 1e9, f"{field_key}_roi小"
+    if field_key == "result_coin_gain":
+        from app.services.coin_gain_reader import read_coin_gain_crop
+
+        with use_result_digit_cnn():
+            val, err, dbg = read_coin_gain_crop(roi)
+        if val is None:
+            return val, err, dbg.replace("crop_", "result_coin_")
+        return val, err, dbg.replace("crop ", "result_coin ")
     gray = qimage_to_gray(roi)
     if gray is None:
         return None, 1e9, "gray失敗"
